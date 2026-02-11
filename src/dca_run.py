@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Roberto's DCA Bot v1 — Execution Engine
+Kraken DCA Bot v1 — Execution Engine
 GitHub Actions → Python → Kraken API → Supabase → Telegram
 
 Usage (via GH Actions, not directly):
@@ -18,6 +18,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+import urllib.error
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -71,15 +72,19 @@ def sb_insert(table: str, row: dict):
 
 def sb_upsert(table: str, row: dict):
     """Upsert row (for claim phase — conflict = already claimed)."""
-    headers_extra = {"Prefer": "return=representation,resolution=merge-duplicates"}
     url = f"{SUPABASE_URL}/rest/v1/{table}"
     data = json.dumps(row).encode()
-    req = urllib.request.Request(url, data=data, method="POST", headers={
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Content-Type": "application/json",
-        "Prefer": "return=representation,resolution=merge-duplicates",
-    })
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method="POST",
+        headers={
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "application/json",
+            "Prefer": "return=representation,resolution=merge-duplicates",
+        },
+    )
     with urllib.request.urlopen(req, timeout=30) as resp:
         return json.loads(resp.read().decode())
 
@@ -88,14 +93,31 @@ def sb_update(table: str, match_params: dict, updates: dict):
     """Update rows matching filter."""
     url = f"{SUPABASE_URL}/rest/v1/{table}?{urllib.parse.urlencode(match_params)}"
     data = json.dumps(updates).encode()
-    req = urllib.request.Request(url, data=data, method="PATCH", headers={
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Content-Type": "application/json",
-        "Prefer": "return=representation",
-    })
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method="PATCH",
+        headers={
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "application/json",
+            "Prefer": "return=representation",
+        },
+    )
     with urllib.request.urlopen(req, timeout=30) as resp:
         return json.loads(resp.read().decode())
+
+
+# ═══════════════════════════════════════════════════════════════
+#  NUMERIC HELPERS
+# ═══════════════════════════════════════════════════════════════
+
+def floor_to_decimals(x: float, decimals: int) -> float:
+    """Floor (truncate) to N decimals to avoid overspending due to rounding."""
+    if decimals < 0:
+        return x
+    factor = 10 ** decimals
+    return int(x * factor) / factor
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -165,14 +187,10 @@ def tg_send(text: str):
         return
     try:
         url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-        data = json.dumps({
-            "chat_id": TG_CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML",
-        }).encode()
-        req = urllib.request.Request(url, data=data, headers={
-            "Content-Type": "application/json"
-        })
+        data = json.dumps(
+            {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"}
+        ).encode()
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
         urllib.request.urlopen(req, timeout=10)
     except Exception as e:
         print(f"[TG error] {e}")
@@ -222,13 +240,16 @@ def execute_pair(order: dict, settings: dict, today_chicago: str) -> dict:
     Returns execution result dict.
     """
     pair = order["pair"]
-    amount = float(order["base_quote_amount"])
+    amount_usd = float(order["base_quote_amount"])  # fixed USD target
     dry_run = settings["dry_run"]
-    ts = int(time.time())
+
+    # 1% safety buffer so we don't exceed USD target due to price movement/rounding
+    quote_buffer_pct = 0.01
+
     cl_ord_id = f"dca-{pair}-{today_chicago}"
-    
+
     print(f"\n{'='*50}")
-    print(f"  {pair} | ${amount:.2f} | {'DRY RUN' if dry_run else 'LIVE'}")
+    print(f"  {pair} | ${amount_usd:.2f} | {'DRY RUN' if dry_run else 'LIVE'}")
     print(f"  cl_ord_id: {cl_ord_id}")
 
     # ── Phase 1: CLAIM ────────────────────────────────────────
@@ -237,32 +258,28 @@ def execute_pair(order: dict, settings: dict, today_chicago: str) -> dict:
         "pair": pair,
         "cl_ord_id": cl_ord_id,
         "status": "claimed",
-        "requested_quote_amount_base": amount,
+        "requested_quote_amount_base": amount_usd,
         "execution_started_at": datetime.now(timezone.utc).isoformat(),
     }
 
     try:
         sb_insert("dca_executions", claim_row)
-        print(f"  ✓ Claimed")
+        print("  ✓ Claimed")
     except urllib.error.HTTPError as e:
         if e.code == 409:
-            print(f"  ⏭ Already claimed/executed today — skipping")
+            print("  ⏭ Already claimed/executed today — skipping")
             return {"pair": pair, "status": "already_claimed", "skipped": True}
         raise
 
     # Helper to update this execution row
     def update_execution(updates: dict):
-        sb_update(
-            "dca_executions",
-            {"cl_ord_id": f"eq.{cl_ord_id}"},
-            updates,
-        )
+        sb_update("dca_executions", {"cl_ord_id": f"eq.{cl_ord_id}"}, updates)
 
     # ── Preflight: Balance ────────────────────────────────────
     try:
         usd_balance = check_balance_usd()
-        fee_buffer = amount * 0.01  # 1% buffer for fees
-        needed = amount + fee_buffer
+        fee_buffer = amount_usd * 0.01  # 1% buffer for fees (informational)
+        needed = amount_usd + fee_buffer
         print(f"  Balance: ${usd_balance:.2f} | Need: ${needed:.2f}")
 
         if usd_balance < needed:
@@ -282,7 +299,7 @@ def execute_pair(order: dict, settings: dict, today_chicago: str) -> dict:
     except KrakenError as e:
         print(f"  ⚠ Balance check failed: {e} — continuing anyway")
 
-    # ── Preflight: Min order ──────────────────────────────────
+    # ── Preflight: Min order (pair info) ───────────────────────
     try:
         pair_info = get_asset_pair_info(pair)
         print(f"  Min order: {pair_info['ordermin']} | Lot decimals: {pair_info['lot_decimals']}")
@@ -297,7 +314,7 @@ def execute_pair(order: dict, settings: dict, today_chicago: str) -> dict:
         tg_send(f"❌ <b>DCA FAIL</b>\n{today_chicago} | {pair}\n{reason}")
         return {"pair": pair, "status": "failed_kraken"}
 
-    # ── Snapshot: mid price ───────────────────────────────────
+    # ── Snapshot: bid/ask/mid ─────────────────────────────────
     try:
         ticker = get_ticker_snapshot(pair)
         print(f"  Bid: {ticker['bid']} | Ask: {ticker['ask']} | Mid: {ticker['mid']:.6f}")
@@ -311,42 +328,61 @@ def execute_pair(order: dict, settings: dict, today_chicago: str) -> dict:
         print(f"  ⚠ Ticker failed: {e} — continuing without snapshot")
         ticker = {"bid": None, "ask": None, "mid": None}
 
-    # ── Estimate volume for min-order check ───────────────────
-    if ticker["mid"] and ticker["mid"] > 0:
-        est_volume = amount / ticker["mid"]
-        if est_volume < pair_info["ordermin"]:
-            reason = (
-                f"Estimated volume {est_volume:.8f} < "
-                f"min {pair_info['ordermin']}"
-            )
-            print(f"  ✗ {reason}")
-            update_execution({
-                "status": "skipped_min_order",
-                "reason": reason,
-                "execution_finished_at": datetime.now(timezone.utc).isoformat(),
-            })
-            tg_send(
-                f"⚠️ <b>DCA SKIP</b>\n"
-                f"{today_chicago} | {pair}\n"
-                f"Below min order: {reason}"
-            )
-            return {"pair": pair, "status": "skipped_min_order"}
+    # ── Convert fixed USD → BASE volume using ASK ──────────────
+    # Your observed behavior: Kraken treats AddOrder.volume as BASE volume for this pair.
+    # So we compute BASE volume from the USD target and current ASK, floor to lot_decimals.
+    if not ticker["ask"] or ticker["ask"] <= 0:
+        reason = "No valid ASK price — can't compute base volume"
+        print(f"  ✗ {reason}")
+        update_execution({
+            "status": "failed_kraken",
+            "reason": reason,
+            "execution_finished_at": datetime.now(timezone.utc).isoformat(),
+        })
+        tg_send(f"❌ <b>DCA FAIL</b>\n{today_chicago} | {pair}\n{reason}")
+        return {"pair": pair, "status": "failed_kraken"}
+
+    spend_usd = amount_usd * (1 - quote_buffer_pct)
+    base_volume_raw = spend_usd / ticker["ask"]
+    base_volume = floor_to_decimals(base_volume_raw, pair_info["lot_decimals"])
+
+    print(f"  USD target: ${amount_usd:.2f} | Spend (buffered): ${spend_usd:.2f}")
+    print(f"  Base volume (ask): {base_volume} (raw {base_volume_raw:.10f})")
+
+    # ── Min order check (BASE) ─────────────────────────────────
+    if base_volume < pair_info["ordermin"]:
+        reason = f"Base volume {base_volume:.10f} < min {pair_info['ordermin']}"
+        print(f"  ✗ {reason}")
+        update_execution({
+            "status": "skipped_min_order",
+            "reason": reason,
+            "execution_finished_at": datetime.now(timezone.utc).isoformat(),
+        })
+        tg_send(
+            f"⚠️ <b>DCA SKIP</b>\n"
+            f"{today_chicago} | {pair}\n"
+            f"Below min order: {reason}"
+        )
+        return {"pair": pair, "status": "skipped_min_order"}
 
     # ── Execute: Place order ──────────────────────────────────
     if dry_run:
-        # Simulate fill with mid price
-        sim_volume = (amount / ticker["mid"]) if ticker["mid"] else 0
-        sim_fee = amount * 0.0026  # Kraken taker fee estimate
-
-        print(f"  🧪 DRY RUN — simulated fill: {sim_volume:.8f} @ {ticker['mid']}")
+        sim_fee = amount_usd * 0.0026  # taker fee estimate
+        print(f"  🧪 DRY RUN — simulated base fill: {base_volume:.8f} @ {ticker.get('mid')}")
         update_execution({
             "status": "filled_dry_run",
-            "filled_quote_cost": amount,
+            "filled_quote_cost": amount_usd,
             "fee_quote": round(sim_fee, 6),
-            "filled_base_volume": round(sim_volume, pair_info["lot_decimals"]),
-            "avg_price": ticker["mid"],
+            "filled_base_volume": round(base_volume, pair_info["lot_decimals"]),
+            "avg_price": ticker.get("mid"),
             "execution_finished_at": datetime.now(timezone.utc).isoformat(),
-            "raw": json.dumps({"dry_run": True, "simulated_mid": ticker["mid"]}),
+            "raw": json.dumps({
+                "dry_run": True,
+                "usd_target": amount_usd,
+                "usd_spend_buffered": spend_usd,
+                "ask": ticker["ask"],
+                "base_volume": base_volume,
+            }),
         })
         return {"pair": pair, "status": "filled_dry_run"}
 
@@ -356,9 +392,9 @@ def execute_pair(order: dict, settings: dict, today_chicago: str) -> dict:
             "pair": pair,
             "type": "buy",
             "ordertype": "market",
-            "volume": str(amount),      # with viqc, this is quote currency
-            "oflags": "viqc,fciq",      # volume-in-quote-currency, fee-in-quote
-            "cl_ordid": cl_ord_id,
+            "volume": str(base_volume),   # BASE volume
+            "oflags": "fciq",             # fee in quote (USD)
+            "cl_ordid": cl_ord_id,        # IMPORTANT: Kraken expects cl_ordid (not cl_ord_id)
         }
 
         result = kraken_private("AddOrder", order_params)
@@ -444,7 +480,6 @@ def run_reconciliation():
 
     cutoff = (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat()
 
-    # Query stale rows
     stale = sb_get("dca_executions", {
         "status": "in.(claimed,placed)",
         "execution_started_at": f"lt.{cutoff}",
@@ -461,15 +496,13 @@ def run_reconciliation():
         print(f"  Stale: {cl_id} | status={row['status']} | order_id={order_id}")
 
         if row["status"] == "claimed" and not order_id:
-            # Was claimed but never placed — likely crash before AddOrder
-            # Try to find by cl_ord_id in Kraken (OpenOrders + ClosedOrders)
             found = try_find_kraken_order(cl_id)
             if found:
-                print(f"    Found in Kraken! Finalizing...")
+                print("    Found in Kraken! Finalizing...")
                 pair_info = get_asset_pair_info(row["pair"])
                 finalize_order(cl_id, found, pair_info)
             else:
-                print(f"    Not found in Kraken — marking failed")
+                print("    Not found in Kraken — marking failed")
                 sb_update(
                     "dca_executions",
                     {"cl_ord_id": f"eq.{cl_id}"},
@@ -486,11 +519,10 @@ def run_reconciliation():
                 )
 
         elif row["status"] == "placed" and order_id:
-            # Was placed but never finalized — try to finalize now
             try:
                 pair_info = get_asset_pair_info(row["pair"])
                 finalize_order(cl_id, order_id, pair_info)
-                print(f"    Finalized successfully")
+                print("    Finalized successfully")
             except Exception as e:
                 print(f"    Finalize still failing: {e}")
                 tg_send(
@@ -503,7 +535,6 @@ def run_reconciliation():
 def try_find_kraken_order(cl_ord_id: str) -> str | None:
     """Try to find a Kraken order by cl_ord_id."""
     try:
-        # Check closed orders (last 24h)
         closed = kraken_private("ClosedOrders", {"cl_ordid": cl_ord_id})
         orders = closed.get("closed", {})
         for txid, order in orders.items():
@@ -528,10 +559,8 @@ def send_weekly_summary():
         print("Not Sunday — skipping weekly summary")
         return
 
-    # ISO week key for idempotency
     week_key = now_chicago.strftime("%G-W%V")
 
-    # Check if already sent
     existing = sb_get("dca_notifications", {
         "notification_type": "eq.weekly_summary",
         "period_key": f"eq.{week_key}",
@@ -540,13 +569,11 @@ def send_weekly_summary():
         print(f"Weekly summary {week_key} already sent")
         return
 
-    # Get this week's executions
     week_start = (now_chicago - timedelta(days=7)).strftime("%Y-%m-%d")
-    today = now_chicago.strftime("%Y-%m-%d")
 
     rows = sb_get("dca_executions", {
         "trade_date_chicago": f"gte.{week_start}",
-        "select": "pair,status,filled_quote_cost,fee_quote,filled_base_volume,avg_price,mid",
+        "select": "pair,status,filled_quote_cost,fee_quote,filled_base_volume,avg_price,mid,trade_date_chicago",
         "order": "trade_date_chicago.asc",
     })
 
@@ -554,14 +581,15 @@ def send_weekly_summary():
         print("No executions this week")
         return
 
-    # Build summary per pair
     pairs = {}
     for r in rows:
         p = r["pair"]
         if p not in pairs:
-            pairs[p] = {"filled": 0, "skipped": 0, "failed": 0,
-                        "total_cost": 0, "total_fee": 0, "total_vol": 0,
-                        "slippages": []}
+            pairs[p] = {
+                "filled": 0, "skipped": 0, "failed": 0,
+                "total_cost": 0, "total_fee": 0, "total_vol": 0,
+                "slippages": []
+            }
 
         s = pairs[p]
         if "filled" in r["status"]:
@@ -578,17 +606,13 @@ def send_weekly_summary():
         elif "failed" in r["status"]:
             s["failed"] += 1
 
-    # Format message
     lines = [f"📊 <b>DCA Weekly Summary</b>", f"Week: {week_key}", ""]
 
     for pair, s in pairs.items():
         symbol = pair.replace("USD", "")
         all_in = s["total_cost"] + s["total_fee"]
         avg_eff = (all_in / s["total_vol"]) if s["total_vol"] > 0 else 0
-        avg_slip = (
-            sum(s["slippages"]) / len(s["slippages"])
-            if s["slippages"] else 0
-        )
+        avg_slip = (sum(s["slippages"]) / len(s["slippages"])) if s["slippages"] else 0
 
         lines.append(f"<b>{symbol}</b>")
         lines.append(
@@ -606,7 +630,6 @@ def send_weekly_summary():
     msg = "\n".join(lines)
     tg_send(msg)
 
-    # Mark as sent
     try:
         sb_insert("dca_notifications", {
             "notification_type": "weekly_summary",
@@ -614,7 +637,7 @@ def send_weekly_summary():
             "payload": json.dumps({"pairs": list(pairs.keys())}),
         })
     except Exception:
-        pass  # idempotency — if it fails, next run will try again
+        pass
 
     print(f"✓ Weekly summary sent for {week_key}")
 
@@ -634,7 +657,6 @@ def main():
         send_weekly_summary()
         return
 
-    # ── Default: scheduled run ────────────────────────────────
     now_chicago = datetime.now(CHICAGO_TZ)
     now_str = now_chicago.strftime("%Y-%m-%d %H:%M:%S %Z")
     today_chicago = now_chicago.strftime("%Y-%m-%d")
@@ -659,10 +681,10 @@ def main():
     print(f"   Window: {window_start.strftime('%H:%M')} – {window_end.strftime('%H:%M')}")
 
     if not (window_start <= now_chicago <= window_end):
-        print(f"   Outside window — exiting.")
+        print("   Outside window — exiting.")
         return
 
-    print(f"   ✓ Inside window!")
+    print("   ✓ Inside window!")
 
     # 3. Reconciliation first
     run_reconciliation()
