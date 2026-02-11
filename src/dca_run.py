@@ -35,6 +35,10 @@ TG_CHAT_ID        = os.environ.get("TG_CHAT_ID", "")
 
 CHICAGO_TZ = ZoneInfo("America/Chicago")
 
+# Safety margin in quote currency (USD) to ensure all-in never exceeds target.
+# Covers: price drift, fee_rate mismatch, rounding drift.
+USD_SAFETY_MARGIN = float(os.environ.get("DCA_USD_SAFETY_MARGIN", "0.03"))
+
 
 # ═══════════════════════════════════════════════════════════════
 #  SUPABASE CLIENT (lightweight, no SDK needed)
@@ -70,25 +74,6 @@ def sb_insert(table: str, row: dict):
     return sb_request("POST", table, body=row)
 
 
-def sb_upsert(table: str, row: dict):
-    """Upsert row (for claim phase — conflict = already claimed)."""
-    url = f"{SUPABASE_URL}/rest/v1/{table}"
-    data = json.dumps(row).encode()
-    req = urllib.request.Request(
-        url,
-        data=data,
-        method="POST",
-        headers={
-            "apikey": SUPABASE_KEY,
-            "Authorization": f"Bearer {SUPABASE_KEY}",
-            "Content-Type": "application/json",
-            "Prefer": "return=representation,resolution=merge-duplicates",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read().decode())
-
-
 def sb_update(table: str, match_params: dict, updates: dict):
     """Update rows matching filter."""
     url = f"{SUPABASE_URL}/rest/v1/{table}?{urllib.parse.urlencode(match_params)}"
@@ -118,6 +103,13 @@ def floor_to_decimals(x: float, decimals: int) -> float:
         return x
     factor = 10 ** decimals
     return int(x * factor) / factor
+
+
+def format_volume(v: float, lot_decimals: int) -> str:
+    """Format volume with exact lot_decimals to avoid float string artifacts."""
+    if lot_decimals <= 0:
+        return str(int(v))
+    return f"{v:.{lot_decimals}f}"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -203,7 +195,6 @@ def tg_send(text: str):
 def check_balance_usd() -> float:
     """Get available USD balance from Kraken."""
     balances = kraken_private("Balance")
-    # Kraken uses ZUSD for US Dollar
     return float(balances.get("ZUSD", 0))
 
 
@@ -237,19 +228,23 @@ def get_ticker_snapshot(pair: str) -> dict:
 def execute_pair(order: dict, settings: dict, today_chicago: str) -> dict:
     """
     Full two-phase execution for one trading pair.
-    Returns execution result dict.
+
+    Bulletproof fee-aware volume calculation (target = all-in cap):
+      total_target  = base_quote_amount (e.g. $10.00)
+      safe_total    = max(total_target - USD_SAFETY_MARGIN, 0)
+      cost_target   = safe_total / (1 + taker_fee_rate)
+      base_volume   = floor(cost_target / ask_price, lot_decimals)
+
+    This ensures:  cost + fee  ≤  safe_total  ≤ total_target
     """
     pair = order["pair"]
-    amount_usd = float(order["base_quote_amount"])  # fixed USD target
+    total_target = float(order["base_quote_amount"])
+    fee_rate = float(settings["taker_fee_rate"])
     dry_run = settings["dry_run"]
-
-    # 1% safety buffer so we don't exceed USD target due to price movement/rounding
-    quote_buffer_pct = 0.01
-
     cl_ord_id = f"dca-{pair}-{today_chicago}"
 
     print(f"\n{'='*50}")
-    print(f"  {pair} | ${amount_usd:.2f} | {'DRY RUN' if dry_run else 'LIVE'}")
+    print(f"  {pair} | ${total_target:.2f} | fee {fee_rate*100:.2f}% | {'DRY RUN' if dry_run else 'LIVE'}")
     print(f"  cl_ord_id: {cl_ord_id}")
 
     # ── Phase 1: CLAIM ────────────────────────────────────────
@@ -258,7 +253,7 @@ def execute_pair(order: dict, settings: dict, today_chicago: str) -> dict:
         "pair": pair,
         "cl_ord_id": cl_ord_id,
         "status": "claimed",
-        "requested_quote_amount_base": amount_usd,
+        "requested_quote_amount_base": total_target,
         "execution_started_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -271,19 +266,16 @@ def execute_pair(order: dict, settings: dict, today_chicago: str) -> dict:
             return {"pair": pair, "status": "already_claimed", "skipped": True}
         raise
 
-    # Helper to update this execution row
     def update_execution(updates: dict):
         sb_update("dca_executions", {"cl_ord_id": f"eq.{cl_ord_id}"}, updates)
 
     # ── Preflight: Balance ────────────────────────────────────
     try:
         usd_balance = check_balance_usd()
-        fee_buffer = amount_usd * 0.01  # 1% buffer for fees (informational)
-        needed = amount_usd + fee_buffer
-        print(f"  Balance: ${usd_balance:.2f} | Need: ${needed:.2f}")
+        print(f"  Balance: ${usd_balance:.2f} | Need: ${total_target:.2f}")
 
-        if usd_balance < needed:
-            reason = f"USD balance ${usd_balance:.2f} < needed ${needed:.2f}"
+        if usd_balance < total_target:
+            reason = f"USD balance ${usd_balance:.2f} < needed ${total_target:.2f}"
             print(f"  ✗ {reason}")
             update_execution({
                 "status": "skipped_insufficient_funds",
@@ -293,13 +285,13 @@ def execute_pair(order: dict, settings: dict, today_chicago: str) -> dict:
             tg_send(
                 f"⚠️ <b>DCA SKIP</b>\n"
                 f"{today_chicago} | {pair}\n"
-                f"Insufficient funds: ${usd_balance:.2f} < ${needed:.2f}"
+                f"Insufficient funds: ${usd_balance:.2f} < ${total_target:.2f}"
             )
             return {"pair": pair, "status": "skipped_insufficient_funds"}
     except KrakenError as e:
         print(f"  ⚠ Balance check failed: {e} — continuing anyway")
 
-    # ── Preflight: Min order (pair info) ───────────────────────
+    # ── Preflight: Pair info ──────────────────────────────────
     try:
         pair_info = get_asset_pair_info(pair)
         print(f"  Min order: {pair_info['ordermin']} | Lot decimals: {pair_info['lot_decimals']}")
@@ -328,9 +320,7 @@ def execute_pair(order: dict, settings: dict, today_chicago: str) -> dict:
         print(f"  ⚠ Ticker failed: {e} — continuing without snapshot")
         ticker = {"bid": None, "ask": None, "mid": None}
 
-    # ── Convert fixed USD → BASE volume using ASK ──────────────
-    # Your observed behavior: Kraken treats AddOrder.volume as BASE volume for this pair.
-    # So we compute BASE volume from the USD target and current ASK, floor to lot_decimals.
+    # ── Fee-aware volume calculation ──────────────────────────
     if not ticker["ask"] or ticker["ask"] <= 0:
         reason = "No valid ASK price — can't compute base volume"
         print(f"  ✗ {reason}")
@@ -342,16 +332,67 @@ def execute_pair(order: dict, settings: dict, today_chicago: str) -> dict:
         tg_send(f"❌ <b>DCA FAIL</b>\n{today_chicago} | {pair}\n{reason}")
         return {"pair": pair, "status": "failed_kraken"}
 
-    spend_usd = amount_usd * (1 - quote_buffer_pct)
-    base_volume_raw = spend_usd / ticker["ask"]
-    base_volume = floor_to_decimals(base_volume_raw, pair_info["lot_decimals"])
+    # Bulletproof guards
+    if fee_rate < 0:
+        print(f"  ⚠ fee_rate < 0 ({fee_rate}) — clamping to 0")
+        fee_rate = 0.0
 
-    print(f"  USD target: ${amount_usd:.2f} | Spend (buffered): ${spend_usd:.2f}")
-    print(f"  Base volume (ask): {base_volume} (raw {base_volume_raw:.10f})")
+    # Apply safety margin in quote currency (USD)
+    safe_total = total_target - USD_SAFETY_MARGIN
+    if safe_total < 0:
+        safe_total = 0.0
 
-    # ── Min order check (BASE) ─────────────────────────────────
+    # cost + fee = safe_total  →  cost = safe_total / (1 + fee_rate)
+    denom = 1.0 + fee_rate
+    if denom <= 0:
+        denom = 1.0
+
+    cost_target = safe_total / denom
+
+    # If target is too small, skip cleanly (prevents volume=0 / min-order errors)
+    if cost_target <= 0:
+        reason = f"Target too small after safety margin (${total_target:.2f} - ${USD_SAFETY_MARGIN:.2f})"
+        print(f"  ✗ {reason}")
+        update_execution({
+            "status": "skipped_target_too_small",
+            "reason": reason,
+            "execution_finished_at": datetime.now(timezone.utc).isoformat(),
+        })
+        tg_send(f"⚠️ <b>DCA SKIP</b>\n{today_chicago} | {pair}\n{reason}")
+        return {"pair": pair, "status": "skipped_target_too_small"}
+
+    base_volume = floor_to_decimals(cost_target / ticker["ask"], pair_info["lot_decimals"])
+
+    # Another guard: if rounding makes it 0, skip cleanly
+    if base_volume <= 0:
+        reason = f"Computed base_volume is 0 after rounding (cost_target=${cost_target:.6f}, ask={ticker['ask']}, lot_decimals={pair_info['lot_decimals']})"
+        print(f"  ✗ {reason}")
+        update_execution({
+            "status": "skipped_target_too_small",
+            "reason": reason,
+            "execution_finished_at": datetime.now(timezone.utc).isoformat(),
+        })
+        tg_send(f"⚠️ <b>DCA SKIP</b>\n{today_chicago} | {pair}\n{reason}")
+        return {"pair": pair, "status": "skipped_target_too_small"}
+
+    estimated_cost = base_volume * ticker["ask"]
+    estimated_fee = estimated_cost * fee_rate
+    estimated_total = estimated_cost + estimated_fee
+
+    print(f"  Fee-aware calc (with safety margin):")
+    print(f"    total_target:   ${total_target:.4f}")
+    print(f"    safety_margin:  ${USD_SAFETY_MARGIN:.4f}")
+    print(f"    safe_total:     ${safe_total:.4f}")
+    print(f"    cost_target:    ${cost_target:.4f}")
+    print(f"    ask:            ${ticker['ask']}")
+    print(f"    base_volume:    {base_volume}")
+    print(f"    est. cost:      ${estimated_cost:.4f}")
+    print(f"    est. fee:       ${estimated_fee:.4f}")
+    print(f"    est. total:     ${estimated_total:.4f}")
+
+    # ── Min order check ───────────────────────────────────────
     if base_volume < pair_info["ordermin"]:
-        reason = f"Base volume {base_volume:.10f} < min {pair_info['ordermin']}"
+        reason = f"Base volume {base_volume} < min {pair_info['ordermin']}"
         print(f"  ✗ {reason}")
         update_execution({
             "status": "skipped_min_order",
@@ -365,36 +406,43 @@ def execute_pair(order: dict, settings: dict, today_chicago: str) -> dict:
         )
         return {"pair": pair, "status": "skipped_min_order"}
 
-    # ── Execute: Place order ──────────────────────────────────
+    # ── Execute ───────────────────────────────────────────────
     if dry_run:
-        sim_fee = amount_usd * 0.0026  # taker fee estimate
-        print(f"  🧪 DRY RUN — simulated base fill: {base_volume:.8f} @ {ticker.get('mid')}")
+        print(f"  🧪 DRY RUN — simulated fill: {base_volume} @ ask {ticker['ask']}")
         update_execution({
             "status": "filled_dry_run",
-            "filled_quote_cost": amount_usd,
-            "fee_quote": round(sim_fee, 6),
-            "filled_base_volume": round(base_volume, pair_info["lot_decimals"]),
-            "avg_price": ticker.get("mid"),
+            "filled_quote_cost": round(estimated_cost, 6),
+            "fee_quote": round(estimated_fee, 6),
+            "filled_base_volume": base_volume,
+            "avg_price": ticker["ask"],
             "execution_finished_at": datetime.now(timezone.utc).isoformat(),
             "raw": json.dumps({
                 "dry_run": True,
-                "usd_target": amount_usd,
-                "usd_spend_buffered": spend_usd,
+                "total_target": total_target,
+                "safety_margin": USD_SAFETY_MARGIN,
+                "safe_total": round(safe_total, 6),
+                "fee_rate": fee_rate,
+                "cost_target": round(cost_target, 6),
                 "ask": ticker["ask"],
                 "base_volume": base_volume,
+                "estimated_cost": round(estimated_cost, 6),
+                "estimated_fee": round(estimated_fee, 6),
+                "estimated_total": round(estimated_total, 6),
             }),
         })
         return {"pair": pair, "status": "filled_dry_run"}
 
     # ── LIVE ORDER ────────────────────────────────────────────
     try:
+        vol_str = format_volume(base_volume, pair_info["lot_decimals"])
+
         order_params = {
             "pair": pair,
             "type": "buy",
             "ordertype": "market",
-            "volume": str(base_volume),   # BASE volume
-            "oflags": "fciq",             # fee in quote (USD)
-            "cl_ordid": cl_ord_id,        # IMPORTANT: Kraken expects cl_ordid (not cl_ord_id)
+            "volume": vol_str,
+            "oflags": "fciq",
+            "cl_ordid": cl_ord_id,
         }
 
         result = kraken_private("AddOrder", order_params)
@@ -419,8 +467,8 @@ def execute_pair(order: dict, settings: dict, today_chicago: str) -> dict:
         tg_send(f"❌ <b>DCA FAIL</b>\n{today_chicago} | {pair}\n{reason}")
         return {"pair": pair, "status": "failed_kraken"}
 
-    # ── Finalize: Query trade details ─────────────────────────
-    time.sleep(2)  # small delay for order to settle
+    # ── Finalize ──────────────────────────────────────────────
+    time.sleep(2)
 
     try:
         finalize_order(cl_ord_id, order_id, pair_info)
@@ -453,7 +501,8 @@ def finalize_order(cl_ord_id: str, order_id: str, pair_info: dict):
     vol_exec = float(order_data.get("vol_exec", 0))
     avg_px = float(order_data.get("price", 0))
 
-    print(f"  Fill: {vol_exec} @ avg {avg_px} | cost ${cost} | fee ${fee}")
+    all_in = cost + fee
+    print(f"  Fill: {vol_exec} @ avg {avg_px} | cost ${cost} | fee ${fee} | all-in ${all_in:.4f}")
 
     sb_update(
         "dca_executions",
@@ -538,11 +587,10 @@ def try_find_kraken_order(cl_ord_id: str) -> str | None:
         closed = kraken_private("ClosedOrders", {"cl_ordid": cl_ord_id})
         orders = closed.get("closed", {})
         for txid, order in orders.items():
-            if (order.get("cl_ordid") == cl_ord_id) or (order.get("cl_ord_id") == cl_ord_id):
+            if order.get("cl_ordid") == cl_ord_id:
                 return txid
     except Exception as e:
         print(f"    ClosedOrders search failed: {e}")
-
     return None
 
 
@@ -554,7 +602,6 @@ def send_weekly_summary():
     """Send Telegram weekly summary (idempotent, Sunday only)."""
     now_chicago = datetime.now(CHICAGO_TZ)
 
-    # Only on Sundays
     if now_chicago.weekday() != 6:
         print("Not Sunday — skipping weekly summary")
         return
@@ -573,7 +620,7 @@ def send_weekly_summary():
 
     rows = sb_get("dca_executions", {
         "trade_date_chicago": f"gte.{week_start}",
-        "select": "pair,status,filled_quote_cost,fee_quote,filled_base_volume,avg_price,mid,trade_date_chicago",
+        "select": "pair,status,filled_quote_cost,fee_quote,filled_base_volume,avg_price,mid",
         "order": "trade_date_chicago.asc",
     })
 
@@ -588,7 +635,7 @@ def send_weekly_summary():
             pairs[p] = {
                 "filled": 0, "skipped": 0, "failed": 0,
                 "total_cost": 0, "total_fee": 0, "total_vol": 0,
-                "slippages": []
+                "slippages": [],
             }
 
         s = pairs[p]
@@ -620,7 +667,7 @@ def send_weekly_summary():
             + (f" | ⏭ {s['skipped']} skip" if s["skipped"] else "")
             + (f" | ❌ {s['failed']} fail" if s["failed"] else "")
         )
-        lines.append(f"  💰 ${all_in:.2f} invested | {s['total_vol']:.6f} {symbol}")
+        lines.append(f"  💰 ${all_in:.2f} all-in | {s['total_vol']:.6f} {symbol}")
         if avg_eff > 0:
             lines.append(f"  📈 Avg price: ${avg_eff:.6f}")
         if avg_slip != 0:
@@ -717,7 +764,7 @@ def main():
             )
             results.append({"pair": order["pair"], "status": "crashed", "error": str(e)})
 
-        time.sleep(1)  # rate limit courtesy
+        time.sleep(1)
 
     # 6. Weekly summary (if Sunday)
     send_weekly_summary()
