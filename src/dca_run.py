@@ -229,7 +229,7 @@ def get_ticker_snapshot(pair: str) -> dict:
 #  FINALIZE (LIVE)
 # ═══════════════════════════════════════════════════════════════
 
-def finalize_order(cl_ord_id: str, order_id: str, pair_info: dict):
+def finalize_order(cl_ord_id: str, order_id: str):
     """Query Kraken for fill details and update DB."""
     if not order_id:
         return
@@ -556,7 +556,7 @@ def execute_pair(order: dict, settings: dict, today_chicago: str) -> dict:
     time.sleep(2)
 
     try:
-        finalize_order(cl_ord_id, order_id, pair_info)
+        finalize_order(cl_ord_id, order_id)
     except Exception as e:
         print(f"  ⚠ Finalize failed: {e} — reconciliation will catch it")
 
@@ -605,8 +605,7 @@ def run_reconciliation():
             found = try_find_kraken_order(cl_id)
             if found:
                 print("    Found in Kraken! Finalizing...")
-                pair_info = get_asset_pair_info(row["pair"])
-                finalize_order(cl_id, found, pair_info)
+                finalize_order(cl_id, found)
             else:
                 print("    Not found in Kraken — marking failed")
                 sb_update(
@@ -626,8 +625,7 @@ def run_reconciliation():
 
         elif row["status"] == "placed" and order_id:
             try:
-                pair_info = get_asset_pair_info(row["pair"])
-                finalize_order(cl_id, order_id, pair_info)
+                finalize_order(cl_id, order_id)
                 print("    Finalized successfully")
             except Exception as e:
                 print(f"    Finalize still failing: {e}")
