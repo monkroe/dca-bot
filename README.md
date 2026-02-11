@@ -1,4 +1,4 @@
-# Roberto's DCA Bot v1 🤖
+# Kraken DCA Bot v1 🤖
 
 Automated Dollar-Cost Averaging via **Kraken API** + **GitHub Actions** + **Supabase**.
 
