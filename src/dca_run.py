@@ -241,7 +241,7 @@ def execute_pair(order: dict, settings: dict, today_chicago: str) -> dict:
     total_target = float(order["base_quote_amount"])
     fee_rate = float(settings["taker_fee_rate"])
     dry_run = settings["dry_run"]
-    cl_ord_id = f"dca-{pair}-{today_chicago}"
+    cl_ord_id = f"dca-{pair}-{today_chicago}-dry"
 
     print(f"\n{'='*50}")
     print(f"  {pair} | ${total_target:.2f} | fee {fee_rate*100:.2f}% | {'DRY RUN' if dry_run else 'LIVE'}")
