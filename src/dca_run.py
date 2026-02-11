@@ -224,8 +224,9 @@ def execute_pair(order: dict, settings: dict, today_chicago: str) -> dict:
     pair = order["pair"]
     amount = float(order["base_quote_amount"])
     dry_run = settings["dry_run"]
+    ts = int(time.time())
     cl_ord_id = f"dca-{pair}-{today_chicago}"
-
+    
     print(f"\n{'='*50}")
     print(f"  {pair} | ${amount:.2f} | {'DRY RUN' if dry_run else 'LIVE'}")
     print(f"  cl_ord_id: {cl_ord_id}")
@@ -357,7 +358,7 @@ def execute_pair(order: dict, settings: dict, today_chicago: str) -> dict:
             "ordertype": "market",
             "volume": str(amount),      # with viqc, this is quote currency
             "oflags": "viqc,fciq",      # volume-in-quote-currency, fee-in-quote
-            "cl_ord_id": cl_ord_id,
+            "cl_ordid": cl_ord_id,
         }
 
         result = kraken_private("AddOrder", order_params)
@@ -503,10 +504,10 @@ def try_find_kraken_order(cl_ord_id: str) -> str | None:
     """Try to find a Kraken order by cl_ord_id."""
     try:
         # Check closed orders (last 24h)
-        closed = kraken_private("ClosedOrders", {"cl_ord_id": cl_ord_id})
+        closed = kraken_private("ClosedOrders", {"cl_ordid": cl_ord_id})
         orders = closed.get("closed", {})
         for txid, order in orders.items():
-            if order.get("cl_ord_id") == cl_ord_id:
+            if (order.get("cl_ordid") == cl_ord_id) or (order.get("cl_ord_id") == cl_ord_id):
                 return txid
     except Exception as e:
         print(f"    ClosedOrders search failed: {e}")
