@@ -1,1 +1,55 @@
+# ═══════════════════════════════════════════════════════════════
+#  Roberto's DCA Bot v1 — GitHub Actions Workflow
+#  Runs every 5 minutes, checks Chicago time window internally
+# ═══════════════════════════════════════════════════════════════
+
+name: DCA Bot
+
+on:
+  schedule:
+    # Every 5 minutes, offset from top of hour to avoid GH peak
+    - cron: '2-59/5 * * * *'
+
+  # Manual trigger for testing
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Run mode'
+        required: false
+        default: ''
+        type: choice
+        options:
+          - ''           # normal scheduled run
+          - --reconcile  # reconciliation only
+          - --weekly     # weekly summary only
+
+# Only one DCA run at a time — don't cancel running job
+concurrency:
+  group: dca-bot
+  cancel-in-progress: false
+
+jobs:
+  dca-run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run DCA Bot
+        env:
+          KRAKEN_API_KEY:            ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET:         ${{ secrets.KRAKEN_API_SECRET }}
+          SUPABASE_URL:              ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          TG_BOT_TOKEN:              ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID:                ${{ secrets.TG_CHAT_ID }}
+        run: |
+          python src/dca_run.py ${{ github.event.inputs.mode || '' }}
 
