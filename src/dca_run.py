@@ -162,7 +162,8 @@ def _claim_command(cmd_id: int) -> dict | None:
     except Exception as e:
         print(f"[commands] claim failed id={cmd_id}: {e}")
         return None
-        
+
+
 def _set_command_status(cmd_id: int, status: str):
     """Best-effort: update status only (to avoid schema mismatch)."""
     try:
