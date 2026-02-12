@@ -7,6 +7,11 @@ Usage (via GH Actions, not directly):
   python src/dca_run.py              # Main scheduled run
   python src/dca_run.py --reconcile  # Reconciliation only
   python src/dca_run.py --weekly     # Weekly summary only
+
+Variantas 1 (SQL control-plane):
+- Telegram/BENAS įrašo komandą į Supabase lentelę dca_commands (status='queued')
+- Šis skriptas, kiekvieno run metu, paima queued komandas, pritaiko į dca_settings/dca_orders
+  ir pažymi komandą done/failed.
 """
 
 import hashlib
@@ -42,6 +47,8 @@ USD_SAFETY_MARGIN = float(os.environ.get("DCA_USD_SAFETY_MARGIN", "0.03"))
 # Whether to send Telegram message on successful fills (dry-run and live).
 TG_NOTIFY_ON_FILL = os.environ.get("TG_NOTIFY_ON_FILL", "true").lower() in ("1", "true", "yes", "y")
 
+# Commands (SQL control-plane)
+DCA_COMMANDS_MAX_PER_RUN = int(os.environ.get("DCA_COMMANDS_MAX_PER_RUN", "25"))
 
 # ═══════════════════════════════════════════════════════════════
 #  SUPABASE CLIENT (lightweight, no SDK needed)
@@ -95,6 +102,167 @@ def sb_update(table: str, match_params: dict, updates: dict):
     with urllib.request.urlopen(req, timeout=30) as resp:
         raw = resp.read().decode()
         return json.loads(raw) if raw.strip() else None
+
+
+# ═══════════════════════════════════════════════════════════════
+#  TELEGRAM
+# ═══════════════════════════════════════════════════════════════
+
+def tg_send(text: str):
+    """Send Telegram message. Silent fail if not configured."""
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        print(f"[TG skip] {text}")
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+        data = json.dumps(
+            {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"}
+        ).encode()
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as e:
+        print(f"[TG error] {e}")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  SQL CONTROL-PLANE (dca_commands)
+# ═══════════════════════════════════════════════════════════════
+
+def _now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _safe_json_load(x):
+    if x is None:
+        return None
+    if isinstance(x, (dict, list)):
+        return x
+    if isinstance(x, str):
+        try:
+            return json.loads(x)
+        except Exception:
+            return None
+    return None
+
+
+def _claim_command(cmd_id: int) -> dict | None:
+    """
+    Optimistic claim: set status=processing only if status is queued.
+    Returns updated row (representation) if claimed, else None.
+    """
+    try:
+        res = sb_update(
+            "dca_commands",
+            {"id": f"eq.{cmd_id}", "status": "eq.queued"},
+            {"status": "processing"},
+        )
+        if isinstance(res, list) and len(res) == 1:
+            return res[0]
+        return None
+    except Exception as e:
+        print(f"[commands] claim failed id={cmd_id}: {e}")
+        return None
+
+
+def _set_command_status(cmd_id: int, status: str):
+    """Best-effort: update status only (to avoid schema mismatch)."""
+    try:
+        sb_update("dca_commands", {"id": f"eq.{cmd_id}"}, {"status": status})
+    except Exception as e:
+        print(f"[commands] set status failed id={cmd_id} -> {status}: {e}")
+
+
+def _apply_settings_set_timewindow(payload: dict):
+    """
+    payload example:
+      {"timezone":"America/Chicago","target_time":"11:50","time_window_minutes":480}
+    Applies to dca_settings id=1.
+    """
+    tz = payload.get("timezone")
+    tt = payload.get("target_time")
+    tw = payload.get("time_window_minutes")
+
+    updates = {"updated_at": _now_utc_iso()}
+
+    if isinstance(tz, str) and tz:
+        updates["timezone"] = tz
+
+    if isinstance(tt, str) and tt and ":" in tt:
+        # very light validation
+        h, m = tt.split(":", 1)
+        if h.isdigit() and m.isdigit():
+            hh = int(h); mm = int(m)
+            if 0 <= hh <= 23 and 0 <= mm <= 59:
+                updates["target_time"] = f"{hh:02d}:{mm:02d}"
+
+    if tw is not None:
+        try:
+            n = int(tw)
+            if n > 0:
+                updates["time_window_minutes"] = n
+        except Exception:
+            pass
+
+    # If nothing to update (besides updated_at), still write updated_at for traceability.
+    sb_update("dca_settings", {"id": "eq.1"}, updates)
+
+
+def process_dca_commands(max_per_run: int = 25):
+    """
+    Pull queued commands and apply them.
+    Important: apply BEFORE reading dca_settings for this run.
+    """
+    try:
+        rows = sb_get(
+            "dca_commands",
+            {
+                "status": "eq.queued",
+                "select": "id,command,payload,created_at,status",
+                "order": "created_at.asc",
+                "limit": str(max_per_run),
+            },
+        ) or []
+    except Exception as e:
+        print(f"[commands] load failed: {e}")
+        return
+
+    if not rows:
+        print("[commands] no queued commands")
+        return
+
+    print(f"[commands] queued: {len(rows)} (max {max_per_run})")
+
+    for r in rows:
+        cmd_id = r.get("id")
+        cmd = r.get("command")
+        payload_raw = r.get("payload")
+
+        if not isinstance(cmd_id, int):
+            continue
+
+        # Claim (avoid double-processing if concurrent runs)
+        claimed = _claim_command(cmd_id)
+        if not claimed:
+            print(f"[commands] skip (not claimed) id={cmd_id}")
+            continue
+
+        payload = _safe_json_load(payload_raw) or {}
+        if not isinstance(payload, dict):
+            payload = {}
+
+        print(f"[commands] processing id={cmd_id} cmd={cmd}")
+
+        try:
+            if cmd == "settings_set_timewindow":
+                _apply_settings_set_timewindow(payload)
+                _set_command_status(cmd_id, "done")
+                print(f"[commands] done id={cmd_id}")
+            else:
+                print(f"[commands] unknown cmd id={cmd_id}: {cmd}")
+                _set_command_status(cmd_id, "failed")
+        except Exception as e:
+            print(f"[commands] failed id={cmd_id}: {e}")
+            _set_command_status(cmd_id, "failed")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -170,26 +338,6 @@ def kraken_public(endpoint: str, params: dict | None = None) -> dict:
     if result.get("error"):
         raise KrakenError(result["error"])
     return result["result"]
-
-
-# ═══════════════════════════════════════════════════════════════
-#  TELEGRAM
-# ═══════════════════════════════════════════════════════════════
-
-def tg_send(text: str):
-    """Send Telegram message. Silent fail if not configured."""
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        print(f"[TG skip] {text}")
-        return
-    try:
-        url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-        data = json.dumps(
-            {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"}
-        ).encode()
-        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-        urllib.request.urlopen(req, timeout=10)
-    except Exception as e:
-        print(f"[TG error] {e}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -747,6 +895,9 @@ def main():
     if mode == "--weekly":
         send_weekly_summary()
         return
+
+    # 0) Consume queued SQL commands BEFORE reading settings
+    process_dca_commands(DCA_COMMANDS_MAX_PER_RUN)
 
     now_chicago = datetime.now(CHICAGO_TZ)
     now_str = now_chicago.strftime("%Y-%m-%d %H:%M:%S %Z")
