@@ -703,13 +703,21 @@ def execute_pair(order: dict, settings: dict, today_chicago: str) -> dict:
     # ── Finalize ──────────────────────────────────────────────
     time.sleep(2)
 
+    # Reflect DB truth in return status
     try:
-        finalize_order(cl_ord_id, order_id)
+        row = sb_get(
+            "dca_executions",
+            {
+                "cl_ord_id": f"eq.{cl_ord_id}",
+                "select": "filled_quote_cost,fee_quote,filled_base_volume,avg_price",
+            },
+        )
+        if row and isinstance(row, list):
+            return {"pair": pair, "status": "placed", "order_id": order_id, **row[0]}
     except Exception as e:
-        print(f"  ⚠ Finalize failed: {e} — reconciliation will catch it")
+        print(f"  ⚠ Post-finalize DB read failed: {e}")
 
     return {"pair": pair, "status": "placed", "order_id": order_id}
-
 
 # ═══════════════════════════════════════════════════════════════
 #  RECONCILIATION
