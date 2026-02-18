@@ -377,6 +377,17 @@ def get_ticker_snapshot(pair: str) -> dict:
 #  FINALIZE (LIVE)
 # ═══════════════════════════════════════════════════════════════
 
+def _pair_from_cl_ord_id(cl_ord_id: str) -> str:
+    # Expected: "dca-KASUSD-YYYY-MM-DD..." → returns "KASUSD"
+    try:
+        parts = cl_ord_id.split("-")
+        if len(parts) >= 2 and parts[1]:
+            return parts[1]
+    except Exception:
+        pass
+    return "?"
+
+
 def finalize_order(cl_ord_id: str, order_id: str):
     """Query Kraken for fill details and update DB."""
     if not order_id:
@@ -403,6 +414,9 @@ def finalize_order(cl_ord_id: str, order_id: str):
     all_in = cost + fee
     print(f"  Fill: {vol_exec} @ avg {avg_px} | cost ${cost} | fee ${fee} | all-in ${all_in:.4f}")
 
+    finished_at_utc = datetime.now(timezone.utc)
+    finished_at_iso = finished_at_utc.isoformat()
+
     sb_update(
         "dca_executions",
         {"cl_ord_id": f"eq.{cl_ord_id}"},
@@ -412,19 +426,30 @@ def finalize_order(cl_ord_id: str, order_id: str):
             "fee_quote": fee,
             "filled_base_volume": vol_exec,
             "avg_price": avg_px,
-            "execution_finished_at": datetime.now(timezone.utc).isoformat(),
+            "execution_finished_at": finished_at_iso,
             "raw": json.dumps(order_data),
         },
     )
 
-    # Telegram notify on successful LIVE fill
+    # Telegram notify on successful LIVE fill (xRocket vibe)
     if TG_NOTIFY_ON_FILL:
+        pair = None
+        try:
+            descr = order_data.get("descr") or {}
+            pair = descr.get("pair")
+        except Exception:
+            pair = None
+        if not pair:
+            pair = _pair_from_cl_ord_id(cl_ord_id)
+
+        filled_ts = finished_at_utc.astimezone(CHICAGO_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
+
         tg_send(
-            f"✅ <b>DCA FILLED</b>\n"
-            f"{cl_ord_id}\n"
+            f"✅ <b>DCA {pair} FILLED</b>\n"
+            f"{filled_ts}\n"
             f"All-in: ${all_in:.4f}\n"
             f"Vol: {vol_exec}\n"
-            f"Avg: ${avg_px}"
+            f"Avg: ${avg_px:.5f}"
         )
 
 
@@ -653,11 +678,12 @@ def execute_pair(order: dict, settings: dict, today_chicago: str) -> dict:
             }),
         })
 
-        # ✅ Telegram notify on successful DRY RUN fill
+        # Telegram notify on successful DRY RUN fill
         if TG_NOTIFY_ON_FILL:
+            ts = datetime.now(timezone.utc).astimezone(CHICAGO_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
             tg_send(
-                f"🧪 <b>DCA DRY RUN FILLED</b>\n"
-                f"{today_chicago} | {pair}\n"
+                f"🧪 <b>DCA {pair} DRY RUN FILLED</b>\n"
+                f"{ts}\n"
                 f"All-in est: ${estimated_total:.4f}\n"
                 f"Vol est: {base_volume}\n"
                 f"Ask: ${ticker['ask']}"
@@ -703,21 +729,29 @@ def execute_pair(order: dict, settings: dict, today_chicago: str) -> dict:
     # ── Finalize ──────────────────────────────────────────────
     time.sleep(2)
 
+    # Best-effort finalize (can also be handled by reconciliation)
+    try:
+        finalize_order(cl_ord_id, order_id)
+    except Exception as e:
+        print(f"  ⚠ finalize_order error: {e}")
+
     # Reflect DB truth in return status
     try:
         row = sb_get(
             "dca_executions",
             {
                 "cl_ord_id": f"eq.{cl_ord_id}",
-                "select": "filled_quote_cost,fee_quote,filled_base_volume,avg_price",
+                "select": "filled_quote_cost,fee_quote,filled_base_volume,avg_price,status",
             },
         )
         if row and isinstance(row, list):
-            return {"pair": pair, "status": "placed", "order_id": order_id, **row[0]}
+            out = row[0]
+            return {"pair": pair, "status": out.get("status") or "placed", "order_id": order_id, **out}
     except Exception as e:
         print(f"  ⚠ Post-finalize DB read failed: {e}")
 
     return {"pair": pair, "status": "placed", "order_id": order_id}
+
 
 # ═══════════════════════════════════════════════════════════════
 #  RECONCILIATION
@@ -913,14 +947,14 @@ def main():
 
     print(f"🕐 Chicago time: {now_str}")
 
-    # 1. Load settings
+    # 1) Load settings
     settings_rows = sb_get("dca_settings", {"id": "eq.1"})
     if not settings_rows:
         print("✗ No dca_settings found!")
         sys.exit(1)
     settings = settings_rows[0]
 
-    # 2. Check time window
+    # 2) Check time window
     target_h, target_m = map(int, settings["target_time"].split(":"))
     window = int(settings["time_window_minutes"])
 
@@ -936,10 +970,10 @@ def main():
 
     print("   ✓ Inside window!")
 
-    # 3. Reconciliation first
+    # 3) Reconciliation first
     run_reconciliation()
 
-    # 4. Load enabled orders
+    # 4) Load enabled orders
     orders = sb_get("dca_orders", {
         "enabled": "eq.true",
         "base_quote_amount": "gt.0",
@@ -952,7 +986,7 @@ def main():
 
     print(f"   Found {len(orders)} enabled order(s)")
 
-    # 5. Execute each pair
+    # 5) Execute each pair
     results = []
     for order in orders:
         try:
@@ -969,10 +1003,10 @@ def main():
 
         time.sleep(1)
 
-    # 6. Weekly summary (if Sunday)
+    # 6) Weekly summary (if Sunday)
     send_weekly_summary()
 
-    # 7. Print summary
+    # 7) Print summary
     print(f"\n{'='*50}")
     print(f"📋 Run complete: {len(results)} pair(s)")
     for r in results:
