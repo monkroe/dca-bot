@@ -1021,7 +1021,7 @@ def main():
 
     print(f"   Window: {window_start.strftime('%H:%M')} – {window_end.strftime('%H:%M')}")
 
-    if not (window_start <= now_chicago <= window_end):
+    if mode != "--force" and not (window_start <= now_chicago <= window_end):
         print("   Outside window — exiting.")
         return
 

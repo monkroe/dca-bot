@@ -22,6 +22,7 @@ on:
           - ''           # normal scheduled run
           - --reconcile  # reconciliation only
           - --weekly     # weekly summary only
+          - --force      # bypass time window (buy now)
 
 # Only one DCA run at a time — don't cancel running job
 concurrency:
