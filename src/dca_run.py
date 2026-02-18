@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Kraken DCA Bot v1 — Execution Engine
+Kraken DCA Bot v1.1 — Execution Engine
 GitHub Actions → Python → Kraken API → Supabase → Telegram
 
 Usage (via GH Actions, not directly):
@@ -8,10 +8,18 @@ Usage (via GH Actions, not directly):
   python src/dca_run.py --reconcile  # Reconciliation only
   python src/dca_run.py --weekly     # Weekly summary only
 
-Variantas 1 (SQL control-plane):
-- Telegram/BENAS įrašo komandą į Supabase lentelę dca_commands (status='queued')
-- Šis skriptas, kiekvieno run metu, paima queued komandas, pritaiko į dca_settings/dca_orders
-  ir pažymi komandą done/failed.
+Control-plane:
+- Telegram/BENAS inserts command into Supabase dca_commands (status='queued')
+- This script, on each run, picks up queued commands, applies to dca_settings/dca_orders,
+  and marks command done/failed.
+
+Changelog v1.1:
+- user_id propagated to all dca_executions inserts
+- user_id filters on reconciliation and weekly summary queries
+- user_id filter on dca_orders load
+- VERSION constant for GH Actions log traceability
+- ICONS constants layer (zero inline emoji)
+- Settings re-read after command processing
 """
 
 import hashlib
@@ -26,6 +34,29 @@ import urllib.request
 import urllib.error
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+
+VERSION = "1.1.0"
+
+# ═══════════════════════════════════════════════════════════════
+#  ICONS — single source of truth for all UI symbols
+#  Change here → changes everywhere. Set all to "" for plain mode.
+# ═══════════════════════════════════════════════════════════════
+
+ICONS = {
+    "OK":        "\u2705",   # ✅
+    "WARN":      "\u26a0\ufe0f",  # ⚠️
+    "FAIL":      "\u274c",   # ❌
+    "SKIP":      "\u23ed",   # ⏭
+    "DRYRUN":    "\U0001f9ea",  # 🧪
+    "CHART":     "\U0001f4ca",  # 📊
+    "RECON":     "\U0001f504",  # 🔄
+    "BOT":       "\U0001f916",  # 🤖
+    "CLOCK":     "\U0001f550",  # 🕐
+    "LIST":      "\U0001f4cb",  # 📋
+    "MONEY":     "\U0001f4b0",  # 💰
+    "TREND":     "\U0001f4c8",  # 📈
+    "RULER":     "\U0001f4d0",  # 📐
+}
 
 # ═══════════════════════════════════════════════════════════════
 #  CONFIG FROM ENVIRONMENT (GH Secrets)
@@ -125,6 +156,30 @@ def tg_send(text: str):
 
 
 # ═══════════════════════════════════════════════════════════════
+#  MESSAGE FORMATTERS — semantic UI layer
+# ═══════════════════════════════════════════════════════════════
+
+def msg_ok(title: str, body: str) -> str:
+    return f"{ICONS['OK']} <b>{title}</b>\n{body}"
+
+
+def msg_warn(title: str, body: str) -> str:
+    return f"{ICONS['WARN']} <b>{title}</b>\n{body}"
+
+
+def msg_fail(title: str, body: str) -> str:
+    return f"{ICONS['FAIL']} <b>{title}</b>\n{body}"
+
+
+def msg_recon(title: str, body: str) -> str:
+    return f"{ICONS['RECON']} <b>{title}</b>\n{body}"
+
+
+def msg_dryrun(title: str, body: str) -> str:
+    return f"{ICONS['DRYRUN']} <b>{title}</b>\n{body}"
+
+
+# ═══════════════════════════════════════════════════════════════
 #  SQL CONTROL-PLANE (dca_commands)
 # ═══════════════════════════════════════════════════════════════
 
@@ -188,7 +243,6 @@ def _apply_settings_set_timewindow(payload: dict):
         updates["timezone"] = tz
 
     if isinstance(tt, str) and tt and ":" in tt:
-        # very light validation
         h, m = tt.split(":", 1)
         if h.isdigit() and m.isdigit():
             hh = int(h); mm = int(m)
@@ -203,7 +257,6 @@ def _apply_settings_set_timewindow(payload: dict):
         except Exception:
             pass
 
-    # If nothing to update (besides updated_at), still write updated_at for traceability.
     sb_update("dca_settings", {"id": "eq.1"}, updates)
 
 
@@ -240,7 +293,6 @@ def process_dca_commands(max_per_run: int = 25):
         if not isinstance(cmd_id, int):
             continue
 
-        # Claim (avoid double-processing if concurrent runs)
         claimed = _claim_command(cmd_id)
         if not claimed:
             print(f"[commands] skip (not claimed) id={cmd_id}")
@@ -378,7 +430,7 @@ def get_ticker_snapshot(pair: str) -> dict:
 # ═══════════════════════════════════════════════════════════════
 
 def _pair_from_cl_ord_id(cl_ord_id: str) -> str:
-    # Expected: "dca-KASUSD-YYYY-MM-DD..." → returns "KASUSD"
+    """Extract pair name from cl_ord_id format: dca-KASUSD-YYYY-MM-DD..."""
     try:
         parts = cl_ord_id.split("-")
         if len(parts) >= 2 and parts[1]:
@@ -396,14 +448,14 @@ def finalize_order(cl_ord_id: str, order_id: str):
     trades = kraken_private("QueryOrders", {"txid": order_id, "trades": "true"})
 
     if order_id not in trades:
-        print(f"  ⚠ Order {order_id} not found in QueryOrders yet")
+        print(f"  {ICONS['WARN']} Order {order_id} not found in QueryOrders yet")
         return
 
     order_data = trades[order_id]
     status = order_data.get("status", "")
 
     if status != "closed":
-        print(f"  ⚠ Order status: {status} (not closed yet)")
+        print(f"  {ICONS['WARN']} Order status: {status} (not closed yet)")
         return
 
     cost = float(order_data.get("cost", 0))
@@ -431,7 +483,6 @@ def finalize_order(cl_ord_id: str, order_id: str):
         },
     )
 
-    # Telegram notify on successful LIVE fill (xRocket vibe)
     if TG_NOTIFY_ON_FILL:
         pair = None
         try:
@@ -444,20 +495,17 @@ def finalize_order(cl_ord_id: str, order_id: str):
 
         filled_ts = finished_at_utc.astimezone(CHICAGO_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
 
-        tg_send(
-            f"✅ <b>DCA {pair} FILLED</b>\n"
-            f"{filled_ts}\n"
-            f"All-in: ${all_in:.4f}\n"
-            f"Vol: {vol_exec}\n"
-            f"Avg: ${avg_px:.5f}"
-        )
+        tg_send(msg_ok(
+            f"DCA {pair} FILLED",
+            f"{filled_ts}\nAll-in: ${all_in:.4f}\nVol: {vol_exec}\nAvg: ${avg_px:.5f}"
+        ))
 
 
 # ═══════════════════════════════════════════════════════════════
 #  CORE: EXECUTE ONE PAIR
 # ═══════════════════════════════════════════════════════════════
 
-def execute_pair(order: dict, settings: dict, today_chicago: str) -> dict:
+def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str) -> dict:
     """
     Full two-phase execution for one trading pair.
 
@@ -467,15 +515,13 @@ def execute_pair(order: dict, settings: dict, today_chicago: str) -> dict:
       cost_target   = safe_total / (1 + taker_fee_rate)
       base_volume   = floor(cost_target / ask_price, lot_decimals)
 
-    This ensures:  cost + fee  ≤  safe_total  ≤ total_target
+    This ensures:  cost + fee  <=  safe_total  <= total_target
     """
     pair = order["pair"]
     total_target = float(order["base_quote_amount"])
     fee_rate = float(settings["taker_fee_rate"])
     dry_run = bool(settings["dry_run"])
 
-    # cl_ord_id should be UNIQUE and idempotent in LIVE mode (one per day).
-    # In DRY RUN we add a unique suffix to allow multiple tests per day.
     if dry_run:
         cl_ord_id = f"dca-{pair}-{today_chicago}-dry-{int(time.time() * 1000)}"
     else:
@@ -487,6 +533,7 @@ def execute_pair(order: dict, settings: dict, today_chicago: str) -> dict:
 
     # ── Phase 1: CLAIM ────────────────────────────────────────
     claim_row = {
+        "user_id": user_id,
         "trade_date_chicago": today_chicago,
         "pair": pair,
         "cl_ord_id": cl_ord_id,
@@ -497,16 +544,15 @@ def execute_pair(order: dict, settings: dict, today_chicago: str) -> dict:
 
     try:
         sb_insert("dca_executions", claim_row)
-        print("  ✓ Claimed")
+        print(f"  {ICONS['OK']} Claimed")
     except urllib.error.HTTPError as e:
-        # If cl_ord_id is unique and already exists, this is the expected idempotency behavior.
         if e.code == 409:
             try:
                 raw = e.read().decode()
                 print(f"[Supabase HTTPError 409] {raw}")
             except Exception:
                 pass
-            print("  ⏭ Already claimed/executed for this cl_ord_id — skipping")
+            print(f"  {ICONS['SKIP']} Already claimed/executed for this cl_ord_id — skipping")
             return {"pair": pair, "status": "already_claimed", "skipped": True}
         raise
 
@@ -520,20 +566,19 @@ def execute_pair(order: dict, settings: dict, today_chicago: str) -> dict:
 
         if usd_balance < total_target:
             reason = f"USD balance ${usd_balance:.2f} < needed ${total_target:.2f}"
-            print(f"  ✗ {reason}")
+            print(f"  {ICONS['FAIL']} {reason}")
             update_execution({
                 "status": "skipped_insufficient_funds",
                 "reason": reason,
                 "execution_finished_at": datetime.now(timezone.utc).isoformat(),
             })
-            tg_send(
-                f"⚠️ <b>DCA SKIP</b>\n"
-                f"{today_chicago} | {pair}\n"
-                f"Insufficient funds: ${usd_balance:.2f} < ${total_target:.2f}"
-            )
+            tg_send(msg_warn(
+                "DCA SKIP",
+                f"{today_chicago} | {pair}\nInsufficient funds: ${usd_balance:.2f} < ${total_target:.2f}"
+            ))
             return {"pair": pair, "status": "skipped_insufficient_funds"}
     except KrakenError as e:
-        print(f"  ⚠ Balance check failed: {e} — continuing anyway")
+        print(f"  {ICONS['WARN']} Balance check failed: {e} — continuing anyway")
 
     # ── Preflight: Pair info ──────────────────────────────────
     try:
@@ -541,13 +586,13 @@ def execute_pair(order: dict, settings: dict, today_chicago: str) -> dict:
         print(f"  Min order: {pair_info['ordermin']} | Lot decimals: {pair_info['lot_decimals']}")
     except KrakenError as e:
         reason = f"AssetPairs lookup failed: {e}"
-        print(f"  ✗ {reason}")
+        print(f"  {ICONS['FAIL']} {reason}")
         update_execution({
             "status": "failed_kraken",
             "reason": reason,
             "execution_finished_at": datetime.now(timezone.utc).isoformat(),
         })
-        tg_send(f"❌ <b>DCA FAIL</b>\n{today_chicago} | {pair}\n{reason}")
+        tg_send(msg_fail("DCA FAIL", f"{today_chicago} | {pair}\n{reason}"))
         return {"pair": pair, "status": "failed_kraken"}
 
     # ── Snapshot: bid/ask/mid ─────────────────────────────────
@@ -561,65 +606,60 @@ def execute_pair(order: dict, settings: dict, today_chicago: str) -> dict:
             "mid_ts": datetime.now(timezone.utc).isoformat(),
         })
     except KrakenError as e:
-        print(f"  ⚠ Ticker failed: {e} — continuing without snapshot")
+        print(f"  {ICONS['WARN']} Ticker failed: {e} — continuing without snapshot")
         ticker = {"bid": None, "ask": None, "mid": None}
 
     # ── Fee-aware volume calculation ──────────────────────────
     if not ticker["ask"] or ticker["ask"] <= 0:
         reason = "No valid ASK price — can't compute base volume"
-        print(f"  ✗ {reason}")
+        print(f"  {ICONS['FAIL']} {reason}")
         update_execution({
             "status": "failed_kraken",
             "reason": reason,
             "execution_finished_at": datetime.now(timezone.utc).isoformat(),
         })
-        tg_send(f"❌ <b>DCA FAIL</b>\n{today_chicago} | {pair}\n{reason}")
+        tg_send(msg_fail("DCA FAIL", f"{today_chicago} | {pair}\n{reason}"))
         return {"pair": pair, "status": "failed_kraken"}
 
-    # Bulletproof guards
     if fee_rate < 0:
-        print(f"  ⚠ fee_rate < 0 ({fee_rate}) — clamping to 0")
+        print(f"  {ICONS['WARN']} fee_rate < 0 ({fee_rate}) — clamping to 0")
         fee_rate = 0.0
 
-    # Apply safety margin in quote currency (USD)
     safe_total = total_target - USD_SAFETY_MARGIN
     if safe_total < 0:
         safe_total = 0.0
 
-    # cost + fee = safe_total  →  cost = safe_total / (1 + fee_rate)
     denom = 1.0 + fee_rate
     if denom <= 0:
         denom = 1.0
 
     cost_target = safe_total / denom
 
-    # If target is too small, skip cleanly (prevents volume=0 / min-order errors)
     if cost_target <= 0:
         reason = f"Target too small after safety margin (${total_target:.2f} - ${USD_SAFETY_MARGIN:.2f})"
-        print(f"  ✗ {reason}")
+        print(f"  {ICONS['FAIL']} {reason}")
         update_execution({
             "status": "skipped_target_too_small",
             "reason": reason,
             "execution_finished_at": datetime.now(timezone.utc).isoformat(),
         })
-        tg_send(f"⚠️ <b>DCA SKIP</b>\n{today_chicago} | {pair}\n{reason}")
+        tg_send(msg_warn("DCA SKIP", f"{today_chicago} | {pair}\n{reason}"))
         return {"pair": pair, "status": "skipped_target_too_small"}
 
     base_volume = floor_to_decimals(cost_target / ticker["ask"], pair_info["lot_decimals"])
 
-    # Another guard: if rounding makes it 0, skip cleanly
     if base_volume <= 0:
         reason = (
             f"Computed base_volume is 0 after rounding "
             f"(cost_target={cost_target:.6f}, ask={ticker['ask']}, lot_decimals={pair_info['lot_decimals']})"
         )
-        print(f"  ✗ {reason}")
+        print(f"  {ICONS['FAIL']} {reason}")
         update_execution({
             "status": "skipped_target_too_small",
             "reason": reason,
             "execution_finished_at": datetime.now(timezone.utc).isoformat(),
         })
-        tg_send(f"⚠️ <b>DCA SKIP</b>\n{today_chicago} | {pair}\n{reason}")
+        tg_send(msg_warn("DCA SKIP", f"{today_chicago} | {pair}\n{reason}"))
         return {"pair": pair, "status": "skipped_target_too_small"}
 
     estimated_cost = base_volume * ticker["ask"]
@@ -640,22 +680,21 @@ def execute_pair(order: dict, settings: dict, today_chicago: str) -> dict:
     # ── Min order check ───────────────────────────────────────
     if base_volume < pair_info["ordermin"]:
         reason = f"Base volume {base_volume} < min {pair_info['ordermin']}"
-        print(f"  ✗ {reason}")
+        print(f"  {ICONS['FAIL']} {reason}")
         update_execution({
             "status": "skipped_min_order",
             "reason": reason,
             "execution_finished_at": datetime.now(timezone.utc).isoformat(),
         })
-        tg_send(
-            f"⚠️ <b>DCA SKIP</b>\n"
-            f"{today_chicago} | {pair}\n"
-            f"Below min order: {reason}"
-        )
+        tg_send(msg_warn(
+            "DCA SKIP",
+            f"{today_chicago} | {pair}\nBelow min order: {reason}"
+        ))
         return {"pair": pair, "status": "skipped_min_order"}
 
     # ── Execute ───────────────────────────────────────────────
     if dry_run:
-        print(f"  🧪 DRY RUN — simulated fill: {base_volume} @ ask {ticker['ask']}")
+        print(f"  {ICONS['DRYRUN']} DRY RUN — simulated fill: {base_volume} @ ask {ticker['ask']}")
         update_execution({
             "status": "filled_dry_run",
             "filled_quote_cost": round(estimated_cost, 6),
@@ -678,16 +717,12 @@ def execute_pair(order: dict, settings: dict, today_chicago: str) -> dict:
             }),
         })
 
-        # Telegram notify on successful DRY RUN fill
         if TG_NOTIFY_ON_FILL:
             ts = datetime.now(timezone.utc).astimezone(CHICAGO_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
-            tg_send(
-                f"🧪 <b>DCA {pair} DRY RUN FILLED</b>\n"
-                f"{ts}\n"
-                f"All-in est: ${estimated_total:.4f}\n"
-                f"Vol est: {base_volume}\n"
-                f"Ask: ${ticker['ask']}"
-            )
+            tg_send(msg_dryrun(
+                f"DCA {pair} DRY RUN FILLED",
+                f"{ts}\nAll-in est: ${estimated_total:.4f}\nVol est: {base_volume}\nAsk: ${ticker['ask']}"
+            ))
 
         return {"pair": pair, "status": "filled_dry_run"}
 
@@ -706,7 +741,7 @@ def execute_pair(order: dict, settings: dict, today_chicago: str) -> dict:
 
         result = kraken_private("AddOrder", order_params)
         order_id = result.get("txid", [None])[0]
-        print(f"  ✓ Order placed: {order_id}")
+        print(f"  {ICONS['OK']} Order placed: {order_id}")
 
         update_execution({
             "status": "placed",
@@ -716,26 +751,24 @@ def execute_pair(order: dict, settings: dict, today_chicago: str) -> dict:
 
     except KrakenError as e:
         reason = f"AddOrder failed: {e}"
-        print(f"  ✗ {reason}")
+        print(f"  {ICONS['FAIL']} {reason}")
         update_execution({
             "status": "failed_kraken",
             "reason": reason,
             "execution_finished_at": datetime.now(timezone.utc).isoformat(),
             "raw": json.dumps({"error": str(e)}),
         })
-        tg_send(f"❌ <b>DCA FAIL</b>\n{today_chicago} | {pair}\n{reason}")
+        tg_send(msg_fail("DCA FAIL", f"{today_chicago} | {pair}\n{reason}"))
         return {"pair": pair, "status": "failed_kraken"}
 
     # ── Finalize ──────────────────────────────────────────────
     time.sleep(2)
 
-    # Best-effort finalize (can also be handled by reconciliation)
     try:
         finalize_order(cl_ord_id, order_id)
     except Exception as e:
-        print(f"  ⚠ finalize_order error: {e}")
+        print(f"  {ICONS['WARN']} finalize_order error: {e}")
 
-    # Reflect DB truth in return status
     try:
         row = sb_get(
             "dca_executions",
@@ -748,7 +781,7 @@ def execute_pair(order: dict, settings: dict, today_chicago: str) -> dict:
             out = row[0]
             return {"pair": pair, "status": out.get("status") or "placed", "order_id": order_id, **out}
     except Exception as e:
-        print(f"  ⚠ Post-finalize DB read failed: {e}")
+        print(f"  {ICONS['WARN']} Post-finalize DB read failed: {e}")
 
     return {"pair": pair, "status": "placed", "order_id": order_id}
 
@@ -770,13 +803,14 @@ def try_find_kraken_order(cl_ord_id: str) -> str | None:
     return None
 
 
-def run_reconciliation():
+def run_reconciliation(user_id: str):
     """Find stale claimed/placed executions and try to resolve them."""
-    print("\n🔄 Reconciliation check...")
+    print(f"\n{ICONS['RECON']} Reconciliation check...")
 
     cutoff = (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat()
 
     stale = sb_get("dca_executions", {
+        "user_id": f"eq.{user_id}",
         "status": "in.(claimed,placed)",
         "execution_started_at": f"lt.{cutoff}",
         "select": "cl_ord_id,order_id,pair,status,trade_date_chicago",
@@ -807,11 +841,10 @@ def run_reconciliation():
                         "execution_finished_at": datetime.now(timezone.utc).isoformat(),
                     },
                 )
-                tg_send(
-                    f"🔄 <b>DCA RECONCILIATION</b>\n"
-                    f"{row['trade_date_chicago']} | {row['pair']}\n"
-                    f"Claimed but never placed — marked failed"
-                )
+                tg_send(msg_recon(
+                    "DCA RECONCILIATION",
+                    f"{row['trade_date_chicago']} | {row['pair']}\nClaimed but never placed — marked failed"
+                ))
 
         elif row["status"] == "placed" and order_id:
             try:
@@ -819,18 +852,17 @@ def run_reconciliation():
                 print("    Finalized successfully")
             except Exception as e:
                 print(f"    Finalize still failing: {e}")
-                tg_send(
-                    f"🔄 <b>DCA RECONCILIATION</b>\n"
-                    f"{row['trade_date_chicago']} | {row['pair']}\n"
-                    f"Placed but can't finalize: {e}"
-                )
+                tg_send(msg_recon(
+                    "DCA RECONCILIATION",
+                    f"{row['trade_date_chicago']} | {row['pair']}\nPlaced but can't finalize: {e}"
+                ))
 
 
 # ═══════════════════════════════════════════════════════════════
 #  WEEKLY SUMMARY
 # ═══════════════════════════════════════════════════════════════
 
-def send_weekly_summary():
+def send_weekly_summary(user_id: str):
     """Send Telegram weekly summary (idempotent, Sunday only)."""
     now_chicago = datetime.now(CHICAGO_TZ)
 
@@ -851,6 +883,7 @@ def send_weekly_summary():
     week_start = (now_chicago - timedelta(days=7)).strftime("%Y-%m-%d")
 
     rows = sb_get("dca_executions", {
+        "user_id": f"eq.{user_id}",
         "trade_date_chicago": f"gte.{week_start}",
         "select": "pair,status,filled_quote_cost,fee_quote,filled_base_volume,avg_price,mid,trade_date_chicago",
         "order": "trade_date_chicago.asc",
@@ -887,7 +920,11 @@ def send_weekly_summary():
         elif "failed" in status or "crashed" in status:
             s["failed"] += 1
 
-    lines = [f"📊 <b>DCA Weekly Summary</b>", f"Week: {week_key}", ""]
+    lines = [
+        f"{ICONS['CHART']} <b>DCA Weekly Summary</b>",
+        f"Week: {week_key}",
+        "",
+    ]
 
     for pair, s in pairs.items():
         symbol = pair.replace("USD", "")
@@ -897,15 +934,15 @@ def send_weekly_summary():
 
         lines.append(f"<b>{symbol}</b>")
         lines.append(
-            f"  ✅ {s['filled']} filled"
-            + (f" | ⏭ {s['skipped']} skip" if s["skipped"] else "")
-            + (f" | ❌ {s['failed']} fail" if s["failed"] else "")
+            f"  {ICONS['OK']} {s['filled']} filled"
+            + (f" | {ICONS['SKIP']} {s['skipped']} skip" if s["skipped"] else "")
+            + (f" | {ICONS['FAIL']} {s['failed']} fail" if s["failed"] else "")
         )
-        lines.append(f"  💰 ${all_in:.2f} all-in | {s['total_vol']:.6f} {symbol}")
+        lines.append(f"  {ICONS['MONEY']} ${all_in:.2f} all-in | {s['total_vol']:.6f} {symbol}")
         if avg_eff > 0:
-            lines.append(f"  📈 Avg price: ${avg_eff:.6f}")
+            lines.append(f"  {ICONS['TREND']} Avg price: ${avg_eff:.6f}")
         if avg_slip != 0:
-            lines.append(f"  📐 Avg slippage: {avg_slip:.4f}%")
+            lines.append(f"  {ICONS['RULER']} Avg slippage: {avg_slip:.4f}%")
         lines.append("")
 
     msg = "\n".join(lines)
@@ -920,7 +957,7 @@ def send_weekly_summary():
     except Exception:
         pass
 
-    print(f"✓ Weekly summary sent for {week_key}")
+    print(f"{ICONS['OK']} Weekly summary sent for {week_key}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -928,33 +965,53 @@ def send_weekly_summary():
 # ═══════════════════════════════════════════════════════════════
 
 def main():
+    print(f"{ICONS['BOT']} DCA Bot v{VERSION}")
+
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
 
+    # ── Load settings + user_id (needed for all modes) ────────
+    settings_rows = sb_get("dca_settings", {"id": "eq.1"})
+    if not settings_rows:
+        print(f"{ICONS['FAIL']} No dca_settings found!")
+        sys.exit(1)
+    settings = settings_rows[0]
+
+    user_id = settings.get("user_id")
+    if not user_id:
+        print(f"{ICONS['FAIL']} dca_settings.user_id is missing! Run:")
+        print("  UPDATE dca_settings SET user_id = '<uuid>' WHERE id = 1;")
+        sys.exit(1)
+
+    print(f"   user_id: {user_id[:8]}...")
+
+    # ── Mode dispatch ─────────────────────────────────────────
     if mode == "--reconcile":
-        run_reconciliation()
+        run_reconciliation(user_id)
         return
 
     if mode == "--weekly":
-        send_weekly_summary()
+        send_weekly_summary(user_id)
         return
+
+    # ── Normal run ────────────────────────────────────────────
 
     # 0) Consume queued SQL commands BEFORE reading settings
     process_dca_commands(DCA_COMMANDS_MAX_PER_RUN)
+
+    # Re-read settings in case commands changed them
+    settings_rows = sb_get("dca_settings", {"id": "eq.1"})
+    if not settings_rows:
+        print(f"{ICONS['FAIL']} No dca_settings found after command processing!")
+        sys.exit(1)
+    settings = settings_rows[0]
 
     now_chicago = datetime.now(CHICAGO_TZ)
     now_str = now_chicago.strftime("%Y-%m-%d %H:%M:%S %Z")
     today_chicago = now_chicago.strftime("%Y-%m-%d")
 
-    print(f"🕐 Chicago time: {now_str}")
+    print(f"{ICONS['CLOCK']} Chicago time: {now_str}")
 
-    # 1) Load settings
-    settings_rows = sb_get("dca_settings", {"id": "eq.1"})
-    if not settings_rows:
-        print("✗ No dca_settings found!")
-        sys.exit(1)
-    settings = settings_rows[0]
-
-    # 2) Check time window
+    # 1) Check time window
     target_h, target_m = map(int, settings["target_time"].split(":"))
     window = int(settings["time_window_minutes"])
 
@@ -968,13 +1025,14 @@ def main():
         print("   Outside window — exiting.")
         return
 
-    print("   ✓ Inside window!")
+    print(f"   {ICONS['OK']} Inside window!")
 
-    # 3) Reconciliation first
-    run_reconciliation()
+    # 2) Reconciliation first
+    run_reconciliation(user_id)
 
-    # 4) Load enabled orders
+    # 3) Load enabled orders (filtered by user_id)
     orders = sb_get("dca_orders", {
+        "user_id": f"eq.{user_id}",
         "enabled": "eq.true",
         "base_quote_amount": "gt.0",
         "order": "priority.asc",
@@ -986,29 +1044,28 @@ def main():
 
     print(f"   Found {len(orders)} enabled order(s)")
 
-    # 5) Execute each pair
+    # 4) Execute each pair
     results = []
     for order in orders:
         try:
-            result = execute_pair(order, settings, today_chicago)
+            result = execute_pair(order, settings, today_chicago, user_id)
             results.append(result)
         except Exception as e:
-            print(f"   ✗ Unhandled error for {order['pair']}: {e}")
-            tg_send(
-                f"❌ <b>DCA CRASH</b>\n"
-                f"{today_chicago} | {order['pair']}\n"
-                f"Unhandled: {e}"
-            )
+            print(f"   {ICONS['FAIL']} Unhandled error for {order['pair']}: {e}")
+            tg_send(msg_fail(
+                "DCA CRASH",
+                f"{today_chicago} | {order['pair']}\nUnhandled: {e}"
+            ))
             results.append({"pair": order["pair"], "status": "crashed", "error": str(e)})
 
         time.sleep(1)
 
-    # 6) Weekly summary (if Sunday)
-    send_weekly_summary()
+    # 5) Weekly summary (if Sunday)
+    send_weekly_summary(user_id)
 
-    # 7) Print summary
+    # 6) Print summary
     print(f"\n{'='*50}")
-    print(f"📋 Run complete: {len(results)} pair(s)")
+    print(f"{ICONS['LIST']} Run complete: {len(results)} pair(s)")
     for r in results:
         print(f"   {r['pair']}: {r['status']}")
 
