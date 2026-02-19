@@ -6,9 +6,6 @@
 name: DCA Bot
 
 on:
-  schedule:
-    # Every 5 minutes, offset from top of hour to avoid GH peak
-    # disabled - using pg_cron via Supabase
 
   # Manual trigger for testing
   workflow_dispatch:
