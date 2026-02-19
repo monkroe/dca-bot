@@ -73,7 +73,7 @@ CHICAGO_TZ = ZoneInfo("America/Chicago")
 
 # Safety margin in quote currency (USD) to ensure all-in never exceeds target.
 # Covers: price drift, fee_rate mismatch, rounding drift.
-USD_SAFETY_MARGIN = float(os.environ.get("DCA_USD_SAFETY_MARGIN", "0.03"))
+USD_SAFETY_MARGIN = float(os.environ.get("DCA_USD_SAFETY_MARGIN", "0"))
 
 # Whether to send Telegram message on successful fills (dry-run and live).
 TG_NOTIFY_ON_FILL = os.environ.get("TG_NOTIFY_ON_FILL", "true").lower() in ("1", "true", "yes", "y")
