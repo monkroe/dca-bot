@@ -136,6 +136,29 @@ def sb_update(table: str, match_params: dict, updates: dict):
 
 
 # ═══════════════════════════════════════════════════════════════
+
+def get_7d_ref_price(pair: str, user_id: str) -> float | None:
+    """Get average all-in price from last 7 filled executions for this pair."""
+    try:
+        rows = sb_get("dca_executions", {
+            "user_id": f"eq.{user_id}",
+            "pair": f"eq.{pair}",
+            "status": "eq.filled",
+            "select": "filled_quote_cost,fee_quote,filled_base_volume",
+            "order": "execution_started_at.desc",
+            "limit": "7",
+        })
+        if not rows or len(rows) == 0:
+            return None
+        total_cost = sum(float(r.get("filled_quote_cost", 0)) + float(r.get("fee_quote", 0)) for r in rows)
+        total_vol = sum(float(r.get("filled_base_volume", 0)) for r in rows)
+        if total_vol <= 0:
+            return None
+        return total_cost / total_vol
+    except Exception as e:
+        print(f"  {ICONS['WARN']} 7D ref price failed: {e}")
+        return None
+
 #  TELEGRAM
 # ═══════════════════════════════════════════════════════════════
 
@@ -610,6 +633,27 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str, 
         print(f"  {ICONS['WARN']} Ticker failed: {e} — continuing without snapshot")
         ticker = {"bid": None, "ask": None, "mid": None}
 
+
+    # ── 7D Cap Check (Smart DCA) ───────────────────────────────
+    CAP_PCT = 0.004  # 0.40%
+    if ticker["mid"] and not force:
+        ref_price = get_7d_ref_price(pair, user_id)
+        if ref_price is not None:
+            cap_price = ref_price * (1 + CAP_PCT)
+            print(f"  7D ref: ${ref_price:.6f} | Cap: ${cap_price:.6f} | Mid: ${ticker['mid']:.6f}")
+            if ticker["mid"] > cap_price:
+                pct_over = ((ticker["mid"] / ref_price) - 1) * 100
+                reason = f"Mid ${ticker['mid']:.6f} > cap ${cap_price:.6f} (+{pct_over:.2f}% vs 7D ref)"
+                print(f"  {ICONS['SKIP']} {reason}")
+                update_execution({
+                    "status": "skipped_above_cap",
+                    "reason": reason,
+                    "execution_finished_at": datetime.now(timezone.utc).isoformat(),
+                })
+                return {"pair": pair, "status": "skipped_above_cap"}
+            print(f"  {ICONS['OK']} Below cap — proceeding")
+        else:
+            print(f"  No 7D history — skipping cap check")
     # ── Fee-aware volume calculation ──────────────────────────
     if not ticker["ask"] or ticker["ask"] <= 0:
         reason = "No valid ASK price — can't compute base volume"
