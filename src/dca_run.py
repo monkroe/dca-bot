@@ -525,7 +525,8 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str, 
     if dry_run:
         cl_ord_id = f"dca-{pair}-{today_chicago}-dry-{int(time.time() * 1000)}"
     else:
-        cl_ord_id = f"dca-{pair}-{today_chicago}-force-{int(time.time() * 1000)}" if force else f"dca-{pair}-{today_chicago}"
+        ot = order.get("target_time", "08:00").replace(":", "")
+        cl_ord_id = f"dca-{pair}-{today_chicago}-force-{int(time.time() * 1000)}" if force else f"dca-{pair}-{today_chicago}-{ot}"
 
     print(f"\n{'='*50}")
     print(f"  {pair} | ${total_target:.2f} | fee {fee_rate*100:.2f}% | {'DRY RUN' if dry_run else 'LIVE'}")
@@ -1011,26 +1012,10 @@ def main():
 
     print(f"{ICONS['CLOCK']} Chicago time: {now_str}")
 
-    # 1) Check time window
-    target_h, target_m = map(int, settings["target_time"].split(":"))
-    window = int(settings["time_window_minutes"])
-
-    target_dt = now_chicago.replace(hour=target_h, minute=target_m, second=0, microsecond=0)
-    window_start = target_dt - timedelta(minutes=window // 2)
-    window_end = target_dt + timedelta(minutes=window // 2)
-
-    print(f"   Window: {window_start.strftime('%H:%M')} – {window_end.strftime('%H:%M')}")
-
-    if mode != "--force" and not (window_start <= now_chicago <= window_end):
-        print("   Outside window — exiting.")
-        return
-
-    print(f"   {ICONS['OK']} Inside window!")
-
-    # 2) Reconciliation first
+    # 1) Reconciliation first
     run_reconciliation(user_id)
 
-    # 3) Load enabled orders (filtered by user_id)
+    # 2) Load enabled orders (filtered by user_id)
     orders = sb_get("dca_orders", {
         "user_id": f"eq.{user_id}",
         "enabled": "eq.true",
@@ -1044,19 +1029,35 @@ def main():
 
     print(f"   Found {len(orders)} enabled order(s)")
 
-    # 4) Execute each pair
+    # 3) Execute each pair (per-order time window)
     results = []
     for order in orders:
+        pair = order["pair"]
+        o_time = order.get("target_time") or settings.get("target_time", "08:00")
+        o_window = int(order.get("time_window_minutes") or settings.get("time_window_minutes", 10))
+
+        o_h, o_m = map(int, o_time.split(":"))
+        o_target = now_chicago.replace(hour=o_h, minute=o_m, second=0, microsecond=0)
+        o_start = o_target - timedelta(minutes=o_window // 2)
+        o_end = o_target + timedelta(minutes=o_window // 2)
+
+        in_window = o_start <= now_chicago <= o_end
+        print(f"\n   {pair} @ {o_time} CT [{o_start.strftime('%H:%M')}-{o_end.strftime('%H:%M')}] {'IN' if in_window else 'OUT'}")
+
+        if mode != "--force" and not in_window:
+            print(f"   {ICONS['SKIP']} Outside window — skipping {pair}")
+            continue
+
         try:
             result = execute_pair(order, settings, today_chicago, user_id, force=(mode == "--force"))
             results.append(result)
         except Exception as e:
-            print(f"   {ICONS['FAIL']} Unhandled error for {order['pair']}: {e}")
+            print(f"   {ICONS['FAIL']} Unhandled error for {pair}: {e}")
             tg_send(msg_fail(
                 "DCA CRASH",
-                f"{today_chicago} | {order['pair']}\nUnhandled: {e}"
+                f"{today_chicago} | {pair}\nUnhandled: {e}"
             ))
-            results.append({"pair": order["pair"], "status": "crashed", "error": str(e)})
+            results.append({"pair": pair, "status": "crashed", "error": str(e)})
 
         time.sleep(1)
 
