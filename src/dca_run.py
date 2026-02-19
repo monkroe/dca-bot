@@ -505,7 +505,7 @@ def finalize_order(cl_ord_id: str, order_id: str):
 #  CORE: EXECUTE ONE PAIR
 # ═══════════════════════════════════════════════════════════════
 
-def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str) -> dict:
+def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str, force: bool = False) -> dict:
     """
     Full two-phase execution for one trading pair.
 
@@ -525,7 +525,7 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str) 
     if dry_run:
         cl_ord_id = f"dca-{pair}-{today_chicago}-dry-{int(time.time() * 1000)}"
     else:
-        cl_ord_id = f"dca-{pair}-{today_chicago}"
+        cl_ord_id = f"dca-{pair}-{today_chicago}-force-{int(time.time() * 1000)}" if force else f"dca-{pair}-{today_chicago}"
 
     print(f"\n{'='*50}")
     print(f"  {pair} | ${total_target:.2f} | fee {fee_rate*100:.2f}% | {'DRY RUN' if dry_run else 'LIVE'}")
@@ -1048,7 +1048,7 @@ def main():
     results = []
     for order in orders:
         try:
-            result = execute_pair(order, settings, today_chicago, user_id)
+            result = execute_pair(order, settings, today_chicago, user_id, force=(mode == "--force"))
             results.append(result)
         except Exception as e:
             print(f"   {ICONS['FAIL']} Unhandled error for {order['pair']}: {e}")
