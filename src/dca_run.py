@@ -635,7 +635,6 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str, 
     try:
         ticker = get_ticker_snapshot(pair)
         print(f"  Bid: {ticker['bid']} | Ask: {ticker['ask']} | Mid: {ticker['mid']:.6f}")
-        save_mid_snapshot(pair, ticker)
         update_execution({
             "bid": ticker["bid"],
             "ask": ticker["ask"],
@@ -1088,6 +1087,19 @@ def main():
     print(f"   Found {len(orders)} enabled order(s)")
 
     # 3) Execute each pair (per-order time window)
+    # 3a) Snapshot all unique pairs (regardless of time window)
+    seen_pairs = set()
+    for o in orders:
+        p = o["pair"]
+        if p not in seen_pairs:
+            seen_pairs.add(p)
+            try:
+                t = get_ticker_snapshot(p)
+                save_mid_snapshot(p, t)
+                print(f"   Snapshot {p}: mid={t['mid']:.6f}")
+            except Exception as e:
+                print(f"   Snapshot {p} failed: {e}")
+
     results = []
     for order in orders:
         pair = order["pair"]
