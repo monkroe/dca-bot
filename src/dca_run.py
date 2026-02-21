@@ -1090,7 +1090,7 @@ def main():
     # 3a) Snapshot all unique pairs (regardless of time window)
     seen_pairs = set()
     # Watchlist: extra pairs to snapshot (not traded, just tracking)
-    watchlist = ["ETHUSD", "DOTUSD", "LINKUSD", "AVAXUSD", "ATOMUSD"]
+    watchlist = ["ETHUSD", "LTCUSD", "BNBUSD", "JUPUSD", "MONUSD", "PEPEUSD", "ASTERUSD", "XMRUSD", "XLMUSD", "SUIUSD", "TONUSD", "CROUSD", "ADAUSD"]
     for wp in watchlist:
         if wp not in seen_pairs:
             seen_pairs.add(wp)
