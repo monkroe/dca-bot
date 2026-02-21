@@ -137,6 +137,18 @@ def sb_update(table: str, match_params: dict, updates: dict):
 
 # ═══════════════════════════════════════════════════════════════
 
+def save_mid_snapshot(pair: str, ticker: dict) -> None:
+    """Save ticker snapshot for A/B comparison and historical analysis."""
+    try:
+        sb_insert("dca_mid_snapshots", {
+            "pair": pair,
+            "mid": ticker.get("mid"),
+            "bid": ticker.get("bid"),
+            "ask": ticker.get("ask"),
+        })
+    except Exception as e:
+        print(f"  {ICONS['WARN']} snapshot save failed: {e}")
+
 def get_7d_ref_price(pair: str, user_id: str) -> float | None:
     """Get average mid price from all executions (filled + skipped) in last 7 days."""
     try:
@@ -623,6 +635,7 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str, 
     try:
         ticker = get_ticker_snapshot(pair)
         print(f"  Bid: {ticker['bid']} | Ask: {ticker['ask']} | Mid: {ticker['mid']:.6f}")
+        save_mid_snapshot(pair, ticker)
         update_execution({
             "bid": ticker["bid"],
             "ask": ticker["ask"],
