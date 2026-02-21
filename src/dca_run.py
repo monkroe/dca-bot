@@ -138,23 +138,23 @@ def sb_update(table: str, match_params: dict, updates: dict):
 # ═══════════════════════════════════════════════════════════════
 
 def get_7d_ref_price(pair: str, user_id: str) -> float | None:
-    """Get average all-in price from last 7 filled executions for this pair."""
+    """Get average mid price from all executions (filled + skipped) in last 7 days."""
     try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
         rows = sb_get("dca_executions", {
             "user_id": f"eq.{user_id}",
             "pair": f"eq.{pair}",
-            "status": "eq.filled",
-            "select": "filled_quote_cost,fee_quote,filled_base_volume",
+            "select": "mid",
+            "mid": "not.is.null",
+            "execution_started_at": f"gte.{cutoff}",
             "order": "execution_started_at.desc",
-            "limit": "7",
         })
         if not rows or len(rows) == 0:
             return None
-        total_cost = sum(float(r.get("filled_quote_cost", 0)) + float(r.get("fee_quote", 0)) for r in rows)
-        total_vol = sum(float(r.get("filled_base_volume", 0)) for r in rows)
-        if total_vol <= 0:
+        mids = [float(r["mid"]) for r in rows if r.get("mid")]
+        if not mids:
             return None
-        return total_cost / total_vol
+        return sum(mids) / len(mids)
     except Exception as e:
         print(f"  {ICONS['WARN']} 7D ref price failed: {e}")
         return None
