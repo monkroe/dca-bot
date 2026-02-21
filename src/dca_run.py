@@ -635,7 +635,7 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str, 
 
 
     # ── 7D Cap Check (Smart DCA) ───────────────────────────────
-    CAP_PCT = 0.004  # 0.40%
+    CAP_PCT = 0.03  # 3.0%
     if ticker["mid"] and not force:
         ref_price = get_7d_ref_price(pair, user_id)
         if ref_price is not None:
