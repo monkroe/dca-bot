@@ -1089,6 +1089,17 @@ def main():
     # 3) Execute each pair (per-order time window)
     # 3a) Snapshot all unique pairs (regardless of time window)
     seen_pairs = set()
+    # Watchlist: extra pairs to snapshot (not traded, just tracking)
+    watchlist = ["ETHUSD", "DOTUSD", "LINKUSD", "AVAXUSD", "ATOMUSD"]
+    for wp in watchlist:
+        if wp not in seen_pairs:
+            seen_pairs.add(wp)
+            try:
+                t = get_ticker_snapshot(wp)
+                save_mid_snapshot(wp, t)
+                print(f"   Snapshot {wp}: mid={t['mid']:.6f}")
+            except Exception as e:
+                print(f"   Snapshot {wp} failed: {e}")
     for o in orders:
         p = o["pair"]
         if p not in seen_pairs:
