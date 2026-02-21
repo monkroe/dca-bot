@@ -650,6 +650,7 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str, 
                     "reason": reason,
                     "execution_finished_at": datetime.now(timezone.utc).isoformat(),
                 })
+                tg_send(f"{ICONS['SKIP']} {pair.replace('USD','')} +{pct_over:.2f}% virš cap — skip")
                 return {"pair": pair, "status": "skipped_above_cap"}
             print(f"  {ICONS['OK']} Below cap — proceeding")
         else:
