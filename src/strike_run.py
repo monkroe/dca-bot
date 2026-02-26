@@ -293,6 +293,8 @@ def execute_pair(order, settings, today_chicago, user_id, force=False):
         if e.code == 409:
             print(f"  {ICONS['SKIP']} Already claimed — skipping")
             return {"pair": pair, "status": "already_claimed", "skipped": True}
+        raw_err = e.read().decode()
+        print(f"  {ICONS['FAIL']} Supabase insert error {e.code}: {raw_err}")
         raise
 
     def upd(updates):
