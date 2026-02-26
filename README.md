@@ -1,18 +1,55 @@
-# Kraken DCA Bot v1 🤖
+# dca-bot 🤖
 
-Automated Dollar-Cost Averaging via **Kraken API** + **GitHub Actions** + **Supabase**.
+Automated Dollar-Cost Averaging via **GitHub Actions** + **Supabase** + **Telegram**.
+Two independent bots — same architecture, different exchanges.
+
+## Bots
+
+| Bot | File | Exchange | Assets | Schedule |
+|-----|------|----------|--------|----------|
+| Kraken DCA | `src/dca_run.py` | Kraken Pro | KAS, SOL, XBT | Every 5 min (time-window) |
+| Strike DCA | `src/strike_run.py` | Strike | BTC | Every 5 min (time-window) |
 
 ## Architecture
+GitHub Actions (cron every 5 min)
+│
+├── src/dca_run.py      → Kraken API → Supabase → Telegram
+└── src/strike_run.py   → Strike API → Supabase → Telegram
+### Execution Flow (both bots)
+Reconciliation       — resolve stale claimed/placed executions
+Load orders          — read enabled orders from DB
+Time window check    — only execute within order's time window
+Balance check        — skip if insufficient funds
+Ticker snapshot      — record bid/ask/mid for analytics
+7D cap check         — skip if price > 7D avg × 1.03
+Execute              — place order (Kraken) or quote (Strike)
+Finalize             — poll for fill, update DB, notify Telegram
+### Smart Pricing (7D Cap)
 
-```
-GitHub Actions (cron 5min)
-    │
-    ├── Check Chicago time window (07:55–08:10)
-    ├── Supabase: read config + claim idempotency
-    ├── Kraken: balance check → snapshot → market buy
-    ├── Supabase: log execution + fill details
-    └── Telegram: alert on fail/skip, weekly summary
-```
+Skips purchase if current price is more than 3% above the 7-day average.
+Prevents buying at local tops. Override with `--force`.
+
+### Idempotency
+
+Each execution has a unique `cl_ord_id`:
+- Live:     `dca-KASUSD-2026-02-26-0845`
+- Dry run:  `dca-KASUSD-2026-02-26-dry-1740000000000`
+- Force:    `dca-KASUSD-2026-02-26-force-1740000000000`
+
+Duplicate runs for the same `cl_ord_id` are rejected (HTTP 409).
+
+### Status Lifecycle
+claimed → placed → filled         (happy path)
+claimed → skipped_*               (preflight fail)
+claimed → failed_kraken           (API error)
+claimed → failed_reconciliation   (orphaned claim)
+placed  → filled                  (via reconciliation)
+### Zero Dependencies
+
+Both scripts use only Python stdlib (`urllib`, `hashlib`, `hmac`, `json`, `zoneinfo`).
+No `pip install` needed. Requires Python 3.11+.
+
+---
 
 ## Setup
 
@@ -28,53 +65,90 @@ Create at [kraken.com/u/security/api](https://www.kraken.com/u/security/api):
 - ✅ Query Open Orders & Trades / Query Closed Orders & Trades
 - ❌ **NO withdrawal permissions!**
 
-### 3. Telegram Bot (optional)
+### 3. Strike API Key
+
+Create at [dashboard.strike.me](https://dashboard.strike.me) → API Keys:
+- ✅ Read balance
+- ✅ Create quotes
+- ❌ **NO withdrawal permissions!**
+
+### 4. Telegram Bot (optional)
 
 1. Message [@BotFather](https://t.me/BotFather) → `/newbot`
 2. Get bot token
-3. Send a message to your bot, then get chat_id:
-   `https://api.telegram.org/bot<TOKEN>/getUpdates`
+3. Get chat_id: `https://api.telegram.org/bot<TOKEN>/getUpdates`
 
-### 4. GitHub Secrets
+### 5. GitHub Secrets
 
-In repo → Settings → Secrets → Actions:
+Settings → Secrets → Actions:
 
-| Secret | Value |
-|--------|-------|
-| `KRAKEN_API_KEY` | Your Kraken API key |
-| `KRAKEN_API_SECRET` | Your Kraken API secret |
-| `SUPABASE_URL` | `https://xxx.supabase.co` |
-| `SUPABASE_SERVICE_ROLE_KEY` | From Supabase → Settings → API |
-| `TG_BOT_TOKEN` | Telegram bot token |
-| `TG_CHAT_ID` | Your Telegram chat ID |
+| Secret | Used by |
+|--------|---------|
+| `KRAKEN_API_KEY` | Kraken bot |
+| `KRAKEN_API_SECRET` | Kraken bot |
+| `STRIKE_API_KEY` | Strike bot |
+| `SUPABASE_URL` | Both |
+| `SUPABASE_SERVICE_ROLE_KEY` | Both |
+| `TG_BOT_TOKEN` | Both |
+| `TG_CHAT_ID` | Both |
 
-### 5. Enable
+### 6. Go Live
 
-Default: `dry_run = true`. Full pipeline runs but no real orders.
+Both bots default to `dry_run = true`. Full pipeline runs but no real orders.
 
-Go live:
 ```sql
+-- Kraken
 UPDATE dca_settings SET dry_run = false WHERE id = 1;
-```
 
-## Commands
-
-```bash
-# Normal run (GH Actions handles this automatically)
-python src/dca_run.py
-
-# Reconciliation only
-python src/dca_run.py --reconcile
-
-# Weekly summary only
-python src/dca_run.py --weekly
-```
-
-Manual trigger: Actions tab → DCA Bot → Run workflow
-
-## Pair Management
-
-```sql
+-- Strike
+UPDATE strike_dca_settings SET dry_run = false WHERE id = 1;
+Database Tables
+Kraken
+Table
+Purpose
+dca_settings
+Global settings (fee rate, dry_run, time window)
+dca_orders
+Per-pair orders (amount, time, priority)
+dca_executions
+Execution log (fill details, status, raw response)
+dca_mid_snapshots
+Price snapshots for analytics
+dca_commands
+SQL control-plane (change settings via Telegram)
+dca_notifications
+Sent notification log (weekly summary dedup)
+Strike
+Table
+Purpose
+strike_dca_settings
+Settings (dry_run, time window, user_id)
+strike_dca_orders
+Per-pair orders
+strike_dca_executions
+Execution log
+GitHub Actions
+Workflow
+File
+Trigger
+Kraken DCA Bot
+.github/workflows/dca_bot.yml
+Every 5 min + manual
+Strike DCA Bot
+.github/workflows/strike_dca.yml
+Every 5 min + manual
+Manual Modes
+Mode
+Description
+(empty)
+Normal scheduled run
+--force
+Bypass time window — buy immediately
+--reconcile
+Reconciliation only — no new orders
+--weekly
+Weekly summary only (Kraken)
+Pair Management (Kraken)
 -- Enable BTC
 UPDATE dca_orders SET enabled = true WHERE pair = 'XBTUSD';
 
@@ -87,11 +161,7 @@ VALUES ('SOLUSD', true, 5.00, 3);
 
 -- Disable everything
 UPDATE dca_orders SET enabled = false;
-```
-
-## Analytics
-
-```sql
+Analytics (Kraken)
 -- Today's executions
 SELECT * FROM v_dca_daily WHERE trade_date = CURRENT_DATE;
 
@@ -111,19 +181,18 @@ SELECT
     / NULLIF(SUM(filled_base_volume), 0) AS avg_effective_price
 FROM dca_executions
 GROUP BY pair;
-```
-
-## Status Lifecycle
-
-```
-claimed → placed → filled         (happy path)
-claimed → skipped_*               (preflight fail)
-claimed → failed_kraken           (API error)
-claimed → failed_reconciliation   (orphaned claim)
-placed  → filled                  (via reconciliation)
-```
-
-## Zero Dependencies
-
-Python script uses only stdlib (`urllib`, `hashlib`, `hmac`, `json`, `zoneinfo`).
-No `pip install` needed. Runs on any Python 3.9+.
+Environment Variables
+Variable
+Default
+Description
+DCA_USD_SAFETY_MARGIN
+0 (Kraken) / 0.03 (Strike)
+USD buffer to avoid overspend
+TG_NOTIFY_ON_FILL
+true
+Send Telegram on successful fill
+DCA_COMMANDS_MAX_PER_RUN
+25
+Max SQL commands per run (Kraken)
+Local Testing
+./test.sh    # Python syntax check for all scripts
