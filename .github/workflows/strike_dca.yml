@@ -1,1 +1,45 @@
+name: Strike DCA Bot
 
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Run mode'
+        required: false
+        default: ''
+        type: choice
+        options:
+          - ''
+          - --reconcile
+          - --force
+
+concurrency:
+  group: strike-dca-bot
+  cancel-in-progress: false
+
+jobs:
+  strike-run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run Strike DCA Bot
+        env:
+          STRIKE_API_KEY:            ${{ secrets.STRIKE_API_KEY }}
+          SUPABASE_URL:              ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          TG_BOT_TOKEN:              ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID:                ${{ secrets.TG_CHAT_ID }}
+          DCA_USD_SAFETY_MARGIN:     '0.03'
+        run: |
+          python src/strike_run.py ${{ github.event.inputs.mode || '' }}
