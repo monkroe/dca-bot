@@ -300,11 +300,11 @@ def execute_pair(order, settings, today_chicago, user_id, force=False):
     def upd(updates):
         sb_update("strike_dca_executions", {"cl_ord_id": f"eq.{cl_ord_id}"}, updates)
 
-    # BALANCE
+    # BALANCE (skip in dry_run)
     try:
         usd_balance = check_balance_usd()
         print(f"  Balance: ${usd_balance:.2f} | Need: ${total_target:.2f}")
-        if usd_balance < total_target:
+        if not dry_run and usd_balance < total_target:
             reason = f"USD balance ${usd_balance:.2f} < needed ${total_target:.2f}"
             upd({"status": "skipped_insufficient_funds", "reason": reason,
                  "execution_finished_at": datetime.now(timezone.utc).isoformat()})
