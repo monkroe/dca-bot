@@ -40,7 +40,7 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           TG_BOT_TOKEN:              ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID:                ${{ secrets.TG_CHAT_ID }}
-          DCA_USD_SAFETY_MARGIN:     '0.03'
+          DCA_USD_SAFETY_MARGIN:     '0'
           PYTHONUNBUFFERED:           '1'
         run: |
           python src/strike_run.py ${{ github.event.inputs.mode || '' }}
