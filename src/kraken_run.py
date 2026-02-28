@@ -476,7 +476,7 @@ def _pair_from_cl_ord_id(cl_ord_id: str) -> str:
     return "?"
 
 
-def finalize_order(cl_ord_id: str, order_id: str, mid: float | None = None):
+def finalize_order(cl_ord_id: str, order_id: str, mid: float | None = None, ohlc_ctx: dict | None = None):
     """Query Kraken for fill details and update DB."""
     if not order_id:
         return
@@ -530,6 +530,9 @@ def finalize_order(cl_ord_id: str, order_id: str, mid: float | None = None):
             "impact_bps": impact_bps,
             "all_in_bps": all_in_bps,
             "mid_source": mid_source,
+            "h7": ohlc_ctx.get("H7") if ohlc_ctx else None,
+            "h30": ohlc_ctx.get("H30") if ohlc_ctx else None,
+            "ohlc_ts": datetime.now(timezone.utc).isoformat() if ohlc_ctx else None,
         },
     )
 
@@ -853,7 +856,7 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str, 
     time.sleep(2)
 
     try:
-        finalize_order(cl_ord_id, order_id, mid=ticker.get("mid"))
+        finalize_order(cl_ord_id, order_id, mid=ticker.get("mid"), ohlc_ctx=ohlc_ctx)
     except Exception as e:
         print(f"  {ICONS['WARN']} finalize_order error: {e}")
 
