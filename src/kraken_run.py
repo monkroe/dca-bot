@@ -640,9 +640,10 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str, 
                 "reason": reason,
                 "execution_finished_at": datetime.now(timezone.utc).isoformat(),
             })
+            ts_chi = datetime.now(timezone.utc).astimezone(CHICAGO_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
             tg_send(msg_warn(
                 "DCA SKIP",
-                f"{today_chicago} | {pair}\nInsufficient funds: ${usd_balance:.2f} < ${total_target:.2f}"
+                f"{ts_chi}\n{today_chicago} | {pair}\nInsufficient funds: ${usd_balance:.2f} < ${total_target:.2f}"
             ))
             return {"pair": pair, "status": "skipped_insufficient_funds"}
     except KrakenError as e:
