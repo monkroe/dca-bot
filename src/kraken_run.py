@@ -475,7 +475,7 @@ def _pair_from_cl_ord_id(cl_ord_id: str) -> str:
     return "?"
 
 
-def finalize_order(cl_ord_id: str, order_id: str):
+def finalize_order(cl_ord_id: str, order_id: str, mid: float | None = None):
     """Query Kraken for fill details and update DB."""
     if not order_id:
         return
@@ -504,6 +504,17 @@ def finalize_order(cl_ord_id: str, order_id: str):
     finished_at_utc = datetime.now(timezone.utc)
     finished_at_iso = finished_at_utc.isoformat()
 
+    # ── bps metrics (Phase 1.5) ──────────────────────────────
+    impact_bps = None
+    all_in_bps = None
+    mid_source = None
+    if mid is not None and mid > 0 and vol_exec > 0 and avg_px > 0:
+        mid_source = "ticker_fallback"
+        impact_bps = round(((avg_px / mid) - 1) * 10_000, 4)
+        all_in_price = (cost + fee) / vol_exec
+        all_in_bps = round(((all_in_price / mid) - 1) * 10_000, 4)
+        print(f"  impact_bps: {impact_bps:.4f} | all_in_bps: {all_in_bps:.4f} | mid_source: {mid_source}")
+
     sb_update(
         "dca_executions",
         {"cl_ord_id": f"eq.{cl_ord_id}"},
@@ -515,6 +526,9 @@ def finalize_order(cl_ord_id: str, order_id: str):
             "avg_price": avg_px,
             "execution_finished_at": finished_at_iso,
             "raw": json.dumps(order_data),
+            "impact_bps": impact_bps,
+            "all_in_bps": all_in_bps,
+            "mid_source": mid_source,
         },
     )
 
@@ -823,7 +837,7 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str, 
     time.sleep(2)
 
     try:
-        finalize_order(cl_ord_id, order_id)
+        finalize_order(cl_ord_id, order_id, mid=ticker.get("mid"))
     except Exception as e:
         print(f"  {ICONS['WARN']} finalize_order error: {e}")
 
