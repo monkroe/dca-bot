@@ -34,6 +34,7 @@ import urllib.request
 import urllib.error
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+from ohlc import build_daily_metrics
 
 VERSION = "1.1.0"
 
@@ -659,6 +660,21 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str, 
         print(f"  {ICONS['WARN']} Ticker failed: {e} — continuing without snapshot")
         ticker = {"bid": None, "ask": None, "mid": None}
 
+
+    # -- OHLC Market Context (Phase 1.5) ----------------------------
+    ohlc_ctx: dict = {}
+    if ticker["mid"] is not None:
+        try:
+            ohlc_ctx = build_daily_metrics(pair, days=220)
+            h7  = ohlc_ctx.get("H7")
+            h30 = ohlc_ctx.get("H30")
+            if h7 is not None and h30 is not None:
+                print(f"  OHLC H7={h7:.6f} H30={h30:.6f} latest={ohlc_ctx.get('latest_close', 0.0):.6f}")
+            else:
+                print("  OHLC partial/missing")
+        except Exception as e:
+            print(f"  WARN OHLC fetch failed: {e} -- continuing without market context")
+            ohlc_ctx = {}
 
     # ── 7D Cap Check (Smart DCA) ───────────────────────────────
     CAP_PCT = 0.03  # 3.0%
