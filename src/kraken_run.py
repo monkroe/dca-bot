@@ -23,6 +23,7 @@ Changelog v1.1:
 """
 
 import hashlib
+import uuid
 import hmac
 import base64
 import json
@@ -627,7 +628,9 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str, 
     print(f"  cl_ord_id: {cl_ord_id}")
 
     # ── Phase 1: CLAIM ────────────────────────────────────────
+    event_id = str(uuid.uuid4())
     claim_row = {
+        "id": event_id,
         "user_id": user_id,
         "trade_date_chicago": today_chicago,
         "pair": pair,
@@ -635,6 +638,8 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str, 
         "status": "claimed",
         "requested_quote_amount_base": total_target,
         "execution_started_at": datetime.now(timezone.utc).isoformat(),
+        "parent_event_id": event_id,
+        "attempt_type": "market",
     }
 
     try:
