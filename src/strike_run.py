@@ -8,11 +8,13 @@ import os
 import sys
 import time
 import json
+import uuid
 import urllib.parse
 import urllib.request
 import urllib.error
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+from ohlc import build_daily_metrics
 
 VERSION = "1.1.0-STRIKE"
 
@@ -197,7 +199,7 @@ def _pair_from_cl_ord_id(cl_ord_id):
     except Exception:
         return "?"
 
-def finalize_order(cl_ord_id, quote_id):
+def finalize_order(cl_ord_id, quote_id, ohlc_ctx=None, dry_run=False):
     if not quote_id:
         return
 
@@ -243,6 +245,9 @@ def finalize_order(cl_ord_id, quote_id):
             "avg_price": avg_px,
             "execution_finished_at": finished_at_utc.isoformat(),
             "raw": json.dumps(final_q),
+            "h7": ohlc_ctx.get("H7") if ohlc_ctx and not dry_run else None,
+            "h30": ohlc_ctx.get("H30") if ohlc_ctx and not dry_run else None,
+            "ohlc_ts": datetime.now(timezone.utc).isoformat() if ohlc_ctx and not dry_run else None,
         },
     )
 
@@ -279,6 +284,7 @@ def execute_pair(order, settings, today_chicago, user_id, force=False):
 
     # CLAIM
     try:
+        event_id = str(uuid.uuid4())
         sb_insert("strike_dca_executions", {
             "user_id": user_id,
             "trade_date_chicago": today_chicago,
@@ -287,6 +293,8 @@ def execute_pair(order, settings, today_chicago, user_id, force=False):
             "status": "claimed",
             "requested_quote_amount_base": total_target,
             "execution_started_at": datetime.now(timezone.utc).isoformat(),
+            "parent_event_id": event_id,
+            "attempt_type": "market",
         })
         print(f"  {ICONS['OK']} Claimed")
     except urllib.error.HTTPError as e:
@@ -323,6 +331,21 @@ def execute_pair(order, settings, today_chicago, user_id, force=False):
     except StrikeError as e:
         print(f"  {ICONS['WARN']} Ticker failed: {e} — continuing without snapshot")
         ticker = {"bid": None, "ask": None, "mid": None}
+
+    # -- OHLC Market Context ----------------------------------------
+    ohlc_ctx: dict = {}
+    if not dry_run and ticker["mid"] is not None:
+        try:
+            ohlc_ctx = build_daily_metrics(pair, days=220)
+            _h7  = ohlc_ctx.get("H7")
+            _h30 = ohlc_ctx.get("H30")
+            if _h7 is not None and _h30 is not None:
+                print(f"  OHLC H7={_h7:.6f} H30={_h30:.6f}")
+            else:
+                print("  OHLC partial/missing")
+        except Exception as e:
+            print(f"  WARN OHLC fetch failed: {e} -- continuing")
+            ohlc_ctx = {}
 
     # 7D CAP
     CAP_PCT = 0.03
@@ -404,7 +427,7 @@ def execute_pair(order, settings, today_chicago, user_id, force=False):
     time.sleep(1)
 
     try:
-        finalize_order(cl_ord_id, quote_id)
+        finalize_order(cl_ord_id, quote_id, ohlc_ctx=ohlc_ctx, dry_run=dry_run)
     except Exception as e:
         print(f"  {ICONS['WARN']} finalize_order error: {e}")
 
