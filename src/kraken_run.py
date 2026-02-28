@@ -175,6 +175,13 @@ def get_7d_ref_price(pair: str, user_id: str) -> float | None:
 #  TELEGRAM
 # ═══════════════════════════════════════════════════════════════
 
+def _tg_html(text: str) -> str:
+    # Telegram parse_mode=HTML is strict. Escape user/variable content, but keep our simple formatting tags.
+    t = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    # Allowlist: only <b>...</b> (used by msg_ok/msg_warn/msg_fail/msg_recon/msg_dryrun)
+    t = t.replace("&lt;b&gt;", "<b>").replace("&lt;/b&gt;", "</b>")
+    return t
+
 def tg_send(text: str):
     """Send Telegram message. Silent fail if not configured."""
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
@@ -183,7 +190,7 @@ def tg_send(text: str):
     try:
         url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
         data = json.dumps(
-            {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"}
+            {"chat_id": TG_CHAT_ID, "text": _tg_html(text), "parse_mode": "HTML"}
         ).encode()
         req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
         urllib.request.urlopen(req, timeout=10)
