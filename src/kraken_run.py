@@ -630,7 +630,6 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str, 
     # ── Phase 1: CLAIM ────────────────────────────────────────
     event_id = str(uuid.uuid4())
     claim_row = {
-        "id": event_id,
         "user_id": user_id,
         "trade_date_chicago": today_chicago,
         "pair": pair,
