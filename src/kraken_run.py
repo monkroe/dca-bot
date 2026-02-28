@@ -187,8 +187,15 @@ def tg_send(text: str):
         ).encode()
         req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
         urllib.request.urlopen(req, timeout=10)
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", "replace")
+        except Exception:
+            body = "<no body>"
+        body = body[:500]
+        print("[TG error] HTTP " + str(e.code) + ": " + str(e.reason) + " | " + body)
     except Exception as e:
-        print(f"[TG error] {e}")
+        print("[TG error] " + str(e))
 
 
 # ═══════════════════════════════════════════════════════════════
