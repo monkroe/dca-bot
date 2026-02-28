@@ -562,9 +562,36 @@ def finalize_order(cl_ord_id: str, order_id: str, mid: float | None = None, ohlc
 
         filled_ts = finished_at_utc.astimezone(CHICAGO_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
 
+        impact_line = ""
+        if impact_bps is not None:
+            sign = "+" if float(impact_bps) >= 0 else ""
+            impact_line = f"\nImpact: {sign}{float(impact_bps):.1f} bps"
+        all_in_line = ""
+        if all_in_bps is not None:
+            sign = "+" if float(all_in_bps) >= 0 else ""
+            all_in_line = f" | All-in: {sign}{float(all_in_bps):.1f} bps"
+        ohlc_line = ""
+        if ohlc_ctx is not None and (ohlc_ctx.get("H7") is not None or ohlc_ctx.get("H30") is not None):
+            _h7 = ohlc_ctx.get("H7")
+            _h30 = ohlc_ctx.get("H30")
+            parts = []
+            if _h7 is not None:
+                parts.append(f"H7: ${float(_h7):.4f}")
+            if _h30 is not None:
+                parts.append(f"H30: ${float(_h30):.4f}")
+            if parts:
+                ohlc_line = "\n" + " | ".join(parts)
+        symbol = pair.replace("USD", "")
         tg_send(msg_ok(
             f"DCA {pair} FILLED",
-            f"{filled_ts}\nAll-in: ${all_in:.4f}\nVol: {vol_exec}\nAvg: ${avg_px:.5f}"
+            f"{filled_ts}\n\n"
+            f"Amount: {vol_exec} {symbol}\n"
+            f"Price:  ${avg_px:.5f}\n"
+            f"Cost:   ${cost:.4f}\n"
+            f"Fee:    ${fee:.4f}\n"
+            f"Total:  ${all_in:.4f}"
+            f"{impact_line}{all_in_line}{ohlc_line}\n"
+            f"Mid:    {mid_source or 'unknown'}"
         ))
 
 
