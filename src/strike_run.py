@@ -469,9 +469,10 @@ def run_reconciliation(user_id):
         print(f"  Stale: {cl_id} | status={row['status']} | quote={quote_id}")
         if quote_id:
             try:
-                raw_json = row.get("raw")
+                raw_row = sb_get("strike_dca_executions", {"cl_ord_id": f"eq.{cl_id}", "select": "raw"})
+                raw_json = raw_row[0].get("raw") if raw_row else None
                 print(f"  raw_json type={type(raw_json)}, value={str(raw_json)[:50]}")
-                quote_res = json.loads(raw_json) if raw_json else None
+                quote_res = raw_json if isinstance(raw_json, dict) else (json.loads(raw_json) if isinstance(raw_json, str) else None)
                 finalize_order(cl_id, quote_id, quote_res=quote_res)
                 print("    Finalized successfully")
             except Exception as e:
