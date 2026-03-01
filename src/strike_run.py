@@ -246,6 +246,7 @@ def finalize_order(cl_ord_id, quote_id, ohlc_ctx=None, dry_run=False, quote_res=
         {"cl_ord_id": f"eq.{cl_ord_id}"},
         {
             "status": "filled",
+            "quote_id": quote_id,
             "filled_quote_cost": usd_spent,
             "fee_quote": 0,
             "filled_base_volume": btc_received,
