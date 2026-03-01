@@ -437,7 +437,9 @@ def execute_pair(order, settings, today_chicago, user_id, force=False):
     try:
         finalize_order(cl_ord_id, quote_id, ohlc_ctx=ohlc_ctx, dry_run=dry_run, quote_res=quote_res)
     except Exception as e:
+        import traceback
         print(f"  {ICONS['WARN']} finalize_order error: {e}")
+        traceback.print_exc()
 
     return {"pair": pair, "status": "placed", "order_id": quote_id}
 
