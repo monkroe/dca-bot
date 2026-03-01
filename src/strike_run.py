@@ -467,7 +467,9 @@ def run_reconciliation(user_id):
         print(f"  Stale: {cl_id} | status={row['status']} | quote={quote_id}")
         if quote_id:
             try:
-                finalize_order(cl_id, quote_id)
+                raw_json = row.get("raw")
+                quote_res = json.loads(raw_json) if raw_json else None
+                finalize_order(cl_id, quote_id, quote_res=quote_res)
                 print("    Finalized successfully")
             except Exception as e:
                 print(f"    Finalize still failing: {e}")
