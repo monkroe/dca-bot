@@ -199,7 +199,7 @@ def _pair_from_cl_ord_id(cl_ord_id):
     except Exception:
         return "?"
 
-def finalize_order(cl_ord_id, quote_id, ohlc_ctx=None, dry_run=False):
+def finalize_order(cl_ord_id, quote_id, ohlc_ctx=None, dry_run=False, quote_res=None):
     if not quote_id:
         return
 
@@ -227,11 +227,15 @@ def finalize_order(cl_ord_id, quote_id, ohlc_ctx=None, dry_run=False):
         time.sleep(3)
 
     if not final_q:
-        print(f"  {ICONS['WARN']} Polling timeout for {quote_id}")
-        return
+        if quote_res and float((quote_res.get("target") or {}).get("amount", 0)) > 0:
+            print(f"  Using quote_res fallback for {quote_id}")
+            final_q = quote_res
+        else:
+            print(f"  {ICONS['WARN']} Polling timeout for {quote_id}")
+            return
 
-    btc_received = float(final_q.get("targetAmount", {}).get("amount", 0))
-    usd_spent    = float(final_q.get("sourceAmount", {}).get("amount", 0))
+    btc_received = float((final_q.get("targetAmount") or final_q.get("target") or {}).get("amount", 0))
+    usd_spent    = float((final_q.get("sourceAmount") or final_q.get("source") or {}).get("amount", 0))
     avg_px       = usd_spent / btc_received if btc_received > 0 else 0
 
     print(f"  Fill: {btc_received:.8f} BTC @ ${avg_px:.2f} | cost ${usd_spent:.2f}")
@@ -430,7 +434,7 @@ def execute_pair(order, settings, today_chicago, user_id, force=False):
     time.sleep(1)
 
     try:
-        finalize_order(cl_ord_id, quote_id, ohlc_ctx=ohlc_ctx, dry_run=dry_run)
+        finalize_order(cl_ord_id, quote_id, ohlc_ctx=ohlc_ctx, dry_run=dry_run, quote_res=quote_res)
     except Exception as e:
         print(f"  {ICONS['WARN']} finalize_order error: {e}")
 
