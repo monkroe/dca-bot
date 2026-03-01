@@ -210,8 +210,11 @@ def finalize_order(cl_ord_id, quote_id, ohlc_ctx=None, dry_run=False):
             state = (q.get("state") or "").lower()
             print(f"  Poll {attempt+1}: {state}")
             if state in ("completed", "executed", "settled", "filled"):
-                final_q = q
-                break
+                amt = float((q.get("targetAmount") or {}).get("amount", 0))
+                if amt > 0:
+                    final_q = q
+                    break
+                print(f"  Poll {attempt+1}: completed but amount=0, retrying...")
             if state in ("failed", "expired", "canceled", "cancelled"):
                 sb_update("strike_dca_executions", {"cl_ord_id": f"eq.{cl_ord_id}"}, {
                     "status": "failed_strike",
