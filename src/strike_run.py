@@ -470,6 +470,7 @@ def run_reconciliation(user_id):
         if quote_id:
             try:
                 raw_json = row.get("raw")
+                print(f"  raw_json type={type(raw_json)}, value={str(raw_json)[:50]}")
                 quote_res = json.loads(raw_json) if raw_json else None
                 finalize_order(cl_id, quote_id, quote_res=quote_res)
                 print("    Finalized successfully")
