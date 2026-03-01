@@ -460,8 +460,13 @@ def run_reconciliation(user_id):
                 print("    Finalized successfully")
             except Exception as e:
                 print(f"    Finalize still failing: {e}")
+                sb_update("strike_dca_executions", {"cl_ord_id": f"eq.{cl_id}"}, {
+                    "status": "failed_reconciliation",
+                    "reason": str(e),
+                    "execution_finished_at": datetime.now(timezone.utc).isoformat(),
+                })
                 tg_send(msg_recon("STRIKE RECONCILIATION",
-                    f"{row['trade_date_chicago']} | {row['pair']}\nCan t finalize: {e}"))
+                    f"{row['trade_date_chicago']} | {row['pair']}\nCan t finalize: {e}\nManual check required."))
 
 
 # ═══════════════════════════════════════════════════════════════
