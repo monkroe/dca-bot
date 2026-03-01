@@ -227,7 +227,9 @@ def finalize_order(cl_ord_id, quote_id, ohlc_ctx=None, dry_run=False, quote_res=
         time.sleep(3)
 
     if not final_q:
-        if quote_res and float((quote_res.get("target") or {}).get("amount", 0)) > 0:
+        amt_fallback = float((quote_res.get("target") or {}).get("amount", 0)) if quote_res else 0
+        print(f"  Fallback check: quote_res={quote_res is not None}, amt={amt_fallback}")
+        if quote_res and amt_fallback > 0:
             print(f"  Using quote_res fallback for {quote_id}")
             final_q = quote_res
         else:
