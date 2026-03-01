@@ -227,9 +227,7 @@ def finalize_order(cl_ord_id, quote_id, ohlc_ctx=None, dry_run=False, quote_res=
         time.sleep(3)
 
     if not final_q:
-        amt_fallback = float((quote_res.get("target") or {}).get("amount", 0)) if quote_res else 0
-        print(f"  Fallback check: quote_res={quote_res is not None}, amt={amt_fallback}")
-        if quote_res and amt_fallback > 0:
+        if quote_res and float((quote_res.get("target") or {}).get("amount", 0)) > 0:
             print(f"  Using quote_res fallback for {quote_id}")
             final_q = quote_res
         else:
@@ -471,7 +469,6 @@ def run_reconciliation(user_id):
             try:
                 raw_row = sb_get("strike_dca_executions", {"cl_ord_id": f"eq.{cl_id}", "select": "raw"})
                 raw_json = raw_row[0].get("raw") if raw_row else None
-                print(f"  raw_json type={type(raw_json)}, value={str(raw_json)[:50]}")
                 quote_res = raw_json if isinstance(raw_json, dict) else (json.loads(raw_json) if isinstance(raw_json, str) else None)
                 finalize_order(cl_id, quote_id, quote_res=quote_res)
                 print("    Finalized successfully")
