@@ -473,7 +473,7 @@ def main():
 
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
 
-    settings_rows = sb_get("strike_dca_settings", {"id": "eq.00000000-0000-0000-0000-000000000001"})
+    settings_rows = sb_get("strike_dca_settings", {"id": "eq.9ec66057-9db9-4a61-b1e2-d2d4aa045b24"})
     if not settings_rows:
         print(f"{ICONS['FAIL']} No strike_dca_settings found!")
         sys.exit(1)
