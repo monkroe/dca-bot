@@ -474,7 +474,7 @@ def run_reconciliation(user_id):
     cutoff = (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat()
     stale = sb_get("strike_dca_executions", {
         "user_id": f"eq.{user_id}",
-        "status": "in.(quote_placed,placed)",
+        "status": "in.(claimed,quote_placed,placed)",
         "execution_started_at": f"lt.{cutoff}",
         "select": "cl_ord_id,order_id,pair,status,trade_date_chicago",
     })
@@ -501,6 +501,14 @@ def run_reconciliation(user_id):
                 })
                 tg_send(msg_recon("STRIKE RECONCILIATION",
                     f"{row['trade_date_chicago']} | {row['pair']}\nCan t finalize: {e}\nManual check required."))
+        else:
+            # claimed but no quote_id — crash before quote was placed
+            sb_update("strike_dca_executions", {"cl_ord_id": f"eq.{cl_id}"}, {
+                "status": "failed_reconciliation",
+                "reason": "Claimed but no quote placed (crash before quote)",
+                "execution_finished_at": datetime.now(timezone.utc).isoformat(),
+            })
+            print(f"    No quote_id — marked as failed_reconciliation")
 
 
 # ═══════════════════════════════════════════════════════════════
