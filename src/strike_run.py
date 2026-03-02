@@ -199,7 +199,7 @@ def _pair_from_cl_ord_id(cl_ord_id):
     except Exception:
         return "?"
 
-def finalize_order(cl_ord_id, quote_id, ohlc_ctx=None, dry_run=False, quote_res=None):
+def finalize_order(cl_ord_id, quote_id, ohlc_ctx=None, dry_run=False, quote_res=None, mid=None):
     if not quote_id:
         return
 
@@ -240,6 +240,16 @@ def finalize_order(cl_ord_id, quote_id, ohlc_ctx=None, dry_run=False, quote_res=
 
     print(f"  Fill: {btc_received:.8f} BTC @ ${avg_px:.2f} | cost ${usd_spent:.2f}")
 
+    impact_bps = None
+    all_in_bps = None
+    mid_source = None
+    if mid is not None and mid > 0 and btc_received > 0 and avg_px > 0:
+        mid_source = "strike_ticker"
+        impact_bps = round(((avg_px / mid) - 1) * 10_000, 4)
+        all_in_price = usd_spent / btc_received
+        all_in_bps = round(((all_in_price / mid) - 1) * 10_000, 4)
+        print(f"  impact_bps: {impact_bps:.4f} | all_in_bps: {all_in_bps:.4f}")
+
     finished_at_utc = datetime.now(timezone.utc)
     sb_update(
         "strike_dca_executions",
@@ -254,6 +264,9 @@ def finalize_order(cl_ord_id, quote_id, ohlc_ctx=None, dry_run=False, quote_res=
             "avg_price": avg_px,
             "execution_finished_at": finished_at_utc.isoformat(),
             "raw": json.dumps(final_q),
+            "impact_bps": impact_bps,
+            "all_in_bps": all_in_bps,
+            "mid_source": mid_source,
             "h7": ohlc_ctx.get("H7") if ohlc_ctx and not dry_run else None,
             "h30": ohlc_ctx.get("H30") if ohlc_ctx and not dry_run else None,
             "ohlc_ts": datetime.now(timezone.utc).isoformat() if ohlc_ctx and not dry_run else None,
@@ -436,11 +449,9 @@ def execute_pair(order, settings, today_chicago, user_id, force=False):
     time.sleep(1)
 
     try:
-        finalize_order(cl_ord_id, quote_id, ohlc_ctx=ohlc_ctx, dry_run=dry_run, quote_res=quote_res)
+        finalize_order(cl_ord_id, quote_id, ohlc_ctx=ohlc_ctx, dry_run=dry_run, quote_res=quote_res, mid=ticker["mid"])
     except Exception as e:
-        import traceback
         print(f"  {ICONS['WARN']} finalize_order error: {e}")
-        traceback.print_exc()
 
     return {"pair": pair, "status": "placed", "order_id": quote_id}
 
