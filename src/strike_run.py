@@ -156,7 +156,7 @@ def check_balance_usd():
     balances = strike_request("GET", "/v1/balances")
     for b in (balances or []):
         if b.get("currency") == "USD":
-            return float(b.get("available", 0))
+            return float(b.get("current", b.get("available", 0)))
     return 0.0
 
 def get_ticker_snapshot(pair):
