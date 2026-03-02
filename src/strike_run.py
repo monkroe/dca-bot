@@ -335,11 +335,20 @@ def execute_pair(order, settings, today_chicago, user_id, force=False):
         usd_balance = check_balance_usd()
         print(f"  Balance: ${usd_balance:.2f} | Need: ${total_target:.2f}")
         if not dry_run and usd_balance < total_target:
+            missing = total_target - usd_balance
             reason = f"USD balance ${usd_balance:.2f} < needed ${total_target:.2f}"
             upd({"status": "skipped_insufficient_funds", "reason": reason,
                  "execution_finished_at": datetime.now(timezone.utc).isoformat()})
-            tg_send(msg_warn("STRIKE DCA SKIP",
-                f"{today_chicago} | {pair}\nInsufficient funds: ${usd_balance:.2f} < ${total_target:.2f}"))
+            
+            now_ct = datetime.now(timezone.utc).astimezone(ZoneInfo("America/Chicago")).strftime("%Y-%m-%d %H:%M:%S CST")
+            tg_send(msg_warn(
+                f"DCA {pair} KLAIDA (Strike)",
+                f"{now_ct}\n\n"
+                f"Priežastis: Nepakankamas balansas\n"
+                f"Reikia:   ${total_target:.2f}\n"
+                f"Balanse:  ${usd_balance:.2f}\n"
+                f"Trūksta:  ${missing:.2f}"
+            ))
             return {"pair": pair, "status": "skipped_insufficient_funds"}
     except StrikeError as e:
         print(f"  {ICONS['WARN']} Balance check failed: {e} — continuing")
