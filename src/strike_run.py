@@ -259,7 +259,7 @@ def finalize_order(cl_ord_id, quote_id, ohlc_ctx=None, dry_run=False, quote_res=
             "quote_id": quote_id,
             "executed_at": finished_at_utc.isoformat(),
             "filled_quote_cost": usd_spent,
-            "fee_quote": 0,
+            "fee_quote": float((final_q.get("fee") or {}).get("amount", 0)),
             "filled_base_volume": btc_received,
             "avg_price": avg_px,
             "execution_finished_at": finished_at_utc.isoformat(),
@@ -276,9 +276,25 @@ def finalize_order(cl_ord_id, quote_id, ohlc_ctx=None, dry_run=False, quote_res=
     if TG_NOTIFY_ON_FILL:
         pair = _pair_from_cl_ord_id(cl_ord_id)
         ts = finished_at_utc.astimezone(CHICAGO_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
+        crypto_sym = pair.replace("USD", "")
+        fee_usd = float((final_q.get("fee") or {}).get("amount", 0))
+        total_usd = usd_spent + fee_usd
+        mid_label = "Strike ticker" if mid_source == "strike_ticker" else (mid_source or "N/A")
+        h7_str = ("$" + f"{ohlc_ctx.get('H7'):.2f}") if ohlc_ctx and ohlc_ctx.get("H7") else "N/A"
+        h30_str = ("$" + f"{ohlc_ctx.get('H30'):.2f}") if ohlc_ctx and ohlc_ctx.get("H30") else "N/A"
+        impact_str = (f"{impact_bps:+.1f}" if impact_bps is not None else "N/A")
+        all_in_str = (f"{all_in_bps:+.1f}" if all_in_bps is not None else "N/A")
         tg_send(msg_ok(
-            f"STRIKE {pair} FILLED",
-            f"{ts}\nSpent: ${usd_spent:.2f}\nVol: {btc_received:.8f} BTC\nAvg: ${avg_px:.2f}"
+            "STRIKE " + pair + " FILLED",
+            ts + "\n\n" +
+            "Amount: " + f"{btc_received:.8f}" + " " + crypto_sym + "\n" +
+            "Price:  $" + f"{avg_px:.2f}" + "\n" +
+            "Cost:   $" + f"{usd_spent:.4f}" + "\n" +
+            "Fee:    $" + f"{fee_usd:.4f}" + "\n" +
+            "Total:  $" + f"{total_usd:.4f}" + "\n" +
+            "Impact: " + impact_str + " bps | All-in: " + all_in_str + " bps\n" +
+            "H7: " + h7_str + " | H30: " + h30_str + "\n" +
+            "Mid:    " + mid_label
         ))
 
 
