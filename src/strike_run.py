@@ -344,7 +344,6 @@ def execute_pair(order, settings, today_chicago, user_id, force=False):
             tg_send(msg_warn(
                 f"DCA {pair} LĖŠŲ TRŪKUMAS (Strike)",
                 f"{now_ct}\n\n"
-                f"Priežastis: Lėšų trūkumas\n"
                 f"Reikia:   ${total_target:.2f}\n"
                 f"Balanse:  ${usd_balance:.2f}\n"
                 f"Trūksta:  ${missing:.2f}"
