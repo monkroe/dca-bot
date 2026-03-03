@@ -342,9 +342,9 @@ def execute_pair(order, settings, today_chicago, user_id, force=False):
             
             now_ct = datetime.now(timezone.utc).astimezone(ZoneInfo("America/Chicago")).strftime("%Y-%m-%d %H:%M:%S CST")
             tg_send(msg_warn(
-                f"DCA {pair} KLAIDA (Strike)",
+                f"DCA {pair} LĖŠŲ TRŪKUMAS (Strike)",
                 f"{now_ct}\n\n"
-                f"Priežastis: Nepakankamas balansas\n"
+                f"Priežastis: Lėšų trūkumas\n"
                 f"Reikia:   ${total_target:.2f}\n"
                 f"Balanse:  ${usd_balance:.2f}\n"
                 f"Trūksta:  ${missing:.2f}"
