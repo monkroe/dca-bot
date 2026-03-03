@@ -337,7 +337,7 @@ def execute_pair(order, settings, today_chicago, user_id, force=False):
         if not dry_run and usd_balance < total_target:
             missing = total_target - usd_balance
             reason = f"USD balance ${usd_balance:.2f} < needed ${total_target:.2f}"
-            upd({"status": "skipped_insufficient_funds", "reason": reason,
+            upd({"status": "skipped_insufficient_funds", "reason": reason, "skip_reason": "insufficient_funds",
                  "execution_finished_at": datetime.now(timezone.utc).isoformat()})
             
             now_ct = datetime.now(timezone.utc).astimezone(ZoneInfo("America/Chicago")).strftime("%Y-%m-%d %H:%M:%S CST")
@@ -389,7 +389,7 @@ def execute_pair(order, settings, today_chicago, user_id, force=False):
                 pct_over = ((ticker["mid"] / ref_price) - 1) * 100
                 reason = f"Mid ${ticker['mid']:.2f} > cap ${cap_price:.2f} (+{pct_over:.2f}% vs 7D ref)"
                 print(f"  {ICONS['SKIP']} {reason}")
-                upd({"status": "skipped_above_cap", "reason": reason,
+                upd({"status": "skipped_above_cap", "reason": reason, "skip_reason": "7d_cap",
                      "execution_finished_at": datetime.now(timezone.utc).isoformat()})
                 tg_send(f"{ICONS['SKIP']} STRIKE {pair.replace('USD','')} +{pct_over:.2f}% virš cap — skip")
                 return {"pair": pair, "status": "skipped_above_cap"}
@@ -401,7 +401,7 @@ def execute_pair(order, settings, today_chicago, user_id, force=False):
     safe_total = total_target - USD_SAFETY_MARGIN
     if safe_total <= 0:
         reason = f"Target too small after safety margin (${total_target:.2f} - ${USD_SAFETY_MARGIN:.2f})"
-        upd({"status": "skipped_target_too_small", "reason": reason,
+        upd({"status": "skipped_target_too_small", "reason": reason, "skip_reason": "limit_guard",
              "execution_finished_at": datetime.now(timezone.utc).isoformat()})
         tg_send(msg_warn("STRIKE DCA SKIP", f"{today_chicago} | {pair}\n{reason}"))
         return {"pair": pair, "status": "skipped_target_too_small"}
