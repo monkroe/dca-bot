@@ -3,7 +3,7 @@
 #  Runs every 5 minutes, checks Chicago time window internally
 # ═══════════════════════════════════════════════════════════════
 
-name: Kraken DCA Bot
+name: Kraken DCA Bot (legacy)
 
 on:
 
