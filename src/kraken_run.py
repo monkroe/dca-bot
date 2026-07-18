@@ -529,6 +529,19 @@ def finalize_order(cl_ord_id: str, order_id: str, mid: float | None = None, ohlc
     if not order_id:
         return
 
+    # Terminal guard (best-effort): a terminal row is final — never rewrite
+    # it, never re-send its Telegram message. Overlapping runs and repeated
+    # reconciliation both funnel through here, so this is the single choke
+    # point for finalize idempotency.
+    try:
+        cur = sb_get("dca_executions", {"cl_ord_id": f"eq.{cl_ord_id}", "select": "status"})
+        cur_status = cur[0].get("status") if cur else None
+        if cur_status is not None and cur_status not in ("claimed", "placed", "limit_open"):
+            print(f"  finalize skip: {cl_ord_id} already terminal ({cur_status})")
+            return
+    except Exception as e:
+        print(f"  {ICONS['WARN']} finalize status pre-check failed: {e} — proceeding")
+
     trades = kraken_private("QueryOrders", {"txid": order_id, "trades": "true"})
 
     if order_id not in trades:
@@ -1628,6 +1641,12 @@ def run_reconciliation(user_id: str):
                         "status": "limit_open",
                         "order_id": open_tx,
                     })
+                elif (recheck := try_find_kraken_order(cl_id)):
+                    # Race: filled between the ClosedOrders miss and the
+                    # OpenOrders miss. Without this re-check the fill would
+                    # be marked failed with real money spent.
+                    print(f"    Closed during race window ({recheck}) — finalizing")
+                    finalize_order(cl_id, recheck)
                 else:
                     print("    Not found in Kraken (closed or open) — marking failed")
                     sb_update(
