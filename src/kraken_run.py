@@ -102,9 +102,20 @@ CRON_CYCLE_MINUTES = int(os.environ.get("DCA_CRON_CYCLE_MINUTES", "5"))
 I6_GRACE_MINUTES = CRON_CYCLE_MINUTES
 # Dead letter: limit_open may not outlive window_end by more than this.
 LIMIT_TTL_MINUTES = int(os.environ.get("DCA_LIMIT_TTL_MINUTES", "60"))
-# Dry-run scenario harness (Step 3 evidence window):
-# fill100 | partial40 | nofill | reject | crash_after_cancel | crash_after_fb_submit
-DRYRUN_MAKER_SCENARIO = os.environ.get("DCA_DRYRUN_MAKER_SCENARIO", "fill100")
+# Dry-run scenario harness (Step 3 evidence window). 'auto' walks
+# SCENARIO_SEQUENCE deterministically; an explicit value overrides.
+DRYRUN_MAKER_SCENARIO = os.environ.get("DCA_DRYRUN_MAKER_SCENARIO", "auto")
+
+# Reviewer-ordered sequence (2026-07-18): simplest states first, crash
+# branches last, so basic breakage surfaces before the emergency paths.
+SCENARIO_SEQUENCE = (
+    "fill100",                # 1. 100% maker fill
+    "nofill",                 # 2. 0% fill -> full fallback
+    "partial40",              # 3. partial fill -> remainder fallback
+    "reject",                 # 4. post-only reject -> direct fallback
+    "crash_after_cancel",     # 5. crash between cancel and fallback
+    "crash_after_fb_submit",  # 6. crash between fb submit and DB update
+)
 # 7D cap (shared by T0 check and DP-5 fallback re-check)
 CAP_PCT = 0.03
 
@@ -647,6 +658,35 @@ def finalize_order(cl_ord_id: str, order_id: str, mid: float | None = None, ohlc
 #  Authoritative spec: robert-os-hub docs/05-roadmap/
 #  dca-phase2-step1-state-machine.md — no states beyond that doc.
 # ═══════════════════════════════════════════════════════════════
+
+def _pick_dry_scenario(user_id: str) -> str:
+    """Deterministic scenario progression for the Step 3 evidence window.
+    A scenario is consumed once any maker dry event has recorded it in raw;
+    the next claim takes the first unconsumed one from SCENARIO_SEQUENCE.
+    DCA_DRYRUN_MAKER_SCENARIO != 'auto' overrides (e.g., to repeat one)."""
+    if DRYRUN_MAKER_SCENARIO != "auto":
+        return DRYRUN_MAKER_SCENARIO
+    consumed = set()
+    try:
+        rows = sb_get("dca_executions", {
+            "user_id": f"eq.{user_id}",
+            "attempt_type": "eq.maker_limit",
+            "cl_ord_id": "like.*-dry",
+            "select": "raw",
+        }) or []
+        for r in rows:
+            raw = _safe_json_load(r.get("raw")) or {}
+            sc = raw.get("maker_scenario")
+            if sc:
+                consumed.add(sc)
+    except Exception as e:
+        print(f"  {ICONS['WARN']} scenario progress query failed: {e}")
+    for sc in SCENARIO_SEQUENCE:
+        if sc not in consumed:
+            return sc
+    print("  All dry-run scenarios consumed — defaulting to fill100")
+    return "fill100"
+
 
 def _window_bounds_for(trade_date: str, target_time: str, window_minutes: int):
     """Chicago window (start, end) for a given trade date and target time."""
@@ -1401,7 +1441,8 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str, 
             }
 
         if dry_run:
-            scenario = DRYRUN_MAKER_SCENARIO
+            scenario = _pick_dry_scenario(user_id)
+            print(f"  {ICONS['DRYRUN']} scenario: {scenario}")
             if scenario == "reject":
                 print(f"  {ICONS['DRYRUN']} DRYRUN post-only reject (sim) -> direct fallback")
                 update_execution({
