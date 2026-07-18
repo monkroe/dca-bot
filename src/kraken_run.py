@@ -20,6 +20,18 @@ Changelog v1.1:
 - VERSION constant for GH Actions log traceability
 - ICONS constants layer (zero inline emoji)
 - Settings re-read after command processing
+
+Changelog v1.2 (Phase 2 Step 2 — maker-first execution):
+- order_strategy='maker_first': post-only limit leg at best bid, cross-run
+  state machine per docs/05-roadmap/dca-phase2-step1-state-machine.md
+  (robert-os-hub). Statuses MUST stay in sync with that doc.
+- run_maker_inspection: limit_open inspection, deadline cancel-confirm-
+  readback, event-level fallback decision (reason marker), dead-letter TTL
+  -> manual_required, I6 window+grace bound, I7 budget guard.
+- Fallback sized by remaining QUOTE budget (money invariant by construction).
+- Reconciliation extended: maker_limit claims also searched in OpenOrders
+  (resting limits are invisible to ClosedOrders) and restored to limit_open.
+- Dry-run scenario harness via DCA_DRYRUN_MAKER_SCENARIO.
 """
 
 import hashlib
@@ -37,7 +49,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from ohlc import build_daily_metrics
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # ═══════════════════════════════════════════════════════════════
 #  ICONS — single source of truth for all UI symbols
@@ -82,6 +94,27 @@ TG_NOTIFY_ON_FILL = os.environ.get("TG_NOTIFY_ON_FILL", "true").lower() in ("1",
 
 # Commands (SQL control-plane)
 DCA_COMMANDS_MAX_PER_RUN = int(os.environ.get("DCA_COMMANDS_MAX_PER_RUN", "25"))
+
+# ── Maker-first (Phase 2) constants ──────────────────────────────
+# Cron dispatch cadence; the cadence IS the cross-run timer (DP-2).
+CRON_CYCLE_MINUTES = int(os.environ.get("DCA_CRON_CYCLE_MINUTES", "5"))
+# I6: new orders for a parent event only until window_end + one cycle.
+I6_GRACE_MINUTES = CRON_CYCLE_MINUTES
+# Dead letter: limit_open may not outlive window_end by more than this.
+LIMIT_TTL_MINUTES = int(os.environ.get("DCA_LIMIT_TTL_MINUTES", "60"))
+# Dry-run scenario harness (Step 3 evidence window):
+# fill100 | partial40 | nofill | reject | crash_after_cancel | crash_after_fb_submit
+DRYRUN_MAKER_SCENARIO = os.environ.get("DCA_DRYRUN_MAKER_SCENARIO", "fill100")
+# 7D cap (shared by T0 check and DP-5 fallback re-check)
+CAP_PCT = 0.03
+
+# Maker-leg statuses whose EVENT still awaits a fallback decision
+# (reason IS NULL = decision pending; reason set = event terminal).
+PENDING_DECISION_STATUSES = (
+    "canceled_partial", "canceled_unfilled", "rejected_postonly",
+    "canceled_partial_dry_run", "canceled_unfilled_dry_run",
+    "rejected_postonly_dry_run",
+)
 
 # ═══════════════════════════════════════════════════════════════
 #  SUPABASE CLIENT (lightweight, no SDK needed)
@@ -491,7 +524,7 @@ def _pair_from_cl_ord_id(cl_ord_id: str) -> str:
     return "?"
 
 
-def finalize_order(cl_ord_id: str, order_id: str, mid: float | None = None, ohlc_ctx: dict | None = None):
+def finalize_order(cl_ord_id: str, order_id: str, mid: float | None = None, ohlc_ctx: dict | None = None, label: str = "FILLED"):
     """Query Kraken for fill details and update DB."""
     if not order_id:
         return
@@ -584,7 +617,7 @@ def finalize_order(cl_ord_id: str, order_id: str, mid: float | None = None, ohlc
                 ohlc_line = "\n" + " | ".join(parts)
         symbol = pair.replace("USD", "")
         tg_send(msg_ok(
-            f"DCA {pair} FILLED",
+            f"DCA {pair} {label}",
             f"{filled_ts}\n\n"
             f"Amount: {vol_exec} {symbol}\n"
             f"Price:  ${avg_px:.5f}\n"
@@ -594,6 +627,496 @@ def finalize_order(cl_ord_id: str, order_id: str, mid: float | None = None, ohlc
             f"{impact_line}{all_in_line}{ohlc_line}\n"
             f"Mid:    {mid_source or 'unknown'}"
         ))
+
+
+# ═══════════════════════════════════════════════════════════════
+#  MAKER-FIRST STATE MACHINE (Phase 2)
+#  Authoritative spec: robert-os-hub docs/05-roadmap/
+#  dca-phase2-step1-state-machine.md — no states beyond that doc.
+# ═══════════════════════════════════════════════════════════════
+
+def _window_bounds_for(trade_date: str, target_time: str, window_minutes: int):
+    """Chicago window (start, end) for a given trade date and target time."""
+    d = datetime.strptime(trade_date, "%Y-%m-%d")
+    h, m = map(int, target_time.split(":"))
+    target = datetime(d.year, d.month, d.day, h, m, tzinfo=CHICAGO_TZ)
+    half = timedelta(minutes=window_minutes // 2)
+    return target - half, target + half
+
+
+def _load_order_row(dca_order_id):
+    if dca_order_id is None:
+        return None
+    try:
+        rows = sb_get("dca_orders", {"id": f"eq.{dca_order_id}"})
+        return rows[0] if rows else None
+    except Exception as e:
+        print(f"  {ICONS['WARN']} dca_orders load failed id={dca_order_id}: {e}")
+        return None
+
+
+def _limit_window_end(row: dict, settings: dict):
+    """Window end (Chicago) for a maker-leg row.
+
+    Derived from the row's dca_order (strategy unit). If the order row is
+    gone, fall back to execution_started_at + window so TTL/I6 still bound
+    the row instead of leaving it immortal."""
+    order = _load_order_row(row.get("dca_order_id"))
+    if order and order.get("target_time"):
+        w = int(order.get("time_window_minutes") or settings.get("time_window_minutes", 10))
+        _, end = _window_bounds_for(row["trade_date_chicago"], order["target_time"], w)
+        return end
+    started = datetime.fromisoformat(str(row["execution_started_at"]).replace("Z", "+00:00"))
+    w = int(settings.get("time_window_minutes", 10))
+    return started.astimezone(CHICAGO_TZ) + timedelta(minutes=w)
+
+
+def _mark_manual_required(row: dict, note: str):
+    """Dead letter (4.1): automation stops for this event, human takes over."""
+    sb_update("dca_executions", {"cl_ord_id": f"eq.{row['cl_ord_id']}"}, {
+        "status": "manual_required",
+        "reason": note,
+        "execution_finished_at": _now_utc_iso(),
+    })
+    tg_send(msg_fail(
+        "DCA MANUAL REQUIRED",
+        f"{row['trade_date_chicago']} | {row['pair']}\n"
+        f"order_id: {row.get('order_id') or '?'}\n{note}\n"
+        f"Automatika sustabdyta siam ivykiui. Patikrink orderi Kraken'e ranka."
+    ))
+
+
+def _find_open_kraken_order(cl_ord_id: str) -> str | None:
+    """Find a RESTING order by cl_ord_id. ClosedOrders can't see these —
+    without this, a crash between limit AddOrder and the DB update would
+    orphan an open order and reconciliation would wrongly mark it failed."""
+    try:
+        oo = kraken_private("OpenOrders")
+        for txid, order in (oo.get("open") or {}).items():
+            if order.get("cl_ordid") == cl_ord_id:
+                return txid
+    except Exception as e:
+        print(f"    OpenOrders search failed: {e}")
+    return None
+
+
+def _cancel_confirm_readback(row: dict) -> str | None:
+    """Deadline steps 1-4: cancel -> confirm -> READBACK (sole authority)
+    -> write canceled_* / filled. Returns 'filled', 'canceled', or None
+    (not confirmed yet — row stays limit_open, TTL bounds the retries)."""
+    cl = row["cl_ord_id"]
+    oid = row["order_id"]
+
+    try:
+        kraken_private("CancelOrder", {"txid": oid})
+        print(f"    cancel sent: {oid}")
+    except KrakenError as e:
+        # Canceling an already closed/canceled order errors — that is fine,
+        # the readback below decides. Idempotent by design.
+        print(f"    cancel error (may already be closed/canceled): {e}")
+
+    try:
+        od = kraken_private("QueryOrders", {"txid": oid})
+    except Exception as e:
+        print(f"    readback query failed: {e}")
+        return None
+    o = od.get(oid)
+    if not o:
+        return None
+
+    st = o.get("status", "")
+    if st == "closed":
+        # Scenario #8 (cancel/fill race): filled 100% before the cancel
+        # landed. Readback wins — this is a normal maker fill, no fallback.
+        print(f"    race: order closed 100% before cancel — maker fill")
+        finalize_order(cl, oid, mid=row.get("mid"))
+        return "filled"
+    if st not in ("canceled", "expired"):
+        print(f"    cancel not confirmed yet (status={st})")
+        return None
+
+    vol_exec = float(o.get("vol_exec", 0) or 0)
+    cost = float(o.get("cost", 0) or 0)
+    fee = float(o.get("fee", 0) or 0)
+    price = float(o.get("price", 0) or 0)
+    new_status = "canceled_partial" if vol_exec > 0 else "canceled_unfilled"
+    print(f"    readback: vol_exec={vol_exec} cost=${cost} fee=${fee} -> {new_status}")
+
+    updates = {
+        "status": new_status,
+        "execution_finished_at": _now_utc_iso(),
+        "raw": json.dumps(o),
+    }
+    if vol_exec > 0:
+        updates.update({
+            "filled_quote_cost": cost,
+            "fee_quote": fee,
+            "filled_base_volume": vol_exec,
+            "avg_price": price if price > 0 else None,
+        })
+    # reason stays NULL: the fallback decision (event resolution) sets it.
+    sb_update("dca_executions", {"cl_ord_id": f"eq.{cl}"}, updates)
+    return "canceled"
+
+
+def _fallback_decision(row: dict, settings: dict, user_id: str, window_end, dry_run: bool, scenario: str | None):
+    """Event-level resolution after the maker leg reached a decision-pending
+    state (canceled_* / rejected_postonly, reason IS NULL). Exactly one
+    outcome, recorded in the maker row's `reason` — that makes the EVENT
+    terminal and auditable:
+      fallback_created | fallback_blocked_i6 | fallback_none_budget |
+      fallback_skipped_above_cap | fallback_below_ordermin |
+      fallback_failed_kraken
+    Transient errors (ticker/pair info) leave reason NULL — retried next
+    run, bounded by I6."""
+    pair = row["pair"]
+    cl_base = row["cl_ord_id"]
+    trade_date = row["trade_date_chicago"]
+    total_target = float(row["requested_quote_amount_base"])
+    spent = float(row.get("filled_quote_cost") or 0) + float(row.get("fee_quote") or 0)
+
+    def mark(reason: str):
+        sb_update("dca_executions", {"cl_ord_id": f"eq.{cl_base}"}, {"reason": reason})
+
+    now_chi = datetime.now(CHICAGO_TZ)
+
+    # I6: new orders for this parent event only until window_end + grace.
+    if now_chi > window_end + timedelta(minutes=I6_GRACE_MINUTES):
+        mark("fallback_blocked_i6")
+        tg_send(msg_warn(
+            "DCA PARTIAL",
+            f"{trade_date} | {pair}\n"
+            f"Maker lega baigesi uz I6 ribos — fallback nekuriamas.\n"
+            f"Ivykdyta: ${spent:.4f} is ${total_target:.2f}"
+        ))
+        return
+
+    # I7 guard: never even compute a fallback on a dead budget.
+    b_rem = total_target - spent
+    if b_rem <= 0:
+        mark("fallback_none_budget")
+        return
+
+    try:
+        ticker = get_ticker_snapshot(pair)
+    except Exception as e:
+        print(f"    fallback ticker failed: {e} — retry next run")
+        return
+
+    # DP-5: cap re-checked with the CURRENT mid, not the T0 one.
+    if ticker.get("mid"):
+        ref_price = get_7d_ref_price(pair, user_id)
+        if ref_price is not None and ticker["mid"] > ref_price * (1 + CAP_PCT):
+            pct_over = ((ticker["mid"] / ref_price) - 1) * 100
+            mark("fallback_skipped_above_cap")
+            tg_send(msg_warn(
+                "DCA PARTIAL",
+                f"{trade_date} | {pair}\n"
+                f"Fallback skip: mid +{pct_over:.2f}% virs 7D cap.\n"
+                f"Ivykdyta: ${spent:.4f} is ${total_target:.2f}"
+            ))
+            return
+
+    if not ticker.get("ask") or ticker["ask"] <= 0:
+        print("    fallback: no valid ask — retry next run")
+        return
+
+    try:
+        pair_info = get_asset_pair_info(pair)
+    except Exception as e:
+        print(f"    fallback pair info failed: {e} — retry next run")
+        return
+
+    taker_rate = max(float(settings.get("taker_fee_rate") or 0), 0.0)
+    safe_total = max(b_rem - USD_SAFETY_MARGIN, 0.0)
+    cost_target = safe_total / (1.0 + taker_rate)
+    vol = floor_to_decimals(cost_target / ticker["ask"], pair_info["lot_decimals"])
+
+    if vol <= 0 or vol < pair_info["ordermin"]:
+        mark("fallback_below_ordermin")
+        tg_send(msg_warn(
+            "DCA PARTIAL",
+            f"{trade_date} | {pair}\n"
+            f"Likutis ${b_rem:.4f} < min orderis — diena priimta daline apimtimi.\n"
+            f"Ivykdyta: ${spent:.4f} is ${total_target:.2f}"
+        ))
+        return
+
+    # Claim-first (I3): the fallback leg gets its own row BEFORE AddOrder.
+    fb_cl = cl_base + "-fb"
+    fb_row = {
+        "user_id": user_id,
+        "trade_date_chicago": trade_date,
+        "pair": pair,
+        "cl_ord_id": fb_cl,
+        "status": "claimed",
+        "requested_quote_amount_base": round(b_rem, 6),
+        "execution_started_at": _now_utc_iso(),
+        "parent_event_id": row.get("parent_event_id"),
+        "attempt_type": "maker_fallback",
+        "dca_order_id": row.get("dca_order_id"),
+    }
+    est_cost = vol * ticker["ask"]
+    est_fee = est_cost * taker_rate
+    if dry_run:
+        fb_row["raw"] = json.dumps({
+            "dry_run": True,
+            "maker_scenario": scenario,
+            "base_volume": vol,
+            "ask": ticker["ask"],
+            "estimated_cost": round(est_cost, 6),
+            "estimated_fee": round(est_fee, 6),
+        })
+    try:
+        sb_insert("dca_executions", fb_row)
+        print(f"    fallback claimed: {fb_cl} (B_rem=${b_rem:.4f}, vol={vol})")
+    except urllib.error.HTTPError as e:
+        if e.code == 409:
+            # Another run already created the fallback leg — its own
+            # machinery (placed/stale rec) finishes it. Event is resolved.
+            mark("fallback_created")
+            return
+        raise
+
+    def update_fb(updates: dict):
+        sb_update("dca_executions", {"cl_ord_id": f"eq.{fb_cl}"}, updates)
+
+    update_fb({
+        "bid": ticker["bid"], "ask": ticker["ask"], "mid": ticker["mid"],
+        "mid_ts": _now_utc_iso(),
+    })
+
+    if dry_run:
+        if scenario == "crash_after_fb_submit":
+            # Simulated crash: leg stays 'claimed'; stale reconciliation
+            # must finalize it WITHOUT re-buying (scenario #6).
+            mark("fallback_created")
+            print("    DRYRUN simulated crash after fb submit — left claimed")
+            return
+        update_fb({
+            "status": "filled_dry_run",
+            "filled_quote_cost": round(est_cost, 6),
+            "fee_quote": round(est_fee, 6),
+            "filled_base_volume": vol,
+            "avg_price": ticker["ask"],
+            "execution_finished_at": _now_utc_iso(),
+        })
+        mark("fallback_created")
+        tg_send(msg_dryrun(
+            f"DCA {pair} FALLBACK DRY RUN",
+            f"B_rem: ${b_rem:.4f}\nAll-in est: ${est_cost + est_fee:.4f}\nVol: {vol}"
+        ))
+        return
+
+    # LIVE fallback market order
+    try:
+        result = kraken_private("AddOrder", {
+            "pair": pair,
+            "type": "buy",
+            "ordertype": "market",
+            "volume": format_volume(vol, pair_info["lot_decimals"]),
+            "oflags": "fciq",
+            "cl_ordid": fb_cl,
+        })
+        order_id = result.get("txid", [None])[0]
+        update_fb({"status": "placed", "order_id": order_id, "raw": json.dumps(result)})
+        print(f"    {ICONS['OK']} fallback placed: {order_id}")
+    except KrakenError as e:
+        if "duplicate" in str(e).lower():
+            found = try_find_kraken_order(fb_cl)
+            if found:
+                finalize_order(fb_cl, found, mid=ticker.get("mid"), label="FALLBACK FILLED")
+                mark("fallback_created")
+                return
+        update_fb({
+            "status": "failed_kraken",
+            "reason": f"fallback AddOrder failed: {e}",
+            "execution_finished_at": _now_utc_iso(),
+        })
+        mark("fallback_failed_kraken")
+        tg_send(msg_fail("DCA FAIL", f"{trade_date} | {pair}\nFallback AddOrder failed: {e}"))
+        return
+
+    mark("fallback_created")
+    time.sleep(2)
+    try:
+        finalize_order(fb_cl, order_id, mid=ticker.get("mid"), label="FALLBACK FILLED")
+    except Exception as e:
+        print(f"    fallback finalize error (stale rec will finish): {e}")
+
+
+def _inspect_dry_limit(row: dict, raw: dict, settings: dict, user_id: str, now_chicago, window_end, deadline):
+    """Simulated Kraken responses for the dry-run scenario harness.
+    Traverses the SAME statuses as live — only the exchange is faked."""
+    scenario = raw.get("maker_scenario", "fill100")
+    cl = row["cl_ord_id"]
+    vol = float(raw.get("base_volume") or 0)
+    px = float(row.get("limit_price") or raw.get("bid") or 0)
+    maker_rate = max(float(settings.get("maker_fee_rate") or 0.004), 0.0)
+
+    if scenario == "fill100":
+        cost = vol * px
+        fee = cost * maker_rate
+        sb_update("dca_executions", {"cl_ord_id": f"eq.{cl}"}, {
+            "status": "filled_dry_run",
+            "filled_quote_cost": round(cost, 6),
+            "fee_quote": round(fee, 6),
+            "filled_base_volume": vol,
+            "avg_price": px,
+            "execution_finished_at": _now_utc_iso(),
+        })
+        tg_send(msg_dryrun(
+            f"DCA {row['pair']} MAKER DRY RUN",
+            f"Limit filled 100% (sim)\nAll-in est: ${cost + fee:.4f}\nVol: {vol}"
+        ))
+        return
+
+    # partial40 / nofill / crash_after_cancel rest on the book until deadline
+    if now_chicago < deadline:
+        print(f"    DRYRUN {cl}: open, waiting (deadline {deadline.strftime('%H:%M')})")
+        return
+
+    frac = 0.4 if scenario == "partial40" else 0.0
+    vol_exec = round(vol * frac, 8)
+    cost = vol_exec * px
+    fee = cost * maker_rate
+    new_status = ("canceled_partial_dry_run" if vol_exec > 0 else "canceled_unfilled_dry_run")
+    updates = {
+        "status": new_status,
+        "execution_finished_at": _now_utc_iso(),
+    }
+    if vol_exec > 0:
+        updates.update({
+            "filled_quote_cost": round(cost, 6),
+            "fee_quote": round(fee, 6),
+            "filled_base_volume": vol_exec,
+            "avg_price": px,
+        })
+    sb_update("dca_executions", {"cl_ord_id": f"eq.{cl}"}, updates)
+    print(f"    DRYRUN {cl}: cancel sim -> {new_status} (vol_exec={vol_exec})")
+
+    if scenario == "crash_after_cancel":
+        # Simulated crash between cancel and fallback (scenario #5 variant):
+        # reason stays NULL — the NEXT run's pending pass must resolve it.
+        print("    DRYRUN simulated crash after cancel — decision left pending")
+        return
+
+    fresh = dict(row)
+    fresh.update(updates)
+    _fallback_decision(fresh, settings, user_id, window_end, dry_run=True, scenario=scenario)
+
+
+def run_maker_inspection(settings: dict, user_id: str, now_chicago):
+    """Row-driven (NOT flag-driven): runs regardless of order_strategy so a
+    rollback flip to 'market' can never strand open maker legs."""
+    sel = ("cl_ord_id,order_id,pair,status,trade_date_chicago,"
+           "requested_quote_amount_base,parent_event_id,dca_order_id,raw,"
+           "execution_started_at,limit_price,mid,filled_quote_cost,fee_quote")
+
+    # Pass 1: pending fallback decisions (crash recovery for the gap
+    # between the canceled_*/rejected write and the decision record).
+    try:
+        pending = sb_get("dca_executions", {
+            "user_id": f"eq.{user_id}",
+            "status": f"in.({','.join(PENDING_DECISION_STATUSES)})",
+            "reason": "is.null",
+            "select": sel,
+        }) or []
+    except Exception as e:
+        print(f"  {ICONS['WARN']} pending-decision query failed: {e}")
+        pending = []
+    for row in pending:
+        print(f"  Pending decision: {row['cl_ord_id']} ({row['status']})")
+        raw = _safe_json_load(row.get("raw")) or {}
+        window_end = _limit_window_end(row, settings)
+        _fallback_decision(row, settings, user_id, window_end,
+                           dry_run=bool(raw.get("dry_run")),
+                           scenario=raw.get("maker_scenario"))
+
+    # Pass 2: open maker legs
+    try:
+        open_rows = sb_get("dca_executions", {
+            "user_id": f"eq.{user_id}",
+            "status": "eq.limit_open",
+            "select": sel,
+        }) or []
+    except Exception as e:
+        print(f"  {ICONS['WARN']} limit_open query failed: {e}")
+        return
+    if not open_rows and not pending:
+        return
+    print(f"\n{ICONS['RECON']} Maker inspection: {len(open_rows)} open, {len(pending)} pending")
+
+    for row in open_rows:
+        cl = row["cl_ord_id"]
+        window_end = _limit_window_end(row, settings)
+        deadline = window_end - timedelta(minutes=CRON_CYCLE_MINUTES)
+        ttl_at = window_end + timedelta(minutes=LIMIT_TTL_MINUTES)
+        raw = _safe_json_load(row.get("raw")) or {}
+
+        if raw.get("dry_run"):
+            _inspect_dry_limit(row, raw, settings, user_id, now_chicago, window_end, deadline)
+            continue
+
+        oid = row.get("order_id")
+        if not oid:
+            if now_chicago > ttl_at:
+                _mark_manual_required(row, "limit_open be order_id, TTL virsytas")
+            continue
+
+        try:
+            od = kraken_private("QueryOrders", {"txid": oid})
+            o = od.get(oid)
+        except Exception as e:
+            print(f"  {ICONS['WARN']} {cl}: QueryOrders failed: {e}")
+            o = None
+
+        if o is None:
+            if now_chicago > ttl_at:
+                _mark_manual_required(row, f"orderis {oid} neuzklausiamas, TTL virsytas")
+            continue
+
+        st = o.get("status", "")
+        if st == "closed":
+            print(f"  {cl}: limit filled 100% as maker")
+            finalize_order(cl, oid, mid=row.get("mid"))
+            continue
+
+        if st in ("canceled", "expired"):
+            # Crash recovery: canceled earlier but the row was never updated.
+            # Reuse the readback path (idempotent), then decide via Pass 1
+            # logic in THIS run to keep normal latency low.
+            outcome = _cancel_confirm_readback(row)
+            if outcome == "canceled":
+                refreshed = sb_get("dca_executions", {"cl_ord_id": f"eq.{cl}", "select": sel})
+                if refreshed:
+                    _fallback_decision(refreshed[0], settings, user_id, window_end,
+                                       dry_run=False, scenario=None)
+            continue
+
+        # still open / pending on the book
+        if now_chicago > ttl_at:
+            outcome = _cancel_confirm_readback(row)
+            if outcome == "canceled":
+                refreshed = sb_get("dca_executions", {"cl_ord_id": f"eq.{cl}", "select": sel})
+                if refreshed:
+                    _fallback_decision(refreshed[0], settings, user_id, window_end,
+                                       dry_run=False, scenario=None)
+            elif outcome is None:
+                _mark_manual_required(row, f"limit_open {LIMIT_TTL_MINUTES} min po lango, cancel nepatvirtintas")
+            continue
+
+        if now_chicago >= deadline:
+            print(f"  {cl}: DEADLINE — cancel sequence")
+            outcome = _cancel_confirm_readback(row)
+            if outcome == "canceled":
+                refreshed = sb_get("dca_executions", {"cl_ord_id": f"eq.{cl}", "select": sel})
+                if refreshed:
+                    _fallback_decision(refreshed[0], settings, user_id, window_end,
+                                       dry_run=False, scenario=None)
+            # 'filled' -> done; None -> retry next run, TTL bounds it
+        else:
+            print(f"  {cl}: open, waiting (deadline {deadline.strftime('%H:%M %Z')})")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -614,17 +1137,27 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str, 
     """
     pair = order["pair"]
     total_target = float(order["base_quote_amount"])
-    fee_rate = float(settings["taker_fee_rate"])
     dry_run = bool(settings["dry_run"])
 
+    # Strategy switch (DP-6): default 'market' = pre-Phase-2 behavior.
+    # --force always goes market (manual trigger wants immediacy).
+    strategy = str(settings.get("order_strategy") or "market")
+    maker = strategy == "maker_first" and not force
+    fee_rate = (max(float(settings.get("maker_fee_rate") or 0.004), 0.0)
+                if maker else float(settings["taker_fee_rate"]))
+
+    ot = (order.get("target_time") or "08:00").replace(":", "")
     if dry_run:
-        cl_ord_id = f"dca-{pair}-{today_chicago}-dry-{int(time.time() * 1000)}"
+        # Maker dry-run needs a DETERMINISTIC id: one event per order per
+        # day, so the cross-run machine is exercised. Market dry-run keeps
+        # the historical fill-every-run behavior.
+        cl_ord_id = (f"dca-{pair}-{today_chicago}-{ot}-dry" if maker
+                     else f"dca-{pair}-{today_chicago}-dry-{int(time.time() * 1000)}")
     else:
-        ot = order.get("target_time", "08:00").replace(":", "")
         cl_ord_id = f"dca-{pair}-{today_chicago}-force-{int(time.time() * 1000)}" if force else f"dca-{pair}-{today_chicago}-{ot}"
 
     print(f"\n{'='*50}")
-    print(f"  {pair} | ${total_target:.2f} | fee {fee_rate*100:.2f}% | {'DRY RUN' if dry_run else 'LIVE'}")
+    print(f"  {pair} | ${total_target:.2f} | {strategy} | fee {fee_rate*100:.2f}% | {'DRY RUN' if dry_run else 'LIVE'}")
     print(f"  cl_ord_id: {cl_ord_id}")
 
     # ── Phase 1: CLAIM ────────────────────────────────────────
@@ -638,8 +1171,11 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str, 
         "requested_quote_amount_base": total_target,
         "execution_started_at": datetime.now(timezone.utc).isoformat(),
         "parent_event_id": event_id,
-        "attempt_type": "market",
+        "attempt_type": "maker_limit" if maker else "market",
     }
+    if maker:
+        # Strategy-unit link: feeds the per-event unique index (I2).
+        claim_row["dca_order_id"] = order.get("id")
 
     try:
         sb_insert("dca_executions", claim_row)
@@ -747,8 +1283,10 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str, 
         else:
             print(f"  No 7D history — skipping cap check")
     # ── Fee-aware volume calculation ──────────────────────────
-    if not ticker["ask"] or ticker["ask"] <= 0:
-        reason = "No valid ASK price — can't compute base volume"
+    # Maker leg prices/sizes at BID (the limit rests there); market at ASK.
+    price_ref = ticker["bid"] if maker else ticker["ask"]
+    if not price_ref or price_ref <= 0:
+        reason = f"No valid {'BID' if maker else 'ASK'} price — can't compute base volume"
         print(f"  {ICONS['FAIL']} {reason}")
         update_execution({
             "status": "failed_kraken",
@@ -783,12 +1321,12 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str, 
         tg_send(msg_warn("DCA SKIP", f"{today_chicago} | {pair}\n{reason}"))
         return {"pair": pair, "status": "skipped_target_too_small"}
 
-    base_volume = floor_to_decimals(cost_target / ticker["ask"], pair_info["lot_decimals"])
+    base_volume = floor_to_decimals(cost_target / price_ref, pair_info["lot_decimals"])
 
     if base_volume <= 0:
         reason = (
             f"Computed base_volume is 0 after rounding "
-            f"(cost_target={cost_target:.6f}, ask={ticker['ask']}, lot_decimals={pair_info['lot_decimals']})"
+            f"(cost_target={cost_target:.6f}, price_ref={price_ref}, lot_decimals={pair_info['lot_decimals']})"
         )
         print(f"  {ICONS['FAIL']} {reason}")
         update_execution({
@@ -799,7 +1337,7 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str, 
         tg_send(msg_warn("DCA SKIP", f"{today_chicago} | {pair}\n{reason}"))
         return {"pair": pair, "status": "skipped_target_too_small"}
 
-    estimated_cost = base_volume * ticker["ask"]
+    estimated_cost = base_volume * price_ref
     estimated_fee = estimated_cost * fee_rate
     estimated_total = estimated_cost + estimated_fee
 
@@ -808,7 +1346,7 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str, 
     print(f"    safety_margin:  ${USD_SAFETY_MARGIN:.4f}")
     print(f"    safe_total:     ${safe_total:.4f}")
     print(f"    cost_target:    ${cost_target:.4f}")
-    print(f"    ask:            ${ticker['ask']}")
+    print(f"    price_ref:      ${price_ref} ({'bid/maker' if maker else 'ask/taker'})")
     print(f"    base_volume:    {base_volume}")
     print(f"    est. cost:      ${estimated_cost:.4f}")
     print(f"    est. fee:       ${estimated_fee:.4f}")
@@ -828,6 +1366,99 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str, 
             f"{today_chicago} | {pair}\nBelow min order: {reason}"
         ))
         return {"pair": pair, "status": "skipped_min_order"}
+
+    # ── MAKER LIMIT LEG (Phase 2, T0) ─────────────────────────
+    if maker:
+        o_window = int(order.get("time_window_minutes") or settings.get("time_window_minutes", 10))
+        o_time = order.get("target_time") or settings.get("target_time", "08:00")
+        _, window_end = _window_bounds_for(today_chicago, o_time, o_window)
+        limit_price = ticker["bid"]
+        price_str = f"{limit_price:.{pair_info['pair_decimals']}f}"
+
+        def _pending_row():
+            return {
+                "pair": pair,
+                "cl_ord_id": cl_ord_id,
+                "trade_date_chicago": today_chicago,
+                "requested_quote_amount_base": total_target,
+                "filled_quote_cost": None,
+                "fee_quote": None,
+                "parent_event_id": event_id,
+                "dca_order_id": order.get("id"),
+            }
+
+        if dry_run:
+            scenario = DRYRUN_MAKER_SCENARIO
+            if scenario == "reject":
+                print(f"  {ICONS['DRYRUN']} DRYRUN post-only reject (sim) -> direct fallback")
+                update_execution({
+                    "status": "rejected_postonly_dry_run",
+                    "limit_price": limit_price,
+                    "execution_finished_at": datetime.now(timezone.utc).isoformat(),
+                    "raw": json.dumps({"dry_run": True, "maker_scenario": scenario}),
+                })
+                _fallback_decision(_pending_row(), settings, user_id, window_end,
+                                   dry_run=True, scenario=scenario)
+                return {"pair": pair, "status": "rejected_postonly_dry_run"}
+
+            print(f"  {ICONS['DRYRUN']} DRYRUN limit resting (sim, scenario={scenario}): {base_volume} @ bid {price_str}")
+            update_execution({
+                "status": "limit_open",
+                "limit_price": limit_price,
+                "raw": json.dumps({
+                    "dry_run": True,
+                    "maker_scenario": scenario,
+                    "base_volume": base_volume,
+                    "bid": limit_price,
+                    "cost_target": round(cost_target, 6),
+                }),
+            })
+            return {"pair": pair, "status": "limit_open"}
+
+        try:
+            result = kraken_private("AddOrder", {
+                "pair": pair,
+                "type": "buy",
+                "ordertype": "limit",
+                "price": price_str,
+                "volume": format_volume(base_volume, pair_info["lot_decimals"]),
+                "oflags": "post,fciq",
+                "cl_ordid": cl_ord_id,
+            })
+            order_id = result.get("txid", [None])[0]
+            print(f"  {ICONS['OK']} Post-only limit resting: {order_id} @ {price_str}")
+            update_execution({
+                "status": "limit_open",
+                "order_id": order_id,
+                "limit_price": limit_price,
+                "raw": json.dumps(result),
+            })
+            # No finalize here — the order rests; the next runs' inspection
+            # phase owns it from now on (DP-2: cron cadence is the timer).
+            return {"pair": pair, "status": "limit_open", "order_id": order_id}
+        except KrakenError as e:
+            if "post only" in str(e).lower():
+                # Would cross the spread -> rejected, NO position exists.
+                print(f"  {ICONS['SKIP']} Post-only rejected -> direct fallback")
+                update_execution({
+                    "status": "rejected_postonly",
+                    "limit_price": limit_price,
+                    "execution_finished_at": datetime.now(timezone.utc).isoformat(),
+                    "raw": json.dumps({"error": str(e)}),
+                })
+                _fallback_decision(_pending_row(), settings, user_id, window_end,
+                                   dry_run=False, scenario=None)
+                return {"pair": pair, "status": "rejected_postonly"}
+            reason = f"limit AddOrder failed: {e}"
+            print(f"  {ICONS['FAIL']} {reason}")
+            update_execution({
+                "status": "failed_kraken",
+                "reason": reason,
+                "execution_finished_at": datetime.now(timezone.utc).isoformat(),
+                "raw": json.dumps({"error": str(e)}),
+            })
+            tg_send(msg_fail("DCA FAIL", f"{today_chicago} | {pair}\n{reason}"))
+            return {"pair": pair, "status": "failed_kraken"}
 
     # ── Execute ───────────────────────────────────────────────
     if dry_run:
@@ -950,7 +1581,7 @@ def run_reconciliation(user_id: str):
         "user_id": f"eq.{user_id}",
         "status": "in.(claimed,placed)",
         "execution_started_at": f"lt.{cutoff}",
-        "select": "cl_ord_id,order_id,pair,status,trade_date_chicago",
+        "select": "cl_ord_id,order_id,pair,status,trade_date_chicago,attempt_type,raw",
     })
 
     if not stale:
@@ -963,10 +1594,55 @@ def run_reconciliation(user_id: str):
         print(f"  Stale: {cl_id} | status={row['status']} | order_id={order_id}")
 
         if row["status"] == "claimed" and not order_id:
+            raw = _safe_json_load(row.get("raw")) or {}
+            if raw.get("dry_run"):
+                # Dry-run scenario #6 (crash after fb submit): simulated
+                # reconciliation must finalize WITHOUT re-buying.
+                sb_update("dca_executions", {"cl_ord_id": f"eq.{cl_id}"}, {
+                    "status": "filled_dry_run",
+                    "filled_quote_cost": raw.get("estimated_cost"),
+                    "fee_quote": raw.get("estimated_fee"),
+                    "filled_base_volume": raw.get("base_volume"),
+                    "avg_price": raw.get("ask"),
+                    "execution_finished_at": datetime.now(timezone.utc).isoformat(),
+                })
+                print("    DRYRUN stale claim -> simulated reconciliation finalize")
+                tg_send(msg_recon(
+                    "DCA RECONCILIATION (DRY)",
+                    f"{row['trade_date_chicago']} | {row['pair']}\nSimulated crash recovered without re-buy"
+                ))
+                continue
             found = try_find_kraken_order(cl_id)
             if found:
                 print("    Found in Kraken! Finalizing...")
                 finalize_order(cl_id, found)
+            elif row.get("attempt_type") == "maker_limit":
+                # A resting limit is INVISIBLE to ClosedOrders. If AddOrder
+                # succeeded but the DB update crashed, the order is open on
+                # Kraken — restore the row to limit_open so the state
+                # machine owns it again instead of orphaning the order.
+                open_tx = _find_open_kraken_order(cl_id)
+                if open_tx:
+                    print(f"    Found RESTING on Kraken ({open_tx}) — restoring limit_open")
+                    sb_update("dca_executions", {"cl_ord_id": f"eq.{cl_id}"}, {
+                        "status": "limit_open",
+                        "order_id": open_tx,
+                    })
+                else:
+                    print("    Not found in Kraken (closed or open) — marking failed")
+                    sb_update(
+                        "dca_executions",
+                        {"cl_ord_id": f"eq.{cl_id}"},
+                        {
+                            "status": "failed_reconciliation",
+                            "reason": "Claimed but no Kraken order found after timeout",
+                            "execution_finished_at": datetime.now(timezone.utc).isoformat(),
+                        },
+                    )
+                    tg_send(msg_recon(
+                        "DCA RECONCILIATION",
+                        f"{row['trade_date_chicago']} | {row['pair']}\nClaimed but never placed — marked failed"
+                    ))
             else:
                 print("    Not found in Kraken — marking failed")
                 sb_update(
@@ -1043,7 +1719,12 @@ def send_weekly_summary(user_id: str):
         s = pairs[p]
         status = (r.get("status") or "").lower()
 
-        if "filled" in status:
+        # NOTE: exact-match on fill statuses. The old `"filled" in status`
+        # substring test would wrongly count canceled_unfilled as a fill.
+        # canceled_partial carries real money, so it aggregates as a fill;
+        # unfilled/rejected maker legs are non-events (their fallback leg
+        # carries the day's outcome).
+        if status in ("filled", "filled_dry_run", "canceled_partial", "canceled_partial_dry_run"):
             s["filled"] += 1
             s["total_cost"] += float(r.get("filled_quote_cost") or 0)
             s["total_fee"] += float(r.get("fee_quote") or 0)
@@ -1052,9 +1733,12 @@ def send_weekly_summary(user_id: str):
             avg = float(r.get("avg_price") or 0)
             if mid > 0 and avg > 0:
                 s["slippages"].append((avg - mid) / mid * 100)
-        elif "skipped" in status:
+        elif "skipped" in status or status in (
+            "canceled_unfilled", "canceled_unfilled_dry_run",
+            "rejected_postonly", "rejected_postonly_dry_run",
+        ):
             s["skipped"] += 1
-        elif "failed" in status or "crashed" in status:
+        elif "failed" in status or "crashed" in status or status == "manual_required":
             s["failed"] += 1
 
     lines = [
@@ -1124,6 +1808,7 @@ def main():
     # ── Mode dispatch ─────────────────────────────────────────
     if mode == "--reconcile":
         run_reconciliation(user_id)
+        run_maker_inspection(settings, user_id, datetime.now(CHICAGO_TZ))
         return
 
     if mode == "--weekly":
@@ -1150,6 +1835,9 @@ def main():
 
     # 1) Reconciliation first
     run_reconciliation(user_id)
+
+    # 1b) Maker-leg inspection (row-driven; no-op when no maker rows exist)
+    run_maker_inspection(settings, user_id, now_chicago)
 
     # 2) Load enabled orders (filtered by user_id)
     orders = sb_get("dca_orders", {
