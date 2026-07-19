@@ -1253,19 +1253,25 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str, 
         print(f"  Balance: ${usd_balance:.2f} | Need: ${total_target:.2f}")
 
         if usd_balance < total_target:
-            reason = f"USD balance ${usd_balance:.2f} < needed ${total_target:.2f}"
-            print(f"  {ICONS['FAIL']} {reason}")
-            update_execution({
-                "status": "skipped_insufficient_funds",
-                "reason": reason,
-                "execution_finished_at": datetime.now(timezone.utc).isoformat(),
-            })
-            ts_chi = datetime.now(timezone.utc).astimezone(CHICAGO_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
-            tg_send(msg_warn(
-                "DCA SKIP",
-                f"{ts_chi} | {pair}\nInsufficient funds: ${usd_balance:.2f} < ${total_target:.2f}"
-            ))
-            return {"pair": pair, "status": "skipped_insufficient_funds"}
+            if dry_run:
+                # A dry run spends nothing — real balance must never gate
+                # the simulation (2026-07-18 night: all 6 scenario windows
+                # died here on a real $0.49 balance).
+                print(f"  {ICONS['DRYRUN']} Insufficient REAL balance — continuing, dry run spends nothing")
+            else:
+                reason = f"USD balance ${usd_balance:.2f} < needed ${total_target:.2f}"
+                print(f"  {ICONS['FAIL']} {reason}")
+                update_execution({
+                    "status": "skipped_insufficient_funds",
+                    "reason": reason,
+                    "execution_finished_at": datetime.now(timezone.utc).isoformat(),
+                })
+                ts_chi = datetime.now(timezone.utc).astimezone(CHICAGO_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
+                tg_send(msg_warn(
+                    "DCA SKIP",
+                    f"{ts_chi} | {pair}\nInsufficient funds: ${usd_balance:.2f} < ${total_target:.2f}"
+                ))
+                return {"pair": pair, "status": "skipped_insufficient_funds"}
     except KrakenError as e:
         print(f"  {ICONS['WARN']} Balance check failed: {e} — continuing anyway")
 
