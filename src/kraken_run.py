@@ -49,7 +49,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from ohlc import build_daily_metrics
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 # ═══════════════════════════════════════════════════════════════
 #  ICONS — single source of truth for all UI symbols
@@ -115,6 +115,9 @@ SCENARIO_SEQUENCE = (
     "reject",                 # 4. post-only reject -> direct fallback
     "crash_after_cancel",     # 5. crash between cancel and fallback
     "crash_after_fb_submit",  # 6. crash between fb submit and DB update
+    "repeg_fill",             # 7. bid rises -> re-peg -> maker fill
+    "repeg_reject",           # 8. bid meets ask -> re-peg blocked (spread) -> fallback
+    "repeg_cap",              # 9. bid above 7D cap -> re-peg blocked -> fallback
 )
 # 7D cap (shared by T0 check and DP-5 fallback re-check)
 CAP_PCT = 0.03
@@ -1024,6 +1027,55 @@ def _inspect_dry_limit(row: dict, raw: dict, settings: dict, user_id: str, now_c
         ))
         return
 
+    # ── Re-peg scenarios (dry): drive the SAME _repeg_decision as live ──
+    if scenario in ("repeg_fill", "repeg_reject", "repeg_cap"):
+        repeg_count = int(raw.get("repeg_count") or 0)
+        # After a successful chase, the re-pegged bid fills as maker.
+        if scenario == "repeg_fill" and repeg_count >= 1:
+            cost = vol * px
+            fee = cost * maker_rate
+            sb_update("dca_executions", {"cl_ord_id": f"eq.{cl}"}, {
+                "status": "filled_dry_run",
+                "filled_quote_cost": round(cost, 6),
+                "fee_quote": round(fee, 6),
+                "filled_base_volume": vol,
+                "avg_price": px,
+                "execution_finished_at": _now_utc_iso(),
+            })
+            tg_send(msg_dryrun(
+                f"DCA {row['pair']} MAKER DRY RUN",
+                f"Re-peg then filled as maker (sim)\nAll-in est: ${cost + fee:.4f}\nVol: {vol}"
+            ))
+            print(f"    DRYRUN {cl}: repeg_fill -> maker fill @ {px} (sim)")
+            return
+        # Before deadline: attempt one chase against a synthetic per-scenario book.
+        if now_chicago < deadline:
+            repeg_max = int(settings.get("repeg_max") or 5)
+            min_ticks = int(settings.get("repeg_min_ticks") or 1)
+            cost_target = float(raw.get("cost_target") or (vol * px))
+            tick = 10 ** -5
+            if scenario == "repeg_fill":       # bid climbs, still maker, under cap
+                s_bid, s_ask, s_ref = px + 3 * tick, px + 4 * tick, px * 1.10
+            elif scenario == "repeg_reject":   # bid meets ask -> spread collapsed
+                s_bid, s_ask, s_ref = px + 3 * tick, px + 3 * tick, px * 1.10
+            else:                              # repeg_cap: bid above 7D cap
+                s_bid, s_ask, s_ref = px + 3 * tick, px + 4 * tick, px * 0.90
+            action, detail = _repeg_decision(
+                px, s_bid, s_ask, s_ref, tick, min_ticks,
+                repeg_count, repeg_max, 0.0, cost_target, 8)
+            if action == "repeg":
+                raw["repeg_count"] = repeg_count + 1
+                raw["kraken_cl"] = f"{cl}-r{repeg_count + 1}"
+                sb_update("dca_executions", {"cl_ord_id": f"eq.{cl}"}, {
+                    "limit_price": detail, "raw": json.dumps(raw),
+                })
+                print(f"    DRYRUN {cl}: repeg #{repeg_count + 1} {px} -> {detail} (sim)")
+            else:
+                print(f"    DRYRUN {cl}: repeg skip ({detail}) — waiting (sim)")
+            return
+        # At/after deadline with no (further) chase: repeg_reject / repeg_cap fall
+        # through to the generic nofill cancel + fallback below.
+
     # partial40 / nofill / crash_after_cancel rest on the book until deadline
     if now_chicago < deadline:
         print(f"    DRYRUN {cl}: open, waiting (deadline {deadline.strftime('%H:%M')})")
@@ -1057,6 +1109,168 @@ def _inspect_dry_limit(row: dict, raw: dict, settings: dict, user_id: str, now_c
     fresh = dict(row)
     fresh.update(updates)
     _fallback_decision(fresh, settings, user_id, window_end, dry_run=True, scenario=scenario)
+
+
+def _repeg_decision(cur_price, bid, ask, ref_price, tick, min_ticks,
+                    repeg_count, repeg_max, ordermin, cost_target, lot_decimals):
+    """PURE decision for MVP bid-chase. No I/O — shared by the live path and
+    the dry-run harness so both exercise identical logic.
+
+    Returns (action, detail):
+      ('repeg', new_bid)  -> cancel + re-post at new_bid (still post-only)
+      ('skip',  reason)   -> leave the resting order as-is this cycle
+
+    Re-peg fires only when the best bid has climbed strictly above our resting
+    price (we've been left behind the book), while staying a genuine maker
+    (bid < ask) and under the same 7D cap the taker fallback respects."""
+    if repeg_count >= repeg_max:
+        return ("skip", "repeg_max reached")
+    if bid < cur_price + min_ticks * tick:
+        return ("skip", "bid not above resting price")   # still top of book
+    if bid >= ask:
+        return ("skip", "spread collapsed (would cross)")
+    if ref_price is not None and bid > ref_price * (1 + CAP_PCT):
+        return ("skip", "above 7D cap")
+    new_vol = floor_to_decimals(cost_target / bid, lot_decimals)
+    if new_vol <= 0 or new_vol < ordermin:
+        return ("skip", "new_vol below ordermin")
+    return ("repeg", bid)
+
+
+def _maybe_repeg(row: dict, o: dict, settings: dict, user_id: str, window_end) -> bool:
+    """LIVE MVP bid-chase. Called only for an open, pre-deadline maker leg.
+
+    Scope (MVP): re-pegs ONLY a fully-unfilled leg. Any partial fill is left
+    to the deadline -> fallback path (partial-aware re-peg is a later phase).
+
+    Crash-safety (claim-first): the current order is canceled and confirmed
+    zero-fill, then the row is parked as `claimed` (order_id NULL) with
+    raw.kraken_cl = the NEXT client id BEFORE AddOrder. So a crash between
+    AddOrder and the DB commit is recovered by reconciliation, which searches
+    raw.kraken_cl and restores limit_open instead of orphaning the order.
+
+    Returns True if a re-peg was performed (caller stops handling this row
+    this cycle); False otherwise (caller falls through to normal 'waiting')."""
+    if not bool(settings.get("repeg_enabled")):
+        return False
+
+    # MVP: zero-fill only (vol_exec from the QueryOrders result we already have)
+    if float(o.get("vol_exec", 0) or 0) > 0:
+        return False
+
+    cl = row["cl_ord_id"]
+    pair = row["pair"]
+    oid = row.get("order_id")
+    if not oid:
+        return False
+    cur_price = float(row.get("limit_price") or 0)
+    if cur_price <= 0:
+        return False
+
+    raw = _safe_json_load(row.get("raw")) or {}
+    repeg_count = int(raw.get("repeg_count") or 0)
+    repeg_max = int(settings.get("repeg_max") or 5)
+    min_ticks = int(settings.get("repeg_min_ticks") or 1)
+
+    try:
+        pair_info = get_asset_pair_info(pair)
+        ticker = get_ticker_snapshot(pair)
+    except Exception as e:
+        print(f"    repeg: market data failed ({e}) — skip this cycle")
+        return False
+
+    bid, ask = ticker.get("bid"), ticker.get("ask")
+    if not bid or not ask or ask <= 0:
+        return False
+
+    tick = 10 ** (-pair_info["pair_decimals"])
+    total_target = float(row["requested_quote_amount_base"])
+    safe_total = max(total_target - USD_SAFETY_MARGIN, 0.0)
+    maker_rate = max(float(settings.get("maker_fee_rate") or 0.004), 0.0)
+    cost_target = safe_total / (1.0 + maker_rate)
+    ref_price = get_7d_ref_price(pair, user_id)
+
+    action, detail = _repeg_decision(
+        cur_price, bid, ask, ref_price, tick, min_ticks,
+        repeg_count, repeg_max, pair_info["ordermin"], cost_target,
+        pair_info["lot_decimals"])
+    if action != "repeg":
+        print(f"    repeg skip ({detail}) — {cl} @ {cur_price}")
+        return False
+    new_bid = detail
+
+    # ── Cancel current resting order, confirm it was zero-fill ──
+    try:
+        kraken_private("CancelOrder", {"txid": oid})
+    except KrakenError as e:
+        print(f"    repeg: cancel error (may already be gone): {e}")
+    try:
+        od = kraken_private("QueryOrders", {"txid": oid})
+        oc = od.get(oid) or {}
+    except Exception as e:
+        print(f"    repeg: readback failed ({e}) — leave for next cycle")
+        return False
+    st = oc.get("status", "")
+    if st == "closed" or float(oc.get("vol_exec", 0) or 0) > 0:
+        # Filled (fully or partially) during the cancel race — do NOT re-peg;
+        # the normal inspection path finalizes/handles it next cycle.
+        print(f"    repeg: fill during cancel race (status={st}) — abort")
+        return False
+    if st not in ("canceled", "expired"):
+        print(f"    repeg: cancel not confirmed (status={st}) — leave for next cycle")
+        return False
+
+    new_vol = floor_to_decimals(cost_target / new_bid, pair_info["lot_decimals"])
+    new_cl = f"{cl}-r{repeg_count + 1}"
+    new_price_str = f"{new_bid:.{pair_info['pair_decimals']}f}"
+
+    # Claim-first: record intent (kraken_cl + parked as claimed) BEFORE AddOrder.
+    raw["kraken_cl"] = new_cl
+    raw["repeg_count"] = repeg_count + 1
+    raw.setdefault("repeg_history", []).append(
+        {"n": repeg_count + 1, "from": cur_price, "to": new_bid, "at": _now_utc_iso()})
+    sb_update("dca_executions", {"cl_ord_id": f"eq.{cl}"}, {
+        "status": "claimed", "order_id": None, "raw": json.dumps(raw),
+    })
+
+    try:
+        result = kraken_private("AddOrder", {
+            "pair": pair, "type": "buy", "ordertype": "limit",
+            "price": new_price_str,
+            "volume": format_volume(new_vol, pair_info["lot_decimals"]),
+            "oflags": "post,fciq",
+            "cl_ordid": new_cl,
+        })
+        new_oid = result.get("txid", [None])[0]
+    except KrakenError as e:
+        # Repost failed/rejected: the old leg is already canceled (zero-fill),
+        # so resolve the event straight to a taker fallback for the full budget
+        # (mirrors the initial post-only-reject path).
+        low = str(e).lower()
+        note = "post-only rejected" if "post only" in low else f"AddOrder failed: {e}"
+        print(f"    repeg: repost {note} — routing to fallback")
+        sb_update("dca_executions", {"cl_ord_id": f"eq.{cl}"}, {
+            "status": "rejected_postonly", "order_id": None,
+            "limit_price": new_bid,
+        })
+        fresh = dict(row)
+        fresh["status"] = "rejected_postonly"
+        _fallback_decision(fresh, settings, user_id, window_end,
+                           dry_run=False, scenario=None)
+        return True
+
+    # Preserve re-peg tracking (repeg_count/kraken_cl/history) in raw; nest the
+    # Kraken result rather than overwriting, or the count would reset next cycle.
+    raw["last_result"] = result
+    sb_update("dca_executions", {"cl_ord_id": f"eq.{cl}"}, {
+        "status": "limit_open", "order_id": new_oid,
+        "limit_price": new_bid,
+        "bid": bid, "ask": ask, "mid": ticker.get("mid"), "mid_ts": _now_utc_iso(),
+        "raw": json.dumps(raw),
+    })
+    print(f"  {ICONS['OK']} repeg #{repeg_count + 1}: {cur_price} -> {new_bid} "
+          f"(txid {new_oid}, vol {new_vol})")
+    return True
 
 
 def run_maker_inspection(settings: dict, user_id: str, now_chicago):
@@ -1169,6 +1383,10 @@ def run_maker_inspection(settings: dict, user_id: str, now_chicago):
                                        dry_run=False, scenario=None)
             # 'filled' -> done; None -> retry next run, TTL bounds it
         else:
+            # Before-deadline & still open: try a bid-chase re-peg (no-op unless
+            # repeg_enabled); otherwise keep resting.
+            if _maybe_repeg(row, o, settings, user_id, window_end):
+                continue
             print(f"  {cl}: open, waiting (deadline {deadline.strftime('%H:%M %Z')})")
 
 
@@ -1672,7 +1890,12 @@ def run_reconciliation(user_id: str):
                     f"{row['trade_date_chicago']} | {row['pair']}\nSimulated crash recovered without re-buy"
                 ))
                 continue
-            found = try_find_kraken_order(cl_id)
+            # A re-peg parks the row as `claimed` with raw.kraken_cl = the
+            # client id of the re-posted order (differs from the row key). Search
+            # by that id so a crash mid-repeg recovers the resting order instead
+            # of orphaning it (double-buy guard).
+            search_cl = raw.get("kraken_cl") or cl_id
+            found = try_find_kraken_order(search_cl)
             if found:
                 print("    Found in Kraken! Finalizing...")
                 finalize_order(cl_id, found)
@@ -1681,14 +1904,14 @@ def run_reconciliation(user_id: str):
                 # succeeded but the DB update crashed, the order is open on
                 # Kraken — restore the row to limit_open so the state
                 # machine owns it again instead of orphaning the order.
-                open_tx = _find_open_kraken_order(cl_id)
+                open_tx = _find_open_kraken_order(search_cl)
                 if open_tx:
                     print(f"    Found RESTING on Kraken ({open_tx}) — restoring limit_open")
                     sb_update("dca_executions", {"cl_ord_id": f"eq.{cl_id}"}, {
                         "status": "limit_open",
                         "order_id": open_tx,
                     })
-                elif (recheck := try_find_kraken_order(cl_id)):
+                elif (recheck := try_find_kraken_order(search_cl)):
                     # Race: filled between the ClosedOrders miss and the
                     # OpenOrders miss. Without this re-check the fill would
                     # be marked failed with real money spent.
