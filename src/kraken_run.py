@@ -49,7 +49,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from ohlc import build_daily_metrics
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 
 # ═══════════════════════════════════════════════════════════════
 #  ICONS — single source of truth for all UI symbols
@@ -578,6 +578,41 @@ def check_balance_usd() -> float:
     """Get available USD balance from Kraken."""
     balances = kraken_private("Balance")
     return float(balances.get("ZUSD", 0))
+
+
+# Days of remaining buys below which we warn. Notification only -- it never
+# changes a trading decision -- so it defaults ON even without the migration.
+LOW_BALANCE_WARN_DAYS_DEFAULT = 5
+
+
+def warn_if_low_balance(usd_balance: float, daily_burn: float, settings: dict) -> None:
+    """Telegram warning while the Kraken USD balance can still be topped up.
+
+    A funding gap does not fail loudly: the day is simply skipped, and a
+    skipped day is never bought back because there is no carryover. That is
+    how 2026-07-23 was lost. This fires while there is still time to act.
+
+    Fires at most once per day: the balance preflight sits AFTER the claim
+    insert, which is day-unique, so later runs inside the same window return
+    at the 409 long before reaching here."""
+    raw = settings.get("low_balance_warn_days")
+    try:
+        threshold = LOW_BALANCE_WARN_DAYS_DEFAULT if raw is None else float(raw)
+    except (TypeError, ValueError):
+        threshold = LOW_BALANCE_WARN_DAYS_DEFAULT
+    if threshold <= 0 or daily_burn <= 0:
+        return
+    days_left = usd_balance / daily_burn
+    if days_left >= threshold:
+        return
+    print(f"  {ICONS['WARN']} Low balance: ${usd_balance:.2f} = ~{days_left:.1f} days of buys")
+    tg_send(msg_warn(
+        "DCA LIKUTIS SENKA",
+        f"Kraken USD: ${usd_balance:.2f}\n"
+        f"Dienos biudzetas: ${daily_burn:.2f}\n"
+        f"Liko ~{days_left:.1f} d. pirkimu (riba {threshold:.0f} d.)\n"
+        f"Papildyk laiku — praleista diena neatperkama."
+    ))
 
 
 def get_asset_pair_info(pair: str) -> dict:
@@ -1482,7 +1517,8 @@ def run_maker_inspection(settings: dict, user_id: str, now_chicago):
 #  CORE: EXECUTE ONE PAIR
 # ═══════════════════════════════════════════════════════════════
 
-def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str, force: bool = False) -> dict:
+def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
+                 force: bool = False, daily_burn: float = 0.0) -> dict:
     """
     Full two-phase execution for one trading pair.
 
@@ -1578,6 +1614,9 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str, 
                     f"{ts_chi} | {pair}\nInsufficient funds: ${usd_balance:.2f} < ${total_target:.2f}"
                 ))
                 return {"pair": pair, "status": "skipped_insufficient_funds"}
+        elif not dry_run:
+            # Balance still covers today -- warn if it will not cover many more.
+            warn_if_low_balance(usd_balance, daily_burn or total_target, settings)
     except KrakenError as e:
         print(f"  {ICONS['WARN']} Balance check failed: {e} — continuing anyway")
 
@@ -2232,6 +2271,10 @@ def main():
 
     print(f"   Found {len(orders)} enabled order(s)")
 
+    # Total committed per day across every enabled order -- the burn rate the
+    # low-balance warning measures the Kraken USD balance against.
+    daily_burn = sum(float(o.get("base_quote_amount") or 0) for o in orders)
+
     # 3) Execute each pair (per-order time window)
     # 3a) Snapshot all unique pairs (regardless of time window)
     seen_pairs = set()
@@ -2276,7 +2319,8 @@ def main():
             continue
 
         try:
-            result = execute_pair(order, settings, today_chicago, user_id, force=(mode == "--force"))
+            result = execute_pair(order, settings, today_chicago, user_id,
+                                  force=(mode == "--force"), daily_burn=daily_burn)
             results.append(result)
         except Exception as e:
             print(f"   {ICONS['FAIL']} Unhandled error for {pair}: {e}")

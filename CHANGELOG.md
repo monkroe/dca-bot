@@ -6,6 +6,15 @@ History before 2026-07-18 (Phase 1 -- Kraken + Strike execution, notifications, 
 
 ## 2026-07-26 (sekmadienis -- Chicago, session 18)
 
+### feat(ops): low-balance warning -- v1.4.1
+- **Why**: a funding gap does not fail loudly. The bot skips the day, and a skipped day is never bought back because there is no carryover. That is exactly how 2026-07-23 was lost (Kraken held $0.49 at the window). Open idea since then; built now
+- `warn_if_low_balance()`: after the balance preflight confirms the day is covered, compare the balance against the daily burn and send a Telegram warning when fewer than `low_balance_warn_days` days of buys remain
+- **Daily burn = SUM of every enabled order's amount**, not just the order being executed -- computed once in `main()` and passed into `execute_pair`, so the figure stays correct if more orders are added
+- **Notification only.** It never changes a trading decision, so unlike the cap and re-peg switches it ships ENABLED (default 5 days). Code default holds even without the migration; the column exists to tune it or switch it off with 0
+- Fires at most once per day by construction: the balance preflight sits AFTER the day-unique claim insert, so later runs in the same window return at the 409 before reaching it. Skipped entirely in `dry_run`, and not emitted when the balance already fails the day (that path has its own alert)
+- Config in `dca_settings` (migration `db/v5-low-balance-warning.sql`): `low_balance_warn_days` (default 5, 0 = off, CHECK >= 0)
+- Validation: 10 added branches (above/at/below threshold, disabled, custom threshold, missing column, zero burn, garbage value, multi-order burn) -- 32 offline branches total, all pass; `test.sh` green
+
 ### feat(cap): veto layer rebased onto the H7 daily-close standard -- v1.4.0
 - **Why**: the cap reference was `AVG(mid)` over our OWN `dca_executions` from the last 7 days -- ~7 unevenly spaced points that sit on the recent low, so a small uptick read as "above cap". Backtest over 220d of KAS daily closes: the legacy rule skips **~22% of ALL days**, and **62% of those skips happened while the price was below H90** (500d: 28% skipped, 59% of them cheap). Same pattern on 8 other pairs (16-25% skipped, 63-95% of skips cheap), so this was never KAS-specific
 - **The rule** (`dca-bot-v2.3.md` Phase 2 weights matrix, H7 veto row + "KAINU DEFINICIJOS" price standard): skip only if `mid > H7 * (1 + cap_pct)` **AND** `mid > H90`, where H7/H90 are SMAs of **Kraken daily closes**, not our own fills
