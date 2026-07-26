@@ -7,7 +7,7 @@ History before 2026-07-18 (Phase 1 -- Kraken + Strike execution, notifications, 
 ## 2026-07-26 (sekmadienis -- Chicago, session 18)
 
 ### feat(cap): veto layer rebased onto the H7 daily-close standard -- v1.4.0
-- **Why**: the cap reference was `AVG(mid)` over our OWN `dca_executions` from the last 7 days -- ~7 unevenly spaced points that sit on the recent low, so a small uptick read as "above cap". Backtest over 220d of KAS daily closes: the legacy rule skips **~30% of ALL days**, and **70% of those skips happened while the price was below H90**. Same pattern on 8 other pairs (23-38% skipped, 69-95% of skips cheap), so this was never KAS-specific
+- **Why**: the cap reference was `AVG(mid)` over our OWN `dca_executions` from the last 7 days -- ~7 unevenly spaced points that sit on the recent low, so a small uptick read as "above cap". Backtest over 220d of KAS daily closes: the legacy rule skips **~22% of ALL days**, and **62% of those skips happened while the price was below H90** (500d: 28% skipped, 59% of them cheap). Same pattern on 8 other pairs (16-25% skipped, 63-95% of skips cheap), so this was never KAS-specific
 - **The rule** (`dca-bot-v2.3.md` Phase 2 weights matrix, H7 veto row + "KAINU DEFINICIJOS" price standard): skip only if `mid > H7 * (1 + cap_pct)` **AND** `mid > H90`, where H7/H90 are SMAs of **Kraken daily closes**, not our own fills
 - **Why the H90 leg**: any 7-day mean has a structural blind spot -- straight after a crash a violent bounce reads as far above H7 while still sitting far below H90, i.e. exactly the cheap day an accumulator wants. On 500d of KAS, 3 of the 4 days above `H7 x 1.20` were below H90. The guard adds no tunable number (H90 is already computed every run) and can only PREVENT skips, never cause them
 - **Why a near-inert veto is correct**: the aggressive cap did improve average cost per dollar, but without a carryover mechanism a skip is not a saving -- it is capital never deployed (220d: ~29% fewer units accumulated for ~2% better price). Carryover + weight sizing is spec §2, i.e. layer 2-3, not this change
@@ -20,7 +20,8 @@ History before 2026-07-18 (Phase 1 -- Kraken + Strike execution, notifications, 
 ### VALIDATION STATUS -- cap rule
 - Covered: 22-branch offline test of `cap_decision` / `cap_params` / `get_cap_context` / the `_repeg_decision` cap leg (real 07-26 numbers, the 2025-11-26 crash-bounce shape, exact cap and H90 boundaries, missing-data paths, legacy-mode regression) -- all pass; `test.sh` green
 - Covered: 220d and 500d backtests on 9 pairs against Kraken daily closes, driven through the LIVE `ohlc.py` functions
-- NOT covered: a live run under `cap_mode='ohlc_h7'` -- not flipped yet. Backtest price proxy is the daily close (00:00 UTC) while the real buy is at 7:04 CT, so intraday spikes between closes are invisible and the true veto-zone count could be slightly higher
+- NOT covered: a live run under `cap_mode='ohlc_h7'`. Backtest price proxy is the daily close (00:00 UTC) while the real buy happens inside the configured execution window, so intraday spikes between closes are invisible and the true veto-zone count could be slightly higher
+- The legacy skip rates above model the exec-mid reference as H7 x 0.990 -- the ratio measured on the live 2026-07-26 skip row (ref $0.027961 vs H7 $0.028241). One observation, so treat the exact percentage as approximate; the direction and the "most skips were cheap" finding hold at any plausible bias
 - Strike (`strike_run.py`) carries the SAME legacy cap and is NOT touched by this change (dormant: zero enabled orders). BTC is bought via Strike, so this fix does not reach BTC until Strike gets the same treatment
 
 ## 2026-07-25 (diena + vakaras -- Chicago; UTC jau 07-26, session 17)
