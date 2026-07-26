@@ -4,6 +4,25 @@ Conventions: dates are **Chicago** time (the bot's trading timezone); a "vakaras
 
 History before 2026-07-18 (Phase 1 -- Kraken + Strike execution, notifications, reconciliation, impact/all-in bps telemetry) is in `git log`; this changelog starts at Phase 2.
 
+## 2026-07-26 (sekmadienis -- Chicago, session 18)
+
+### feat(cap): veto layer rebased onto the H7 daily-close standard -- v1.4.0
+- **Why**: the cap reference was `AVG(mid)` over our OWN `dca_executions` from the last 7 days -- ~7 unevenly spaced points that sit on the recent low, so a small uptick read as "above cap". Backtest over 220d of KAS daily closes: the legacy rule skips **~30% of ALL days**, and **70% of those skips happened while the price was below H90**. Same pattern on 8 other pairs (23-38% skipped, 69-95% of skips cheap), so this was never KAS-specific
+- **The rule** (`dca-bot-v2.3.md` Phase 2 weights matrix, H7 veto row + "KAINU DEFINICIJOS" price standard): skip only if `mid > H7 * (1 + cap_pct)` **AND** `mid > H90`, where H7/H90 are SMAs of **Kraken daily closes**, not our own fills
+- **Why the H90 leg**: any 7-day mean has a structural blind spot -- straight after a crash a violent bounce reads as far above H7 while still sitting far below H90, i.e. exactly the cheap day an accumulator wants. On 500d of KAS, 3 of the 4 days above `H7 x 1.20` were below H90. The guard adds no tunable number (H90 is already computed every run) and can only PREVENT skips, never cause them
+- **Why a near-inert veto is correct**: the aggressive cap did improve average cost per dollar, but without a carryover mechanism a skip is not a saving -- it is capital never deployed (220d: ~29% fewer units accumulated for ~2% better price). Carryover + weight sizing is spec §2, i.e. layer 2-3, not this change
+- `cap_decision()`: PURE veto shared by all three call sites (T0 check, DP-5 fallback re-check, re-peg guard) so they can never drift apart. Missing reference or missing H90 = NO skip (DP-4: the day must never end unbought while funds exist)
+- `get_cap_context()` routes by mode; `get_ohlc_ctx()` caches the OHLC fetch per run (T0 hands in the context it already built for Phase 1.5 telemetry)
+- `_repeg_decision()` now takes `h90` + cap params and calls the same `cap_decision`; dry-run scenario `repeg_cap` re-tuned so its veto still fires under BOTH cap modes
+- Config in `dca_settings` (migration `db/v4-cap-h7-ohlc.sql`): `cap_mode` (`exec_7d` default | `ohlc_h7`), `cap_pct` (0.03 default), `cap_require_above_h90` (false default). Code is safe WITHOUT the migration -- missing columns read as legacy. Kill-switch: `cap_mode='exec_7d'`, instant, zero deploy
+- Ships with LEGACY defaults: deploying changes nothing until the flip UPDATE is run
+
+### VALIDATION STATUS -- cap rule
+- Covered: 22-branch offline test of `cap_decision` / `cap_params` / `get_cap_context` / the `_repeg_decision` cap leg (real 07-26 numbers, the 2025-11-26 crash-bounce shape, exact cap and H90 boundaries, missing-data paths, legacy-mode regression) -- all pass; `test.sh` green
+- Covered: 220d and 500d backtests on 9 pairs against Kraken daily closes, driven through the LIVE `ohlc.py` functions
+- NOT covered: a live run under `cap_mode='ohlc_h7'` -- not flipped yet. Backtest price proxy is the daily close (00:00 UTC) while the real buy is at 7:04 CT, so intraday spikes between closes are invisible and the true veto-zone count could be slightly higher
+- Strike (`strike_run.py`) carries the SAME legacy cap and is NOT touched by this change (dormant: zero enabled orders). BTC is bought via Strike, so this fix does not reach BTC until Strike gets the same treatment
+
 ## 2026-07-25 (diena + vakaras -- Chicago; UTC jau 07-26, session 17)
 
 ### feat(maker): re-peg (bid-chase) MVP -- v1.3.0 (0e429ec)

@@ -49,7 +49,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from ohlc import build_daily_metrics
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 # ═══════════════════════════════════════════════════════════════
 #  ICONS — single source of truth for all UI symbols
@@ -119,8 +119,17 @@ SCENARIO_SEQUENCE = (
     "repeg_reject",           # 8. bid meets ask -> re-peg blocked (spread) -> fallback
     "repeg_cap",              # 9. bid above 7D cap -> re-peg blocked -> fallback
 )
-# 7D cap (shared by T0 check and DP-5 fallback re-check)
-CAP_PCT = 0.03
+# ── Cap (veto layer) ───────────────────────────────────────────────
+# Two reference modes, selected by dca_settings.cap_mode:
+#   'exec_7d' (legacy) — reference = mean of OUR OWN execution mids over 7 days.
+#   'ohlc_h7' (v2.3 spec) — reference = H7 SMA of Kraken daily closes, per the
+#       project price standard ("H7/H30/H90/H180 = SMA is Kraken daily close",
+#       dca-bot-v2.3.md), with the euphoria threshold from the Phase 2 weights
+#       matrix and an H90 guard (see cap_decision).
+# These defaults keep the legacy behaviour until cap_mode is flipped in the DB.
+CAP_MODE_DEFAULT = "exec_7d"
+CAP_PCT_DEFAULT = 0.03
+CAP_REQUIRE_ABOVE_H90_DEFAULT = False
 
 # Maker-leg statuses whose EVENT still awaits a fallback decision
 # (reason IS NULL = decision pending; reason set = event terminal).
@@ -219,6 +228,77 @@ def get_7d_ref_price(pair: str, user_id: str) -> float | None:
     except Exception as e:
         print(f"  {ICONS['WARN']} 7D ref price failed: {e}")
         return None
+
+
+_OHLC_CACHE: dict = {}
+
+
+def get_ohlc_ctx(pair: str, preloaded: dict | None = None) -> dict:
+    """Daily OHLC metrics for `pair`, fetched at most once per run.
+
+    The T0 path already builds this for Phase 1.5 telemetry and hands it in;
+    the fallback and re-peg paths run in later cron cycles (fresh processes)
+    and fetch their own. Returns {} when Kraken OHLC is unavailable."""
+    if preloaded:
+        _OHLC_CACHE[pair] = preloaded
+        return preloaded
+    if pair in _OHLC_CACHE:
+        return _OHLC_CACHE[pair]
+    try:
+        ctx = build_daily_metrics(pair, days=220)
+    except Exception as e:
+        print(f"  {ICONS['WARN']} OHLC fetch for cap failed: {e}")
+        ctx = {}
+    _OHLC_CACHE[pair] = ctx
+    return ctx
+
+
+def get_cap_context(pair: str, user_id: str, settings: dict, ohlc_ctx: dict | None = None):
+    """Resolve the cap reference for `pair`. Returns (ref_price, h90, label).
+
+    ref_price None means NO cap check runs at all — a missing reference has
+    always meant "proceed" here (DP-4: the day must never end unbought while
+    funds exist), and that stays true if Kraken OHLC is unreachable."""
+    mode = settings.get("cap_mode") or CAP_MODE_DEFAULT
+    if mode == "ohlc_h7":
+        ctx = get_ohlc_ctx(pair, ohlc_ctx)
+        return ctx.get("H7"), ctx.get("H90"), "H7"
+    return get_7d_ref_price(pair, user_id), None, "7D"
+
+
+def cap_params(settings: dict):
+    """(cap_pct, require_above_h90) with legacy-safe defaults."""
+    raw_pct = settings.get("cap_pct")
+    try:
+        cap_pct = CAP_PCT_DEFAULT if raw_pct is None else float(raw_pct)
+    except (TypeError, ValueError):
+        cap_pct = CAP_PCT_DEFAULT
+    raw_req = settings.get("cap_require_above_h90")
+    require = CAP_REQUIRE_ABOVE_H90_DEFAULT if raw_req is None else bool(raw_req)
+    return cap_pct, require
+
+
+def cap_decision(price, ref_price, h90, cap_pct, require_above_h90):
+    """PURE veto decision — shared by the T0 check, the DP-5 fallback re-check
+    and the re-peg guard, so all three can never drift apart.
+
+    Skip only when the price is stretched against the SHORT reference and --
+    when the guard is on -- also above the 90-day trend. The H90 condition
+    closes a structural blind spot of any 7-day mean: straight after a crash a
+    violent bounce reads as far above H7 while still sitting well BELOW H90,
+    i.e. exactly the cheap day an accumulator wants to buy. Measured on 500d of
+    KAS daily closes: of the 4 days above H7 x 1.20, three were below H90.
+
+    Returns (skip: bool, detail: str | None)."""
+    if price is None or ref_price is None or ref_price <= 0:
+        return (False, None)
+    cap_price = ref_price * (1.0 + cap_pct)
+    if price <= cap_price:
+        return (False, None)
+    if require_above_h90 and (h90 is None or price <= h90):
+        return (False, None)
+    pct_over = ((price / ref_price) - 1.0) * 100.0
+    return (True, f"+{pct_over:.2f}% vs ref (cap ${cap_price:.6f})")
 
 #  TELEGRAM
 # ═══════════════════════════════════════════════════════════════
@@ -861,14 +941,15 @@ def _fallback_decision(row: dict, settings: dict, user_id: str, window_end, dry_
 
     # DP-5: cap re-checked with the CURRENT mid, not the T0 one.
     if ticker.get("mid"):
-        ref_price = get_7d_ref_price(pair, user_id)
-        if ref_price is not None and ticker["mid"] > ref_price * (1 + CAP_PCT):
-            pct_over = ((ticker["mid"] / ref_price) - 1) * 100
+        cap_pct, require_h90 = cap_params(settings)
+        ref_price, h90, label = get_cap_context(pair, user_id, settings)
+        skip, detail = cap_decision(ticker["mid"], ref_price, h90, cap_pct, require_h90)
+        if skip:
             mark("fallback_skipped_above_cap")
             tg_send(msg_warn(
                 "DCA PARTIAL",
                 f"{trade_date} | {pair}\n"
-                f"Fallback skip: mid +{pct_over:.2f}% virs 7D cap.\n"
+                f"Fallback skip: mid {detail} virs {label} cap.\n"
                 f"Ivykdyta: ${spent:.4f} is ${total_target:.2f}"
             ))
             return
@@ -1054,15 +1135,19 @@ def _inspect_dry_limit(row: dict, raw: dict, settings: dict, user_id: str, now_c
             min_ticks = int(settings.get("repeg_min_ticks") or 1)
             cost_target = float(raw.get("cost_target") or (vol * px))
             tick = 10 ** -5
+            cap_pct, require_h90 = cap_params(settings)
+            # Synthetic books. The repeg_cap reference is set low enough that the
+            # veto fires under BOTH cap modes (legacy 3% and the H7+H90 rule),
+            # so the scenario keeps its meaning whichever mode is configured.
             if scenario == "repeg_fill":       # bid climbs, still maker, under cap
-                s_bid, s_ask, s_ref = px + 3 * tick, px + 4 * tick, px * 1.10
+                s_bid, s_ask, s_ref, s_h90 = px + 3 * tick, px + 4 * tick, px * 1.10, px * 1.10
             elif scenario == "repeg_reject":   # bid meets ask -> spread collapsed
-                s_bid, s_ask, s_ref = px + 3 * tick, px + 3 * tick, px * 1.10
-            else:                              # repeg_cap: bid above 7D cap
-                s_bid, s_ask, s_ref = px + 3 * tick, px + 4 * tick, px * 0.90
+                s_bid, s_ask, s_ref, s_h90 = px + 3 * tick, px + 3 * tick, px * 1.10, px * 1.10
+            else:                              # repeg_cap: bid above cap AND above H90
+                s_bid, s_ask, s_ref, s_h90 = px + 3 * tick, px + 4 * tick, px * 0.80, px * 0.90
             action, detail = _repeg_decision(
-                px, s_bid, s_ask, s_ref, tick, min_ticks,
-                repeg_count, repeg_max, 0.0, cost_target, 8)
+                px, s_bid, s_ask, s_ref, s_h90, cap_pct, require_h90,
+                tick, min_ticks, repeg_count, repeg_max, 0.0, cost_target, 8)
             if action == "repeg":
                 raw["repeg_count"] = repeg_count + 1
                 raw["kraken_cl"] = f"{cl}-r{repeg_count + 1}"
@@ -1111,8 +1196,9 @@ def _inspect_dry_limit(row: dict, raw: dict, settings: dict, user_id: str, now_c
     _fallback_decision(fresh, settings, user_id, window_end, dry_run=True, scenario=scenario)
 
 
-def _repeg_decision(cur_price, bid, ask, ref_price, tick, min_ticks,
-                    repeg_count, repeg_max, ordermin, cost_target, lot_decimals):
+def _repeg_decision(cur_price, bid, ask, ref_price, h90, cap_pct, require_above_h90,
+                    tick, min_ticks, repeg_count, repeg_max, ordermin,
+                    cost_target, lot_decimals):
     """PURE decision for MVP bid-chase. No I/O — shared by the live path and
     the dry-run harness so both exercise identical logic.
 
@@ -1122,15 +1208,16 @@ def _repeg_decision(cur_price, bid, ask, ref_price, tick, min_ticks,
 
     Re-peg fires only when the best bid has climbed strictly above our resting
     price (we've been left behind the book), while staying a genuine maker
-    (bid < ask) and under the same 7D cap the taker fallback respects."""
+    (bid < ask) and under the same cap the taker fallback respects."""
     if repeg_count >= repeg_max:
         return ("skip", "repeg_max reached")
     if bid < cur_price + min_ticks * tick:
         return ("skip", "bid not above resting price")   # still top of book
     if bid >= ask:
         return ("skip", "spread collapsed (would cross)")
-    if ref_price is not None and bid > ref_price * (1 + CAP_PCT):
-        return ("skip", "above 7D cap")
+    capped, cap_detail = cap_decision(bid, ref_price, h90, cap_pct, require_above_h90)
+    if capped:
+        return ("skip", f"above cap ({cap_detail})")
     new_vol = floor_to_decimals(cost_target / bid, lot_decimals)
     if new_vol <= 0 or new_vol < ordermin:
         return ("skip", "new_vol below ordermin")
@@ -1188,12 +1275,13 @@ def _maybe_repeg(row: dict, o: dict, settings: dict, user_id: str, window_end) -
     safe_total = max(total_target - USD_SAFETY_MARGIN, 0.0)
     maker_rate = max(float(settings.get("maker_fee_rate") or 0.004), 0.0)
     cost_target = safe_total / (1.0 + maker_rate)
-    ref_price = get_7d_ref_price(pair, user_id)
+    cap_pct, require_h90 = cap_params(settings)
+    ref_price, h90, _label = get_cap_context(pair, user_id, settings)
 
     action, detail = _repeg_decision(
-        cur_price, bid, ask, ref_price, tick, min_ticks,
-        repeg_count, repeg_max, pair_info["ordermin"], cost_target,
-        pair_info["lot_decimals"])
+        cur_price, bid, ask, ref_price, h90, cap_pct, require_h90,
+        tick, min_ticks, repeg_count, repeg_max, pair_info["ordermin"],
+        cost_target, pair_info["lot_decimals"])
     if action != "repeg":
         print(f"    repeg skip ({detail}) — {cl} @ {cur_price}")
         return False
@@ -1538,16 +1626,18 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str, 
             print(f"  WARN OHLC fetch failed: {e} -- continuing without market context")
             ohlc_ctx = {}
 
-    # ── 7D Cap Check (Smart DCA) ───────────────────────────────
-    CAP_PCT = 0.03  # 3.0%
+    # ── Cap Check (veto layer, Smart DCA) ──────────────────────
     if ticker["mid"] and not force:
-        ref_price = get_7d_ref_price(pair, user_id)
+        cap_pct, require_h90 = cap_params(settings)
+        ref_price, h90, label = get_cap_context(pair, user_id, settings, ohlc_ctx)
         if ref_price is not None:
-            cap_price = ref_price * (1 + CAP_PCT)
-            print(f"  7D ref: ${ref_price:.6f} | Cap: ${cap_price:.6f} | Mid: ${ticker['mid']:.6f}")
-            if ticker["mid"] > cap_price:
+            h90_txt = f"${h90:.6f}" if h90 else "n/a"
+            print(f"  {label} ref: ${ref_price:.6f} | Cap: ${ref_price * (1 + cap_pct):.6f} | "
+                  f"H90: {h90_txt} | Mid: ${ticker['mid']:.6f}")
+            skip, detail = cap_decision(ticker["mid"], ref_price, h90, cap_pct, require_h90)
+            if skip:
                 pct_over = ((ticker["mid"] / ref_price) - 1) * 100
-                reason = f"Mid ${ticker['mid']:.6f} > cap ${cap_price:.6f} (+{pct_over:.2f}% vs 7D ref)"
+                reason = f"Mid ${ticker['mid']:.6f} above cap: {detail} [{label}]"
                 print(f"  {ICONS['SKIP']} {reason}")
                 update_execution({
                     "status": "skipped_above_cap",
@@ -1558,7 +1648,7 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str, 
                 return {"pair": pair, "status": "skipped_above_cap"}
             print(f"  {ICONS['OK']} Below cap — proceeding")
         else:
-            print(f"  No 7D history — skipping cap check")
+            print(f"  No {label} reference — skipping cap check")
     # ── Fee-aware volume calculation ──────────────────────────
     # Maker leg prices/sizes at BID (the limit rests there); market at ASK.
     price_ref = ticker["bid"] if maker else ticker["ask"]
