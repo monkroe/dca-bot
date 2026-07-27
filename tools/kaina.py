@@ -6,21 +6,41 @@ and the cap verdict computed by the bot's OWN cap_decision(), so this tool can
 never drift from what actually runs.
 
 Usage:
-    python3 tools/kaina.py                    # the live order's pair
-    python3 tools/kaina.py KASUSD SOLUSD      # any Kraken pairs
-    python3 tools/kaina.py --cap-pct 0.10     # what-if on the threshold
-    python3 tools/kaina.py --no-h90           # what-if without the guard
+    kaina                    # the live order's pair
+    kaina KAS BTC SOL        # bare symbols or full Kraken pairs
+    kaina KAS --cap-pct 0.10 # what-if on the threshold
+    kaina KAS --no-h90       # what-if without the guard
+
+Installed as the `kaina` command by tools/install-kaina.sh.
 """
 import argparse
 import json
 import os
 import sys
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(HERE), "src"))
+
+
+def _load_dotenv(path):
+    """Minimal KEY=VALUE reader -- no dependency, and the shell environment
+    still wins so an explicit export can override the file."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip().strip("'\""))
+    except OSError:
+        pass
+
+
+_load_dotenv(os.path.expanduser("~/.env"))
 
 # kraken_run reads its secrets at import time, but everything this tool touches
 # is pure. setdefault, so a real environment still wins.
@@ -31,7 +51,10 @@ for _k in ("KRAKEN_API_KEY", "KRAKEN_API_SECRET", "SUPABASE_URL",
 from ohlc import build_daily_metrics                      # noqa: E402
 from kraken_run import cap_decision, cap_params           # noqa: E402
 
-CHICAGO = ZoneInfo("America/Chicago")
+try:
+    CHICAGO = ZoneInfo("America/Chicago")
+except Exception:  # Termux without tzdata -- a header should never be fatal
+    CHICAGO = timezone.utc
 DEFAULT_PAIR = "KASUSD"
 TICKER_URL = "https://api.kraken.com/0/public/Ticker?pair="
 
@@ -47,6 +70,19 @@ ASSUMED_SETTINGS = {
     "cap_pct": 0.20,
     "cap_require_above_h90": True,
 }
+
+
+# "kaina KAS" should just work. Kraken wants a full pair, and BTC is XBT there.
+SYMBOL_ALIASES = {"BTC": "XBT", "DOGE": "XDG"}
+
+
+def to_pair(arg):
+    s = arg.strip().upper()
+    for quote in ("USDT", "USD", "EUR"):
+        if s.endswith(quote) and len(s) > len(quote):
+            base = s[:-len(quote)]
+            return SYMBOL_ALIASES.get(base, base) + quote
+    return SYMBOL_ALIASES.get(s, s) + "USD"
 
 
 def ticker(pair):
@@ -148,7 +184,7 @@ def report(pair, settings, source, cap_pct_override, no_h90):
 
 def main():
     ap = argparse.ArgumentParser(description="What the DCA bot sees right now.")
-    ap.add_argument("pairs", nargs="*", default=[], help=f"Kraken pairs (default {DEFAULT_PAIR})")
+    ap.add_argument("pairs", nargs="*", default=[], help=f"KAS, BTC, SOL or full pairs (default {DEFAULT_PAIR})")
     ap.add_argument("--cap-pct", type=float, default=None, help="what-if cap threshold, e.g. 0.10")
     ap.add_argument("--no-h90", action="store_true", help="what-if: cap without the H90 guard")
     args = ap.parse_args()
@@ -162,9 +198,9 @@ def main():
     print(f"\n{datetime.now(CHICAGO):%Y-%m-%d %H:%M %Z}", end="")
     for pair in (args.pairs or [DEFAULT_PAIR]):
         try:
-            report(pair.upper(), settings, source, args.cap_pct, args.no_h90)
+            report(to_pair(pair), settings, source, args.cap_pct, args.no_h90)
         except Exception as e:
-            print(f"\n{pair.upper()}   klaida: {e}")
+            print(f"\n{to_pair(pair)}   klaida: {e}")
     print()
 
 
