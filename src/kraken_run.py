@@ -49,7 +49,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from ohlc import build_daily_metrics
 
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 
 # ═══════════════════════════════════════════════════════════════
 #  ICONS — single source of truth for all UI symbols
@@ -706,6 +706,24 @@ def finalize_order(cl_ord_id: str, order_id: str, mid: float | None = None, ohlc
         all_in_bps = round(((all_in_price / mid) - 1) * 10_000, 4)
         print(f"  impact_bps: {impact_bps:.4f} | all_in_bps: {all_in_bps:.4f} | mid_source: {mid_source}")
 
+    # ── pair + market context ────────────────────────────────
+    # cl_ord_id carries OUR config's pair string; Kraken's descr.pair can use
+    # its own aliases (XXBTZUSD vs XBTUSD), so it is only the fallback here.
+    pair = _pair_from_cl_ord_id(cl_ord_id)
+    if pair == "?":
+        try:
+            pair = (order_data.get("descr") or {}).get("pair") or "?"
+        except Exception:
+            pair = "?"
+    # Only the T0 path hands in a context; every other call site (maker
+    # inspection, fallback, reconciliation) runs in a LATER cron cycle, i.e. a
+    # fresh process, and used to write h7/h30 as NULL. Since the maker-first
+    # cutover that is nearly every fill, so fetch it here when missing.
+    # get_ohlc_ctx caches per run and returns {} if Kraken OHLC is unavailable,
+    # which writes NULL exactly as before — telemetry never blocks a fill.
+    if ohlc_ctx is None and pair != "?":
+        ohlc_ctx = get_ohlc_ctx(pair)
+
     sb_update(
         "dca_executions",
         {"cl_ord_id": f"eq.{cl_ord_id}"},
@@ -727,15 +745,6 @@ def finalize_order(cl_ord_id: str, order_id: str, mid: float | None = None, ohlc
     )
 
     if TG_NOTIFY_ON_FILL:
-        pair = None
-        try:
-            descr = order_data.get("descr") or {}
-            pair = descr.get("pair")
-        except Exception:
-            pair = None
-        if not pair:
-            pair = _pair_from_cl_ord_id(cl_ord_id)
-
         filled_ts = finished_at_utc.astimezone(CHICAGO_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
 
         impact_line = ""
@@ -746,15 +755,18 @@ def finalize_order(cl_ord_id: str, order_id: str, mid: float | None = None, ohlc
         if all_in_bps is not None:
             sign = "+" if float(all_in_bps) >= 0 else ""
             all_in_line = f" | All-in: {sign}{float(all_in_bps):.1f} bps"
+        # H7 is the cap anchor and H90 the guard, so both belong here now that
+        # the veto reads them. H30 carries no decision weight -- it is kept
+        # because the ORDER of the three (H7 < H30 < H90 = drifting down) reads
+        # the trend at a glance, which no single number does. Same precision as
+        # the Price line above so they compare directly.
         ohlc_line = ""
-        if ohlc_ctx is not None and (ohlc_ctx.get("H7") is not None or ohlc_ctx.get("H30") is not None):
-            _h7 = ohlc_ctx.get("H7")
-            _h30 = ohlc_ctx.get("H30")
-            parts = []
-            if _h7 is not None:
-                parts.append(f"H7: ${float(_h7):.4f}")
-            if _h30 is not None:
-                parts.append(f"H30: ${float(_h30):.4f}")
+        if ohlc_ctx:
+            parts = [
+                f"{name}: ${float(ohlc_ctx[name]):.5f}"
+                for name in ("H7", "H30", "H90")
+                if ohlc_ctx.get(name) is not None
+            ]
             if parts:
                 ohlc_line = "\n" + " | ".join(parts)
         symbol = pair.replace("USD", "")

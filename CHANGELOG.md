@@ -4,6 +4,26 @@ Conventions: dates are **Chicago** time (the bot's trading timezone); a "vakaras
 
 History before 2026-07-18 (Phase 1 -- Kraken + Strike execution, notifications, reconciliation, impact/all-in bps telemetry) is in `git log`; this changelog starts at Phase 2.
 
+## 2026-07-27 (pirmadienis -- Chicago, session 19)
+
+### fix(telemetry): market context restored on cross-run fills -- v1.4.2
+- **Why**: `h7` / `h30` / `ohlc_ts` have been NULL on every execution since 2026-07-18, and the fill notification lost its `H7 | H30` line. Root cause: `finalize_order()` writes those from `ohlc_ctx`, but of its 8 call sites only the same-run T0 path passed one. After the maker-first cutover a fill is almost always finalized by a LATER cron cycle -- a fresh process -- so the context was gone. Introduced by Step 2 (session 16), surfaced by reviewing the first post-cap live fill
+- `finalize_order()` now resolves the pair and lazily calls `get_ohlc_ctx(pair)` when no context was handed in. Cached per run, so the T0 path still does not refetch and the inspection path costs at most one public OHLC call
+- Pair resolution prefers the pair encoded in `cl_ord_id` (OUR config string) over Kraken's `descr.pair`, which may return an exchange alias; `descr.pair` stays as fallback. Also removes a latent `None.replace()` on the notification path when neither source resolved
+- Fill notification now carries `H7 | H30 | H90` at the same precision as its Price line. H7 is the cap anchor and H90 the guard, so both belong there now that the veto reads them; H30 has no decision weight but the ORDER of the three reads the trend at a glance (`H7 < H30 < H90` = drifting down), which no single number does. `h90` is NOT stored as a column -- see the open item below
+- **Telemetry only, cannot alter a decision** -- hence patch. The cap has always fetched its own context in whichever process it runs; it was never affected. Kraken OHLC unavailable still writes NULL and never blocks a fill
+- Validation: 32 offline branches driving the REAL `finalize_order` with hermetic stubs (cross-run path, `-fb` and `-r1` leg ids, handed-in context not refetched, empty context, H7-only and H90-only contexts, notification order, unparseable id, no pair at all, exchange alias) -- all pass; the 32 cap/low-balance branches still pass; `test.sh` green
+
+### OPEN -- cap decisions are not reconstructible from the DB
+- `dca_executions` stores `h7` and `h30` but no `h90`, and no cap threshold. A skip row records its reason as text, a buy row records nothing about the cap at all, so after the fact you cannot verify from the DB alone whether the H90 guard was what prevented a skip
+- Fix would be a column (`h90`, and arguably the cap price actually applied) + migration. Not done in v1.4.2 to keep this patch to the regression it fixes
+
+### VALIDATION -- cap rule confirmed on its first live day
+- First execution under `cap_mode='ohlc_h7'` BOUGHT, maker leg, at the maker fee rate. The day sat ~3% above H7 but ~7% BELOW H90 -- a cheap day by the 90-day trend
+- The legacy rule, recomputed from the same `dca_executions` rows it would have read, put its cap BELOW the day's mid: **07-27 would have been a second consecutive skip, again on a cheap day.** This is the live confirmation of the backtest diagnosis
+- The exec-mid bias assumed in the session 18 backtest (ref ~= H7 x 0.990) reproduced exactly on this second independent observation
+- Re-peg still NOT proven live: the maker leg filled inside the first inspection cycle at its original limit, so there was no drifting bid to chase. Needs a day that buys but misses the first maker fill
+
 ## 2026-07-26 (sekmadienis -- Chicago, session 18)
 
 ### feat(ops): low-balance warning -- v1.4.1
