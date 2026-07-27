@@ -18,7 +18,7 @@ import json
 import os
 import sys
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -48,13 +48,23 @@ for _k in ("KRAKEN_API_KEY", "KRAKEN_API_SECRET", "SUPABASE_URL",
            "SUPABASE_SERVICE_ROLE_KEY"):
     os.environ.setdefault(_k, "unused-by-this-tool")
 
-from ohlc import build_daily_metrics                      # noqa: E402
-from kraken_run import cap_decision, cap_params           # noqa: E402
-
+# Must be checked BEFORE importing kraken_run: it builds CHICAGO_TZ at module
+# level, so a missing tz database dies there with a 40-line traceback. Termux
+# ships no zoneinfo and no tzdata package; Android's /system blob is a format
+# Python cannot read. Falling back to a fixed offset was rejected -- it would
+# print a wrong wall-clock half the year, and in this project Chicago time is
+# the convention, not a decoration.
 try:
     CHICAGO = ZoneInfo("America/Chicago")
-except Exception:  # Termux without tzdata -- a header should never be fatal
-    CHICAGO = timezone.utc
+except Exception:
+    sys.exit(
+        "kaina: truksta laiko zonu duomenu (tzdata).\n"
+        "  Pataisymas (viena karta, Termux):  pip install tzdata\n"
+        "  Tada:  kaina KAS"
+    )
+
+from ohlc import build_daily_metrics                      # noqa: E402
+from kraken_run import cap_decision, cap_params           # noqa: E402
 DEFAULT_PAIR = "KASUSD"
 TICKER_URL = "https://api.kraken.com/0/public/Ticker?pair="
 
