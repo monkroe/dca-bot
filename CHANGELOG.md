@@ -6,6 +6,16 @@ History before 2026-07-18 (Phase 1 -- Kraken + Strike execution, notifications, 
 
 ## 2026-07-27 (pirmadienis -- Chicago, session 19)
 
+### feat(telemetry): cap decisions reconstructible from the row -- v1.4.3
+- **Why**: closes the OPEN item raised the same day. `dca_executions` stored `h7` / `h30` / `mid` but neither the 90-day floor the guard reads nor the threshold actually applied. A skip row explained itself only in free text; a BUY row said nothing about the cap at all, so "did the H90 guard save this day?" was unanswerable after the fact
+- `cap_telemetry()` returns the two columns; the T0 check writes them on **BOTH** outcomes, so a normal buy now carries its cap evidence too
+- A stored row replays the decision by arithmetic, no text parsing: `skip <=> mid > cap_price AND (guard off OR mid > h90)`. The mode is inferable as well -- under `ohlc_h7`, `cap_price / h7 = 1 + cap_pct` exactly, which does not hold for the legacy exec-mid reference
+- **Scope limit, deliberate**: the columns describe the **T0** decision. The DP-5 fallback re-check and the re-peg guard run in later cycles against a fresher mid; writing their numbers onto the same row would pair a T0 `mid` with a later `cap_price` and read as a contradiction. Those paths stay auditable through their existing enum `reason` markers, which are unchanged
+- Migration `db/v6-cap-telemetry.sql` (`h90`, `cap_price`, both nullable, with column comments). **DEPLOY ORDER MATTERS**: unlike v4/v5 these columns are WRITTEN, so the migration must be applied BEFORE the code ships. Applied to Benas AI and verified before push
+- Not backfilled: the legacy cap reference averaged rows that have since changed, so historical `cap_price` is not honestly recoverable. Pre-migration rows stay NULL, which reads correctly as "not recorded"
+- Telemetry only -- cannot alter a decision, hence patch
+- Validation: 10 added branches (threshold arithmetic, missing/zero reference, missing H90, legacy pct) including 3 replay tests that assert a stored row reproduces `cap_decision`'s verdict on the live 07-27 numbers, a crash-bounce and a euphoria day -- 42 cap branches total, all pass; 32 finalize branches still pass; `test.sh` green
+
 ### fix(telemetry): market context restored on cross-run fills -- v1.4.2
 - **Why**: `h7` / `h30` / `ohlc_ts` have been NULL on every execution since 2026-07-18, and the fill notification lost its `H7 | H30` line. Root cause: `finalize_order()` writes those from `ohlc_ctx`, but of its 8 call sites only the same-run T0 path passed one. After the maker-first cutover a fill is almost always finalized by a LATER cron cycle -- a fresh process -- so the context was gone. Introduced by Step 2 (session 16), surfaced by reviewing the first post-cap live fill
 - `finalize_order()` now resolves the pair and lazily calls `get_ohlc_ctx(pair)` when no context was handed in. Cached per run, so the T0 path still does not refetch and the inspection path costs at most one public OHLC call
@@ -14,9 +24,7 @@ History before 2026-07-18 (Phase 1 -- Kraken + Strike execution, notifications, 
 - **Telemetry only, cannot alter a decision** -- hence patch. The cap has always fetched its own context in whichever process it runs; it was never affected. Kraken OHLC unavailable still writes NULL and never blocks a fill
 - Validation: 32 offline branches driving the REAL `finalize_order` with hermetic stubs (cross-run path, `-fb` and `-r1` leg ids, handed-in context not refetched, empty context, H7-only and H90-only contexts, notification order, unparseable id, no pair at all, exchange alias) -- all pass; the 32 cap/low-balance branches still pass; `test.sh` green
 
-### OPEN -- cap decisions are not reconstructible from the DB
-- `dca_executions` stores `h7` and `h30` but no `h90`, and no cap threshold. A skip row records its reason as text, a buy row records nothing about the cap at all, so after the fact you cannot verify from the DB alone whether the H90 guard was what prevented a skip
-- Fix would be a column (`h90`, and arguably the cap price actually applied) + migration. Not done in v1.4.2 to keep this patch to the regression it fixes
+- Raised the "cap decisions are not reconstructible from the DB" gap here; CLOSED the same day by v1.4.3 above
 
 ### VALIDATION -- cap rule confirmed on its first live day
 - First execution under `cap_mode='ohlc_h7'` BOUGHT, maker leg, at the maker fee rate. The day sat ~3% above H7 but ~7% BELOW H90 -- a cheap day by the 90-day trend

@@ -49,7 +49,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from ohlc import build_daily_metrics
 
-VERSION = "1.4.2"
+VERSION = "1.4.3"
 
 # ═══════════════════════════════════════════════════════════════
 #  ICONS — single source of truth for all UI symbols
@@ -276,6 +276,20 @@ def cap_params(settings: dict):
     raw_req = settings.get("cap_require_above_h90")
     require = CAP_REQUIRE_ABOVE_H90_DEFAULT if raw_req is None else bool(raw_req)
     return cap_pct, require
+
+
+def cap_telemetry(ref_price, cap_pct, h90) -> dict:
+    """The two numbers that make a cap decision reconstructible from the row.
+
+    `h7` and `mid` were already stored; these add the 90-day floor the guard
+    reads and the threshold actually applied, so afterwards the decision is
+    checkable by arithmetic instead of by parsing the reason text:
+        skip <=> mid > cap_price AND (guard off OR mid > h90)
+    Both NULL means no reference was available and NO cap check ran."""
+    return {
+        "h90": h90,
+        "cap_price": ref_price * (1.0 + cap_pct) if ref_price else None,
+    }
 
 
 def cap_decision(price, ref_price, h90, cap_pct, require_above_h90):
@@ -1686,6 +1700,9 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
             print(f"  {label} ref: ${ref_price:.6f} | Cap: ${ref_price * (1 + cap_pct):.6f} | "
                   f"H90: {h90_txt} | Mid: ${ticker['mid']:.6f}")
             skip, detail = cap_decision(ticker["mid"], ref_price, h90, cap_pct, require_h90)
+            # Recorded on BOTH outcomes: a buy row used to say nothing about the
+            # cap, so "did the H90 guard save this day?" was unanswerable later.
+            cap_cols = cap_telemetry(ref_price, cap_pct, h90)
             if skip:
                 pct_over = ((ticker["mid"] / ref_price) - 1) * 100
                 reason = f"Mid ${ticker['mid']:.6f} above cap: {detail} [{label}]"
@@ -1694,10 +1711,12 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
                     "status": "skipped_above_cap",
                     "reason": reason,
                     "execution_finished_at": datetime.now(timezone.utc).isoformat(),
+                    **cap_cols,
                 })
                 tg_send(f"{ICONS['SKIP']} {pair.replace('USD','')} +{pct_over:.2f}% virš cap — skip")
                 return {"pair": pair, "status": "skipped_above_cap"}
             print(f"  {ICONS['OK']} Below cap — proceeding")
+            update_execution(cap_cols)
         else:
             print(f"  No {label} reference — skipping cap check")
     # ── Fee-aware volume calculation ──────────────────────────
