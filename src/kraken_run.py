@@ -49,7 +49,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from ohlc import build_daily_metrics
 
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 
 # ═══════════════════════════════════════════════════════════════
 #  ICONS — single source of truth for all UI symbols
@@ -1441,6 +1441,46 @@ def _repeg_decision(cur_price, bid, ask, ref_price, h90, cap_pct, require_above_
     return ("repeg", bid)
 
 
+def log_repeg_probe(row: dict, action: str, detail: str | None,
+                    cur_price=None, bid=None, ask=None, tick=None,
+                    repeg_count=None) -> None:
+    """Record the re-peg decision for ONE inspection cycle, whatever it was.
+
+    Before this the decision reached a print() and nothing else, so it survived
+    only in a GitHub Actions log that rotates — this week's are already gone.
+    That is worse than a coarse measurement: it destroys data that would
+    otherwise exist, rather than merely limiting future precision.
+
+    Written on EVERY path, including the early returns, because the negatives
+    are the measurement. "Rested through five cycles, bid never above the limit"
+    is the answer to how often the condition occurs; a fire-only log answers
+    nothing. `ticks_above` keeps near-misses visible — 2026-07-21 and -07-28
+    both sat at exactly 0.0 ticks, one short of firing, which the executions
+    table cannot show.
+
+    Telemetry only, and swallowed on failure: this must never be able to keep a
+    leg from being re-pegged or a day from being bought."""
+    try:
+        ticks_above = None
+        if bid is not None and cur_price and tick:
+            ticks_above = round((float(bid) - float(cur_price)) / tick, 2)
+        sb_insert("dca_repeg_log", {
+            "cl_ord_id": row.get("cl_ord_id"),
+            "dca_order_id": row.get("dca_order_id"),
+            "trade_date_chicago": row.get("trade_date_chicago"),
+            "pair": row.get("pair"),
+            "limit_price": cur_price,
+            "bid": bid,
+            "ask": ask,
+            "ticks_above": ticks_above,
+            "repeg_count": repeg_count,
+            "action": action,
+            "detail": detail,
+        })
+    except Exception as e:
+        print(f"    {ICONS['WARN']} repeg probe log failed: {e}")
+
+
 def _maybe_repeg(row: dict, o: dict, settings: dict, user_id: str, window_end) -> bool:
     """LIVE MVP bid-chase. Called only for an open, pre-deadline maker leg.
 
@@ -1456,19 +1496,23 @@ def _maybe_repeg(row: dict, o: dict, settings: dict, user_id: str, window_end) -
     Returns True if a re-peg was performed (caller stops handling this row
     this cycle); False otherwise (caller falls through to normal 'waiting')."""
     if not bool(settings.get("repeg_enabled")):
+        log_repeg_probe(row, "not_evaluated", "repeg_enabled=false")
         return False
 
     # MVP: zero-fill only (vol_exec from the QueryOrders result we already have)
     if float(o.get("vol_exec", 0) or 0) > 0:
+        log_repeg_probe(row, "not_evaluated", "partial fill — MVP re-pegs zero-fill legs only")
         return False
 
     cl = row["cl_ord_id"]
     pair = row["pair"]
     oid = row.get("order_id")
     if not oid:
+        log_repeg_probe(row, "not_evaluated", "no order_id on the row")
         return False
     cur_price = float(row.get("limit_price") or 0)
     if cur_price <= 0:
+        log_repeg_probe(row, "not_evaluated", "no limit_price on the row")
         return False
 
     raw = _safe_json_load(row.get("raw")) or {}
@@ -1481,10 +1525,14 @@ def _maybe_repeg(row: dict, o: dict, settings: dict, user_id: str, window_end) -
         ticker = get_ticker_snapshot(pair)
     except Exception as e:
         print(f"    repeg: market data failed ({e}) — skip this cycle")
+        log_repeg_probe(row, "not_evaluated", f"market data failed: {e}",
+                        cur_price=cur_price, repeg_count=repeg_count)
         return False
 
     bid, ask = ticker.get("bid"), ticker.get("ask")
     if not bid or not ask or ask <= 0:
+        log_repeg_probe(row, "not_evaluated", "no usable bid/ask",
+                        cur_price=cur_price, bid=bid, ask=ask, repeg_count=repeg_count)
         return False
 
     tick = 10 ** (-pair_info["pair_decimals"])
@@ -1499,6 +1547,12 @@ def _maybe_repeg(row: dict, o: dict, settings: dict, user_id: str, window_end) -
         cur_price, bid, ask, ref_price, h90, cap_pct, require_h90,
         tick, min_ticks, repeg_count, repeg_max, pair_info["ordermin"],
         cost_target, pair_info["lot_decimals"])
+    # Logged on BOTH outcomes. The skips are the measurement: "the leg rested
+    # through N cycles and the bid was never above it" is what answers how often
+    # the condition occurs, and it is exactly what a fire-only log would omit.
+    log_repeg_probe(row, action, detail if action != "repeg" else f"repeg to {detail}",
+                    cur_price=cur_price, bid=bid, ask=ask, tick=tick,
+                    repeg_count=repeg_count)
     if action != "repeg":
         print(f"    repeg skip ({detail}) — {cl} @ {cur_price}")
         return False
