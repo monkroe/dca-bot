@@ -49,7 +49,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from ohlc import build_daily_metrics
 
-VERSION = "1.4.3"
+VERSION = "1.5.0"
 
 # ═══════════════════════════════════════════════════════════════
 #  ICONS — single source of truth for all UI symbols
@@ -207,6 +207,99 @@ def save_mid_snapshot(pair: str, ticker: dict) -> None:
     except Exception as e:
         print(f"  {ICONS['WARN']} snapshot save failed: {e}")
 
+
+# Reference join window (v2.3 spec §142). A snapshot further than this from the
+# fill is not evidence of the market AT the fill, so we say so rather than
+# pretend.
+#
+# SYMMETRIC, which the spec left open -- it says "nearest within 180s" with no
+# direction. So the reference may be a snapshot taken up to 180s AFTER the fill,
+# and the metric absorbs a little post-trade drift. Backward-only was measured
+# on the 33 historical rows and is worse: 6 of them would have no snapshot at
+# all and fall back to the ~10-minute-old ticker mid -- a small bias traded for
+# a large one. Current split: 26 references before the fill, 7 after, mean
+# distance 17.4s.
+REF_MID_WINDOW_SECONDS = 180
+
+
+def resolve_reference_mid(pair: str, fill_ts: datetime, ticker_mid: float | None):
+    """The mid that impact_bps / all_in_bps get measured against.
+
+    Returns (ref_mid, mid_source, ref_mid_ts_iso).
+
+    impact_bps is meant to answer "how much worse than the market did we buy",
+    which only holds if the reference was observed AT the fill. Before v1.5.0
+    this used the T0 ticker mid — sampled when the run started, typically ten
+    minutes earlier — so it largely reported market drift instead. The snapshots
+    to do this properly have been collected since 2026-02-21; only the join was
+    missing.
+
+    Falls back to the run's ticker mid exactly as before when no snapshot is
+    close enough, and returns (None, None, None) when there is no mid at all.
+    A failed lookup degrades to the fallback — this is telemetry and must never
+    be able to block a fill."""
+    lo = fill_ts - timedelta(seconds=REF_MID_WINDOW_SECONDS)
+    hi = fill_ts + timedelta(seconds=REF_MID_WINDOW_SECONDS)
+    try:
+        # One filter per key: PostgREST ANDs repeated keys, but urlencode would
+        # need a list to emit them and the semantics are easy to get wrong. A
+        # lower bound plus ascending order is unambiguous, and the window is
+        # narrower than the limit can truncate — snapshots are written once per
+        # cron cycle, so 360s holds a handful of rows, never 50.
+        rows = sb_get("dca_mid_snapshots", {
+            "pair": f"eq.{pair}",
+            "ts": f"gte.{lo.isoformat()}",
+            "order": "ts.asc",
+            "limit": "50",
+            "select": "ts,mid",
+        }) or []
+    except Exception as e:
+        print(f"  {ICONS['WARN']} snapshot lookup failed: {e} — using ticker mid")
+        rows = []
+
+    best = None
+    for r in rows:
+        if r.get("mid") is None or not r.get("ts"):
+            continue
+        try:
+            ts = datetime.fromisoformat(r["ts"].replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        if ts > hi:
+            break
+        delta = abs((ts - fill_ts).total_seconds())
+        if best is None or delta < best[0]:
+            best = (delta, float(r["mid"]), ts)
+
+    if best is not None:
+        print(f"  ref mid: ${best[1]:.6f} from snapshot {best[0]:.1f}s from fill")
+        return best[1], "snapshot", best[2].isoformat()
+    if ticker_mid is not None and ticker_mid > 0:
+        print(f"  ref mid: ${float(ticker_mid):.6f} from run ticker (no snapshot within {REF_MID_WINDOW_SECONDS}s)")
+        return float(ticker_mid), "ticker_fallback", None
+    return None, None, None
+
+
+def fill_timestamp(order_data: dict, observed_at: datetime) -> datetime:
+    """When the order ACTUALLY closed, per Kraken's own `closetm`.
+
+    `execution_finished_at` is when a later cron cycle noticed the fill, which
+    since the maker-first cutover can be minutes afterwards. Measured over the
+    33 rows carrying bps: lag averages 17.7s but reaches 151.4s -- 84% of
+    REF_MID_WINDOW_SECONDS, the half-width of THIS join's window and no other --
+    spent on our own polling, which would drag the window most of the way off
+    the event it describes."""
+    try:
+        closetm = order_data.get("closetm")
+        if closetm:
+            return datetime.fromtimestamp(float(closetm), tz=timezone.utc)
+    except (TypeError, ValueError, OSError, OverflowError):
+        pass
+    return observed_at
+
+
 def get_7d_ref_price(pair: str, user_id: str) -> float | None:
     """Get average mid price from all executions (filled + skipped) in last 7 days."""
     try:
@@ -281,10 +374,11 @@ def cap_params(settings: dict):
 def cap_telemetry(ref_price, cap_pct, h90) -> dict:
     """The two numbers that make a cap decision reconstructible from the row.
 
-    `h7` and `mid` were already stored; these add the 90-day floor the guard
-    reads and the threshold actually applied, so afterwards the decision is
-    checkable by arithmetic instead of by parsing the reason text:
+    `h7` and `mid` are stored earlier in the SAME run; these add the 90-day
+    floor the guard reads and the threshold actually applied, so afterwards the
+    decision is checkable by arithmetic instead of by parsing the reason text:
         skip <=> mid > cap_price AND (guard off OR mid > h90)
+    and, in ohlc_h7 mode, cap_price / h7 - 1 == cap_pct.
     Both NULL means no reference was available and NO cap check ran."""
     return {
         "h90": h90,
@@ -369,6 +463,14 @@ def msg_recon(title: str, body: str) -> str:
 
 def msg_dryrun(title: str, body: str) -> str:
     return f"{ICONS['DRYRUN']} <b>{title}</b>\n{body}"
+
+
+def pair_label(pair: str) -> str:
+    """KASUSD -> KAS/USD. DISPLAY ONLY — never hand this back to Kraken."""
+    for quote in ("USDT", "USDC", "USD", "EUR"):
+        if pair.endswith(quote) and len(pair) > len(quote):
+            return f"{pair[:-len(quote)]}/{quote}"
+    return pair
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -621,11 +723,13 @@ def warn_if_low_balance(usd_balance: float, daily_burn: float, settings: dict) -
         return
     print(f"  {ICONS['WARN']} Low balance: ${usd_balance:.2f} = ~{days_left:.1f} days of buys")
     tg_send(msg_warn(
-        "DCA LIKUTIS SENKA",
-        f"Kraken USD: ${usd_balance:.2f}\n"
-        f"Dienos biudzetas: ${daily_burn:.2f}\n"
-        f"Liko ~{days_left:.1f} d. pirkimu (riba {threshold:.0f} d.)\n"
-        f"Papildyk laiku — praleista diena neatperkama."
+        "Dėmesio: senka DCA lėšų likutis",
+        f"\n"
+        f"• Kraken USD: ${usd_balance:.2f}\n"
+        f"• Dienos biudžetas: ${daily_burn:.2f}\n"
+        f"• Likutis pirkimams: ~{days_left:.1f} d. (riba – {threshold:.0f} d.)\n"
+        f"\n"
+        f"Prašome papildyti sąskaitą. Praleisti DCA pirkimai atgaline data nevykdomi."
     ))
 
 
@@ -676,9 +780,21 @@ def finalize_order(cl_ord_id: str, order_id: str, mid: float | None = None, ohlc
     # it, never re-send its Telegram message. Overlapping runs and repeated
     # reconciliation both funnel through here, so this is the single choke
     # point for finalize idempotency.
+    # The OHLC columns ride along on the same read: if T0 already stored them,
+    # this run must NOT refetch, because a second reading of H7 taken minutes
+    # later no longer reproduces the cap_price derived from the first.
+    stored_ohlc: dict = {}
     try:
-        cur = sb_get("dca_executions", {"cl_ord_id": f"eq.{cl_ord_id}", "select": "status"})
-        cur_status = cur[0].get("status") if cur else None
+        cur = sb_get("dca_executions",
+                     {"cl_ord_id": f"eq.{cl_ord_id}", "select": "status,h7,h30,h90"})
+        row0 = cur[0] if cur else {}
+        cur_status = row0.get("status")
+        if row0.get("h7") is not None:
+            stored_ohlc = {
+                name: float(row0[col])
+                for name, col in (("H7", "h7"), ("H30", "h30"), ("H90", "h90"))
+                if row0.get(col) is not None
+            }
         if cur_status is not None and cur_status not in ("claimed", "placed", "limit_open"):
             print(f"  finalize skip: {cl_ord_id} already terminal ({cur_status})")
             return
@@ -709,18 +825,7 @@ def finalize_order(cl_ord_id: str, order_id: str, mid: float | None = None, ohlc
     finished_at_utc = datetime.now(timezone.utc)
     finished_at_iso = finished_at_utc.isoformat()
 
-    # ── bps metrics (Phase 1.5) ──────────────────────────────
-    impact_bps = None
-    all_in_bps = None
-    mid_source = None
-    if mid is not None and mid > 0 and vol_exec > 0 and avg_px > 0:
-        mid_source = "ticker_fallback"
-        impact_bps = round(((avg_px / mid) - 1) * 10_000, 4)
-        all_in_price = (cost + fee) / vol_exec
-        all_in_bps = round(((all_in_price / mid) - 1) * 10_000, 4)
-        print(f"  impact_bps: {impact_bps:.4f} | all_in_bps: {all_in_bps:.4f} | mid_source: {mid_source}")
-
-    # ── pair + market context ────────────────────────────────
+    # ── pair ─────────────────────────────────────────────────
     # cl_ord_id carries OUR config's pair string; Kraken's descr.pair can use
     # its own aliases (XXBTZUSD vs XBTUSD), so it is only the fallback here.
     pair = _pair_from_cl_ord_id(cl_ord_id)
@@ -729,14 +834,48 @@ def finalize_order(cl_ord_id: str, order_id: str, mid: float | None = None, ohlc
             pair = (order_data.get("descr") or {}).get("pair") or "?"
         except Exception:
             pair = "?"
-    # Only the T0 path hands in a context; every other call site (maker
-    # inspection, fallback, reconciliation) runs in a LATER cron cycle, i.e. a
-    # fresh process, and used to write h7/h30 as NULL. Since the maker-first
-    # cutover that is nearly every fill, so fetch it here when missing.
-    # get_ohlc_ctx caches per run and returns {} if Kraken OHLC is unavailable,
-    # which writes NULL exactly as before — telemetry never blocks a fill.
-    if ohlc_ctx is None and pair != "?":
-        ohlc_ctx = get_ohlc_ctx(pair)
+
+    # ── bps metrics (Phase 1.5, reference join v1.5.0) ───────
+    # Measured against the market AT the fill, not at T0. `mid` (the run's
+    # ticker mid) is now only the fallback; see resolve_reference_mid.
+    impact_bps = None
+    all_in_bps = None
+    ref_mid = None
+    mid_source = None
+    ref_mid_ts = None
+    if vol_exec > 0 and avg_px > 0 and pair != "?":
+        ref_mid, mid_source, ref_mid_ts = resolve_reference_mid(
+            pair, fill_timestamp(order_data, finished_at_utc), mid)
+    elif mid is not None and mid > 0 and vol_exec > 0 and avg_px > 0:
+        # No pair to look a snapshot up by — keep the pre-v1.5.0 behaviour
+        # rather than dropping the metric entirely.
+        ref_mid, mid_source = float(mid), "ticker_fallback"
+    if ref_mid and ref_mid > 0 and vol_exec > 0 and avg_px > 0:
+        impact_bps = round(((avg_px / ref_mid) - 1) * 10_000, 4)
+        all_in_price = (cost + fee) / vol_exec
+        all_in_bps = round(((all_in_price / ref_mid) - 1) * 10_000, 4)
+        print(f"  impact_bps: {impact_bps:.4f} | all_in_bps: {all_in_bps:.4f} | mid_source: {mid_source}")
+
+    # ── market context: written ONCE, at T0 ──────────────────
+    # T0 stores H7/H30 alongside the cap_price it derives from them, so a fill
+    # observed by a later cron cycle must reuse the row rather than refetch.
+    # Refetching was the v1.4.2 behaviour and it silently desynced the row:
+    # on 2026-07-28 the T0 anchor was 0.02818714 and the 07:03 refetch wrote
+    # 0.02818143, so cap_price / h7 - 1 read 20.02% for a 20% cap.
+    ohlc_cols: dict = {}
+    if stored_ohlc:
+        ohlc_ctx = stored_ohlc
+    else:
+        # No T0 context on the row — a pre-v1.4.4 row, or a path that never ran
+        # the cap check. get_ohlc_ctx caches per run and returns {} if Kraken
+        # OHLC is unavailable, writing NULL: telemetry never blocks a fill.
+        if ohlc_ctx is None and pair != "?":
+            ohlc_ctx = get_ohlc_ctx(pair)
+        ohlc_cols = {
+            "h7": ohlc_ctx.get("H7") if ohlc_ctx else None,
+            "h30": ohlc_ctx.get("H30") if ohlc_ctx else None,
+            "ohlc_ts": datetime.now(timezone.utc).isoformat() if ohlc_ctx else None,
+        }
 
     sb_update(
         "dca_executions",
@@ -752,29 +891,36 @@ def finalize_order(cl_ord_id: str, order_id: str, mid: float | None = None, ohlc
             "impact_bps": impact_bps,
             "all_in_bps": all_in_bps,
             "mid_source": mid_source,
-            "h7": ohlc_ctx.get("H7") if ohlc_ctx else None,
-            "h30": ohlc_ctx.get("H30") if ohlc_ctx else None,
-            "ohlc_ts": datetime.now(timezone.utc).isoformat() if ohlc_ctx else None,
+            "ref_mid": ref_mid,
+            "ref_mid_ts": ref_mid_ts,
+            **ohlc_cols,
         },
     )
 
     if TG_NOTIFY_ON_FILL:
         filled_ts = finished_at_utc.astimezone(CHICAGO_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
 
-        impact_line = ""
+        # Market context is its own block, separated from the settlement
+        # figures by a blank line: the numbers above are what was paid, the
+        # numbers below are what the market looked like. Every line is dropped
+        # when its data is missing — no placeholders, no "unknown".
+        market_lines = []
+
+        bps_parts = []
         if impact_bps is not None:
             sign = "+" if float(impact_bps) >= 0 else ""
-            impact_line = f"\nImpact: {sign}{float(impact_bps):.1f} bps"
-        all_in_line = ""
+            bps_parts.append(f"Impact: {sign}{float(impact_bps):.1f} bps")
         if all_in_bps is not None:
             sign = "+" if float(all_in_bps) >= 0 else ""
-            all_in_line = f" | All-in: {sign}{float(all_in_bps):.1f} bps"
+            bps_parts.append(f"All-in: {sign}{float(all_in_bps):.1f} bps")
+        if bps_parts:
+            market_lines.append(" | ".join(bps_parts))
+
         # H7 is the cap anchor and H90 the guard, so both belong here now that
         # the veto reads them. H30 carries no decision weight -- it is kept
         # because the ORDER of the three (H7 < H30 < H90 = drifting down) reads
         # the trend at a glance, which no single number does. Same precision as
         # the Price line above so they compare directly.
-        ohlc_line = ""
         if ohlc_ctx:
             parts = [
                 f"{name}: ${float(ohlc_ctx[name]):.5f}"
@@ -782,18 +928,28 @@ def finalize_order(cl_ord_id: str, order_id: str, mid: float | None = None, ohlc
                 if ohlc_ctx.get(name) is not None
             ]
             if parts:
-                ohlc_line = "\n" + " | ".join(parts)
+                market_lines.append(" | ".join(parts))
+
+        # The reference the two bps figures above were measured against. It is
+        # normally the market AT the fill, so it needs no qualifier; when no
+        # snapshot was within 180s we fell back to the price seen when the run
+        # STARTED, and that is worth saying, because it makes the bps a weaker
+        # claim. Qualified in plain words, not with the enum. No mid, no line.
+        if ref_mid is not None and float(ref_mid) > 0:
+            qualifier = " (run ticker)" if mid_source == "ticker_fallback" else ""
+            market_lines.append(f"Mid: ${float(ref_mid):.5f}{qualifier}")
+
+        market_block = "\n\n" + "\n".join(market_lines) if market_lines else ""
         symbol = pair.replace("USD", "")
         tg_send(msg_ok(
-            f"DCA {pair} {label}",
+            f"DCA {pair_label(pair)} {label}",
             f"{filled_ts}\n\n"
             f"Amount: {vol_exec} {symbol}\n"
             f"Price:  ${avg_px:.5f}\n"
             f"Cost:   ${cost:.4f}\n"
             f"Fee:    ${fee:.4f}\n"
             f"Total:  ${all_in:.4f}"
-            f"{impact_line}{all_in_line}{ohlc_line}\n"
-            f"Mid:    {mid_source or 'unknown'}"
+            f"{market_block}"
         ))
 
 
@@ -1690,6 +1846,19 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
         except Exception as e:
             print(f"  WARN OHLC fetch failed: {e} -- continuing without market context")
             ohlc_ctx = {}
+
+    # Store the context in the SAME run that derives cap_price from it. Written
+    # here and not at fill time because the fill is normally observed by a later
+    # cron cycle: a second fetch returns a slightly different H7, and the row's
+    # arithmetic (cap_price / h7 - 1 == cap_pct) stops holding. Unconditional on
+    # the cap branch below, so `force` runs and reference-less days still carry
+    # market context. finalize_order will not overwrite what lands here.
+    if ohlc_ctx:
+        update_execution({
+            "h7": ohlc_ctx.get("H7"),
+            "h30": ohlc_ctx.get("H30"),
+            "ohlc_ts": datetime.now(timezone.utc).isoformat(),
+        })
 
     # ── Cap Check (veto layer, Smart DCA) ──────────────────────
     if ticker["mid"] and not force:

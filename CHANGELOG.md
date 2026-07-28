@@ -4,6 +4,50 @@ Conventions: dates are **Chicago** time (the bot's trading timezone); a "vakaras
 
 History before 2026-07-18 (Phase 1 -- Kraken + Strike execution, notifications, reconciliation, impact/all-in bps telemetry) is in `git log`; this changelog starts at Phase 2.
 
+## 2026-07-28 (antradienis -- Chicago, session 21)
+
+### VALIDATION -- cap telemetry confirmed on its first live day
+- 2026-07-28 is the FIRST row carrying `h7` / `h30` / `h90` / `cap_price` together. The 07-27 row is NULL on all four and that is correct, not a regression: v1.4.2 and v1.4.3 were committed at 07:23 and 07:35 CT, and that day's execution had already finished at 06:58 CT. Yesterday's fill ran on the previous code
+- The day bought on the maker leg, below both the cap and H90 -- `over_cap` false, `over_h90` false, reconstructed by arithmetic from the row alone, exactly as v1.4.3 intended
+
+### fix(telemetry): the OHLC context is written once, at T0 -- v1.4.4
+- **Why**: the first live row failed its own invariant. `cap_price / h7 - 1` read **20.0243%** for a 20% cap. Root cause: `cap_price` and `h90` are written at T0, but `h7` / `h30` were written at FILL time -- and since the maker-first cutover the fill is observed by a later cron cycle, a fresh process, which refetched OHLC. On 07-28 the two fetches sat 10 minutes apart (`execution_started_at` 06:53:19, `ohlc_ts` 07:03:21) and H7 had moved. The stored anchor was not the anchor the cap was computed from
+- The decision itself was never affected: `mid`, `cap_price` and `h90` all come from the same T0 fetch, so `skip <=> mid > cap_price AND (guard off OR mid > h90)` held throughout. Only the reconstruction path was wrong, and only through `h7`
+- T0 now writes `h7` / `h30` / `ohlc_ts` in the same run that derives `cap_price` from them, placed OUTSIDE the cap branch so `force` runs and reference-less days still carry market context
+- `finalize_order()` reads `h7` on the terminal-guard query it already made -- no extra round trip -- and when it is present, reuses the stored context instead of refetching. That also drops one public OHLC call per fill. Rows written before this version still refetch, so nothing regresses for them
+- The fill notification now reports the numbers stored on the row, so the message and the row can no longer disagree
+- **Telemetry only, cannot alter a decision** -- hence patch
+- Validation: 23 hermetic branches driving the REAL `finalize_order` (T0 context reused, payload carries no `h7`/`h30`/`ohlc_ts`, `cap_price / h7 - 1 == cap_pct` to 1e-12, legacy NULL row still refetches and writes, Kraken OHLC outage writes NULL and still fills, Mid present/absent, message shape, terminal row untouched) -- all pass; `test.sh` green
+
+### feat(ux): notifications read as a financial system, not as a log line
+- **Why**: Roberto's review. Two messages carried text that only made sense to whoever wrote the code
+- **Fill**: pair renders as `KAS/USD`, not `KASUSD` (`pair_label()`, display only -- never fed back to Kraken). Market context becomes its own block, separated from the settlement figures by a blank line: what was paid above, what the market looked like below. Every line drops out when its data is missing -- no `N/A`, no `unknown`, no placeholders
+- **`Mid:` now shows the price, not a source label.** It used to print `mid_source`, which has exactly ONE non-NULL value in the entire codebase (`kraken_run.py:717`, hardcoded `"ticker_fallback"`) -- confirmed against the DB: 33 rows `ticker_fallback`, 95 NULL, nothing else. A constant carries no information and read like a leaked variable name. No mid, no line
+- **Low balance** rewritten in full Lithuanian with diacritics, bulleted, with the ask and the consequence in a closing sentence. Kept at one decimal (`~4.9 d.`) rather than rounding: the threshold is 5 days, and a message reading `~5 d. (riba – 5 d.)` would look like it contradicts itself
+- Emoji unchanged -- one status icon per message, from `ICONS`, no additions
+- `strike_run.py` deliberately untouched: it has not executed since 2026-04-25 and its `mid_source` does have a real label. Left for whenever Strike comes back
+
+### feat(telemetry): the reference join, four months late -- v1.5.0
+- **Why**: `dca-bot-v2.3.md:142` specified it -- nearest `dca_mid_snapshots` row within 180s of the fill, marked `mid_source = 'snapshot'`, else the run's ticker mid as `'ticker_fallback'`. The snapshot side shipped and has been collecting since 2026-02-21 (49,213 rows, 20 pairs). **The join never did.** `finalize_order` hardcoded `'ticker_fallback'` and measured bps against the mid already on the row -- the T0 ticker mid, sampled ~10 minutes BEFORE the fill. Found while checking whether the constant could be dropped from the notification
+- The damage is to meaning, not to trading. `impact_bps` is supposed to say "how much worse than the market did we buy"; against a ten-minute-old reference it mostly reported how far the market drifted in those ten minutes
+- `resolve_reference_mid()` does the join and returns `(ref_mid, mid_source, ref_mid_ts)`. A lookup failure or an empty window degrades to the old ticker mid -- this is telemetry and must never be able to block a fill
+- **Anchored on Kraken's `closetm`**, the instant the order actually closed, NOT `execution_finished_at`, the instant a later cron cycle noticed. Measured over the 33 rows: polling lag averages 17.7s but reaches **151.4s**. The window meant here is the **snapshot join window of this change, +/-180s around the anchor** -- no other window (the cron cycle, the order's time window, the cap reference) is involved -- so 151.4s is 84% of its 180s half-width, spent on our own polling, which would drag the window most of the way off the event it describes. In practice it changes which snapshot is picked on only **1 of 33** rows -- but that row's impact moves by 14.1 bps, so the cheap correctness is worth taking. Falls back to `execution_finished_at` when `closetm` is absent
+- **The window is symmetric on purpose, and the spec did not say so.** §142 says "nearest within 180s" without a direction; taking it symmetrically means the reference can be a snapshot up to 180s AFTER the fill, so the metric absorbs a little post-trade drift. The alternative -- backward-only -- was measured and is worse: **6 of 33** rows would lose their reference entirely and fall back to the ~10-minute-old ticker mid, trading a small bias for a large one. As it stands 26 of 33 references precede the fill and 7 follow it, mean distance 17.4s
+- New columns `ref_mid` / `ref_mid_ts` (migration `db/v7-reference-mid.sql`). **`mid` is deliberately NOT reused**: it is the T0 ticker mid and it is the cap decision's evidence -- `over_cap` replays as `mid > cap_price`. Overwriting it would silently invalidate every cap replay. **DEPLOY ORDER MATTERS**: these columns are WRITTEN, so migrate before the code ships
+- `mid_source` finally carries information, so the notification uses it again -- but as plain words, not the enum: an unqualified `Mid:` line means the market at the fill, `Mid: $x (run ticker)` means no snapshot was close enough and the bps are a weaker claim
+- **Not a patch**: this changes what two shipped metrics mean. Minor, though not major -- no buying decision is touched, and the cap path never read these columns
+- Validation: 24 hermetic branches driving the REAL `finalize_order` and `resolve_reference_mid` (snapshot beats T0 mid, nearest wins, 180s boundary on both sides, wrong pair excluded, query bounded, no-snapshot fallback labelled, no reference at all leaves bps NULL and still fills, lookup exception degrades, missing `closetm`, `mid` column untouched, both message shapes) -- all pass, plus the 23 v1.4.4 branches as regression; `test.sh` green
+
+### BACKFILL prepared, not applied -- `db/v7-backfill-reference-mid.sql`
+- Unlike v6, history here IS honestly recoverable: the snapshots are real observations already stored, not a reconstruction. Verified before writing -- all 33 rows carrying `impact_bps` have both a `closetm` and a snapshot inside the window, so none can be left half-converted
+- Mean |delta| 2.0 bps, max 19.6 bps, **6 of 33 rows change sign**. The moves are systematic: the July maker-first rows read as slightly negative impact and become positive. The stale reference was flattering the maker leg, which matters because Phase 2 acceptance is partly judged on it
+- Idempotent (`where ref_mid is null`), wrapped in a transaction with a post-condition that aborts on any row left behind, and reversible -- the old value is recomputable as `(avg_price / mid - 1) * 10000` since `mid` is untouched
+- **Not applied.** It rewrites reported metrics; that is Roberto's call
+
+### OPEN -- the reference is near the fill, but not at it
+- Snapshots are written once per cron cycle (~5 min), so "nearest within 180s" can still be up to 180s away. In the backfill the rows whose snapshot lands within seconds barely move (2026-03-05, -03-06: 1s away, ~0 delta) while the ones 97-148s away move the most -- so some of the remaining number is still reference staleness, not execution quality
+- Closing that gap means taking a snapshot AT fill time, which is a decision about Kraken API budget, not a bug fix. Filed
+
 ## 2026-07-27 (pirmadienis -- Chicago, session 19)
 
 ### feat(telemetry): cap decisions reconstructible from the row -- v1.4.3
