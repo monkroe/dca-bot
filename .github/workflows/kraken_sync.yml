@@ -1,0 +1,69 @@
+name: Kraken Account Sync
+
+# Mirrors Kraken's private account state (Balance, TradesHistory, Ledgers) into
+# Supabase. READ ONLY -- this workflow never places, amends or cancels an order.
+#
+# Deliberately SEPARATE from the DCA workflow, and in its own concurrency group,
+# so a slow or failing sync can never delay or block a buy window.
+#
+# CREDENTIALS: this job gets its OWN read-only Kraken key. The trading key is
+# not passed here at all, which is the point -- credentials that leak from a
+# sync job cannot then place an order. It also removes a real failure mode:
+# Kraken requires a strictly increasing nonce PER KEY, and the DCA workflow runs
+# every five minutes, so a shared key would make "Invalid nonce" a matter of
+# timing rather than a matter of if.
+#
+# The read-only secrets are mapped onto the names the shared Kraken client
+# already reads, so there is no second signing implementation to keep in step.
+#
+# Create the key as: Kraken -> Settings -> API -> Add key
+#   tick ONLY  : Query (Funds), Query closed orders & trades, Query ledger entries
+#   leave OFF  : Create & modify orders, Cancel & close orders, Withdraw, Deposit, Earn
+#   toggles    : leave WebSocket, Key expiration and Query start date OFF.
+#                IP address restriction MUST stay off -- GitHub runners get a
+#                different IP every run, so restricting it breaks the sync.
+#                Query start date AND Query end date must stay off, or Kraken
+#                silently truncates the history it returns -- and a truncated
+#                window comes back empty, which reads as "no sells": the most
+#                convincing wrong answer available.
+#                Custom nonce window is not needed; a key of its own removes
+#                the nonce collision rather than widening the tolerance for it.
+# then add KRAKEN_RO_API_KEY / KRAKEN_RO_API_SECRET to the repo's Actions
+# secrets. The script fails with those exact instructions if they are absent.
+#
+# Manual only for now. Put it on a schedule once the first run has confirmed the
+# key carries those two read permissions -- until then a cron would just
+# produce a daily reminder that it does not, which trains you to ignore red.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: kraken-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Sync Kraken account state
+        working-directory: src
+        env:
+          # Read-only key, under the names the shared client expects.
+          # The TRADING key is intentionally absent from this job.
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_RO_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_RO_API_SECRET }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: python kraken_sync.py
