@@ -32,8 +32,8 @@ so the workflow simply maps the read-only secret onto those names -- no second
 signing implementation, and nothing to keep in sync between two copies.
 
 PERMISSIONS. Balance already works (the buy preflight has used it since Phase 1).
-TradesHistory and Ledgers additionally need the key's "Query Ledger & Trade
-History" permission, which cannot be checked from here. Each source is therefore
+TradesHistory and Ledgers additionally need the key's "Query Closed Orders & Trades"
+and "Query Ledger Entries" permissions, which cannot be checked from here. Each source is therefore
 attempted independently and a permission error is recorded against that source
 alone, so one blocked endpoint still leaves the others synced and the first run
 tells us exactly which is missing.
@@ -72,8 +72,8 @@ def check_credentials() -> bool:
     print(f"{kr.ICONS['FAIL']} No Kraken credentials in this job's environment.")
     print("   This sync expects its OWN read-only key, not the trading one:")
     print("   1. Kraken -> Settings -> API -> Add key")
-    print("      tick ONLY: Query Funds, Query Ledger & Trade History")
-    print("      leave OFF: everything under Orders & Trades, and Withdraw")
+    print("      tick ONLY: Query Funds, Query Closed Orders & Trades, Query Ledger Entries")
+    print("      leave OFF: Modify Orders, Cancel/Close Orders, Withdraw Funds, Deposit Funds")
     print("   2. GitHub -> repo Settings -> Secrets -> Actions, add")
     print("      KRAKEN_RO_API_KEY and KRAKEN_RO_API_SECRET")
     print("   The trading key is intentionally not passed to this workflow.")
@@ -256,7 +256,7 @@ def sync_trades() -> int:
         status = "permission_denied" if is_permission_error(e) else "error"
         print(f"  {kr.ICONS['FAIL']} {e}")
         if status == "permission_denied":
-            print("    → the API key lacks 'Query Ledger & Trade History'")
+            print("    → the API key lacks 'Query Closed Orders & Trades' + 'Query Ledger Entries'")
         write_state("trades", status=status, detail=str(e), rows_seen=seen)
         return seen
 
@@ -300,7 +300,7 @@ def sync_ledgers() -> int:
         status = "permission_denied" if is_permission_error(e) else "error"
         print(f"  {kr.ICONS['FAIL']} {e}")
         if status == "permission_denied":
-            print("    → the API key lacks 'Query Ledger & Trade History'")
+            print("    → the API key lacks 'Query Closed Orders & Trades' + 'Query Ledger Entries'")
         write_state("ledgers", status=status, detail=str(e), rows_seen=seen)
         return seen
 
@@ -349,7 +349,7 @@ def main() -> int:
     if blocked:
         print(f"\n{kr.ICONS['WARN']} blocked by key permissions: {', '.join(blocked)}")
         print("   Kraken → Settings → API → edit the key → tick"
-              " 'Query Ledger & Trade History'. Nothing else needs to change.")
+              " 'Query Closed Orders & Trades' + 'Query Ledger Entries'. Nothing else needs to change.")
 
     # Exit non-zero only if NO source succeeded -- a partial sync is still
     # progress, and a red workflow for one known-missing permission is noise
