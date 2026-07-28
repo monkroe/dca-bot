@@ -17,6 +17,20 @@ module-level statement being the __main__ guard — but it deliberately does NOT
 share its trading path, and it runs from its own workflow so that a sync failure
 can never interfere with a buy.
 
+CREDENTIALS. This runs on its OWN Kraken key, with query permissions only and no
+trade or withdraw rights. The trading key is deliberately absent from the sync
+job's environment, so credentials that leak from here cannot place an order.
+Two further reasons beyond the obvious one:
+  * permissions here only ever need to GROW (Ledgers, Trade History), and
+    growing them on the trading key would widen what the trading key can do;
+  * Kraken requires a strictly increasing nonce PER KEY. The trading bot runs
+    every five minutes and this sync would overlap it sooner or later; sharing a
+    key makes "Invalid nonce" a question of timing. Separate keys remove that
+    failure mode entirely rather than making it rare.
+The shared client reads its credentials from module-level names in kraken_run,
+so the workflow simply maps the read-only secret onto those names -- no second
+signing implementation, and nothing to keep in sync between two copies.
+
 PERMISSIONS. Balance already works (the buy preflight has used it since Phase 1).
 TradesHistory and Ledgers additionally need the key's "Query Ledger & Trade
 History" permission, which cannot be checked from here. Each source is therefore
@@ -49,6 +63,22 @@ PAGE_PAUSE_SECONDS = 2.0
 WATERMARK_REWIND_MINUTES = 30
 # Guard against an unbounded loop if `count` and the returned pages disagree.
 MAX_PAGES = 200
+
+def check_credentials() -> bool:
+    """Fail loudly and specifically rather than letting an empty key produce a
+    signature error that reads like a Kraken outage."""
+    if kr.KRAKEN_API_KEY and kr.KRAKEN_API_SECRET:
+        return True
+    print(f"{kr.ICONS['FAIL']} No Kraken credentials in this job's environment.")
+    print("   This sync expects its OWN read-only key, not the trading one:")
+    print("   1. Kraken -> Settings -> API -> Add key")
+    print("      tick ONLY: Query Funds, Query Ledger & Trade History")
+    print("      leave OFF: everything under Orders & Trades, and Withdraw")
+    print("   2. GitHub -> repo Settings -> Secrets -> Actions, add")
+    print("      KRAKEN_RO_API_KEY and KRAKEN_RO_API_SECRET")
+    print("   The trading key is intentionally not passed to this workflow.")
+    return False
+
 
 def load_user_id() -> str | None:
     """Same source the trading path uses -- dca_settings.id=1 -- rather than a
@@ -287,8 +317,11 @@ def main() -> int:
     print(f"{kr.ICONS['BOT']} Kraken sync v{VERSION} (read-only)")
     print(f"{kr.ICONS['CLOCK']} "
           f"{datetime.now(timezone.utc).astimezone(kr.CHICAGO_TZ):%Y-%m-%d %H:%M:%S %Z}")
+    if not check_credentials():
+        return 1
     USER_ID = load_user_id()
     print(f"   user_id: {USER_ID[:8] + '...' if USER_ID else '(none)'}")
+    print(f"   key:     ...{kr.KRAKEN_API_KEY[-4:]} (expected: query-only)")
 
     # Independent on purpose: one blocked endpoint must not hide the others.
     outcomes = {}
