@@ -72,8 +72,8 @@ def check_credentials() -> bool:
     print(f"{kr.ICONS['FAIL']} No Kraken credentials in this job's environment.")
     print("   This sync expects its OWN read-only key, not the trading one:")
     print("   1. Kraken -> Settings -> API -> Add key")
-    print("      tick ONLY: Query Funds, Query Closed Orders & Trades, Query Ledger Entries")
-    print("      leave OFF: Modify Orders, Cancel/Close Orders, Withdraw Funds, Deposit Funds")
+    print("      tick ONLY: Query (Funds), Query closed orders & trades, Query ledger entries")
+    print("      leave OFF: Create & modify orders, Cancel & close orders, Withdraw, Deposit, Earn")
     print("   2. GitHub -> repo Settings -> Secrets -> Actions, add")
     print("      KRAKEN_RO_API_KEY and KRAKEN_RO_API_SECRET")
     print("   The trading key is intentionally not passed to this workflow.")
@@ -256,7 +256,7 @@ def sync_trades() -> int:
         status = "permission_denied" if is_permission_error(e) else "error"
         print(f"  {kr.ICONS['FAIL']} {e}")
         if status == "permission_denied":
-            print("    → the API key lacks 'Query Closed Orders & Trades' + 'Query Ledger Entries'")
+            print("    → the API key lacks 'Query closed orders & trades' + 'Query ledger entries'")
         write_state("trades", status=status, detail=str(e), rows_seen=seen)
         return seen
 
@@ -300,7 +300,7 @@ def sync_ledgers() -> int:
         status = "permission_denied" if is_permission_error(e) else "error"
         print(f"  {kr.ICONS['FAIL']} {e}")
         if status == "permission_denied":
-            print("    → the API key lacks 'Query Closed Orders & Trades' + 'Query Ledger Entries'")
+            print("    → the API key lacks 'Query closed orders & trades' + 'Query ledger entries'")
         write_state("ledgers", status=status, detail=str(e), rows_seen=seen)
         return seen
 
@@ -349,7 +349,7 @@ def main() -> int:
     if blocked:
         print(f"\n{kr.ICONS['WARN']} blocked by key permissions: {', '.join(blocked)}")
         print("   Kraken → Settings → API → edit the key → tick"
-              " 'Query Closed Orders & Trades' + 'Query Ledger Entries'. Nothing else needs to change.")
+              " 'Query closed orders & trades' + 'Query ledger entries'. Nothing else needs to change.")
 
     # Exit non-zero only if NO source succeeded -- a partial sync is still
     # progress, and a red workflow for one known-missing permission is noise

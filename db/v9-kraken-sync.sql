@@ -32,7 +32,7 @@
 -- PERMISSIONS, and the one thing that may block this: the API key already
 -- works for Balance (used by the buy preflight since Phase 1) and for order
 -- queries. TradesHistory and Ledgers additionally require the key's
--- "Query Closed Orders & Trades" and "Query Ledger Entries" permissions. Whether
+-- "Query closed orders & trades" and "Query ledger entries" permissions. Whether
 -- those boxes are ticked cannot be determined from here -- the sync reports a
 -- permission error per source and carries on rather than failing the run, so
 -- the first run tells us.
