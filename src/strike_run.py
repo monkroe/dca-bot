@@ -406,7 +406,7 @@ def execute_pair(order, settings, today_chicago, user_id, force=False):
                 print(f"  {ICONS['SKIP']} {reason}")
                 upd({"status": "skipped_above_cap", "reason": reason, "skip_reason": "7d_cap",
                      "execution_finished_at": datetime.now(timezone.utc).isoformat()})
-                tg_send(f"{ICONS['SKIP']} STRIKE {pair.replace('USD','')} +{pct_over:.2f}% virš cap — skip")
+                tg_send(f"{ICONS['SKIP']} STRIKE {pair.replace('USD','')} +{pct_over:.2f}% virš cap – skip")
                 return {"pair": pair, "status": "skipped_above_cap"}
             print(f"  {ICONS['OK']} Below cap — proceeding")
         else:
