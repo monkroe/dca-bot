@@ -5,16 +5,23 @@ Ledgers.
 WHY THIS EXISTS. Everything the system knows about the Kraken account is
 inferred from what the bot itself did, so anything done by hand in the Kraken
 app is invisible. `bf_holdings` only ever accumulates bot buys; a sell or a
-withdrawal never reduces it. On 2026-07-28 that gap was measured: roughly
-14,865 KAS left the account around 2026-03-31 and appears nowhere in this
-database except a note in a manual export. Kraken is the only source of truth
-for the account, and this is its mirror.
+withdrawal never reduces it. On 2026-07-28 that gap was measured once this
+mirror existed: roughly 59,850 KAS was sold across eight trades between 05-26
+and 06-30, plus a 9,486 KAS spend, none of it visible anywhere in this database.
+Kraken is the only source of truth for the account, and this is its mirror.
+(An earlier draft of this docstring said ~14,865 KAS left around 2026-03-31,
+reasoning from a note in a manual export. That was wrong: March and April held
+only buys. Corrected here so the code does not contradict the hub.)
 
 READ ONLY. This process calls Balance, TradesHistory and Ledgers. It never
 places, amends or cancels an order. It borrows kraken_run's request signing and
-Supabase helpers — importing that module is side-effect free, its only
-module-level statement being the __main__ guard — but it deliberately does NOT
-share its trading path, and it runs from its own workflow so that a sync failure
+Supabase helpers. Importing that module is NOT free: it reads KRAKEN_API_KEY,
+KRAKEN_API_SECRET, SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY with os.environ[...]
+at module level and raises KeyError if any is missing, so this job cannot start
+without credentials present under those names (which is how the workflow maps
+the read-only secret). An earlier version of this docstring claimed the import
+was side-effect free; it is not. This job still deliberately does NOT share the
+trading path, and it runs from its own workflow so that a sync failure
 can never interfere with a buy.
 
 CREDENTIALS. This runs on its OWN Kraken key, with query permissions only and no
