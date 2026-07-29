@@ -1673,6 +1673,29 @@ def run_maker_inspection(settings: dict, user_id: str, now_chicago):
         return
     print(f"\n{ICONS['RECON']} Maker inspection: {len(open_rows)} open, {len(pending)} pending")
 
+    # A snapshot BEFORE any leg is finalized, once per pair with an open leg.
+    #
+    # WHY HERE. main() writes its snapshots near the end of the run, after this
+    # inspection. So resolve_reference_mid could only ever see the PREVIOUS
+    # cycle's snapshot, a full cron interval away and therefore outside the
+    # +/-180s window -- which made v1.5.0's reference join fall back to the run
+    # ticker on every single live fill, exactly the stale reading it was written
+    # to replace. Confirmed on 2026-07-29: a KASUSD snapshot existed 4.5s after
+    # the fill, written later in the same run, and the join still fell back.
+    #
+    # Placed inside the inspection rather than by reordering main() because this
+    # is the buy path: this adds a read and a write where a cycle already runs,
+    # and changes nothing about the order in which orders are placed.
+    #
+    # Costs one public ticker call per cycle per pair with a resting leg -- a
+    # handful a day. Failure is swallowed: telemetry must never keep a leg from
+    # being finalized.
+    for _snap_pair in {r.get("pair") for r in open_rows if r.get("pair")}:
+        try:
+            save_mid_snapshot(_snap_pair, get_ticker_snapshot(_snap_pair))
+        except Exception as e:
+            print(f"  {ICONS['WARN']} pre-inspection snapshot {_snap_pair} failed: {e}")
+
     for row in open_rows:
         cl = row["cl_ord_id"]
         window_end = _limit_window_end(row, settings)
