@@ -28,8 +28,15 @@ REGENERATING db/schema-columns.json after a migration:
       group by table_name
     ) t;
 
-Committed rather than queried live because this runs in CI, which has no
-database credentials.
+Committed rather than queried live because the check must run without database
+credentials.
+
+WHERE THIS RUNS, stated accurately after getting it wrong once: `test.sh`, and
+`test.sh` alone. **This repository has no CI workflow that runs it** -- the four
+workflows here execute the bot, not the tests. So this gate protects only what
+someone remembers to run locally. The changelog and STATUS first claimed it runs
+in CI; that was false and is corrected. A gate whose execution is not guaranteed
+is a gate for the runs where it happened to be invoked.
 """
 import ast
 import json
