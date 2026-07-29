@@ -14,6 +14,10 @@ python3 -m py_compile src/ohlc.py       && echo "${OK} ohlc.py OK"       || { ec
 python3 -m py_compile src/kraken_sync.py && echo "${OK} kraken_sync.py OK" || { echo "${FAIL} kraken_sync.py FAIL"; failed=1; }
 
 echo
+echo "${CHECK} Schema check (every written column exists)..."
+python3 scripts/check_schema_columns.py && echo "${OK} schema OK" || { echo "${FAIL} schema FAIL"; failed=1; }
+
+echo
 echo "${CHECK} Running unit tests (pure decision functions, no I/O)..."
 
 for t in tests/test_*.py; do

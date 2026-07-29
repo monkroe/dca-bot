@@ -1,0 +1,21 @@
+{
+  "_comment": "Column snapshot for the tables this bot WRITES to. Checked by scripts/check_schema_columns.py, run from test.sh and therefore in GitHub Actions, where there are no database credentials -- hence a committed snapshot rather than a live query. Regenerate after any migration that adds or removes a column; the SQL is in that script's header.",
+  "_generated": "2026-07-29 (Chicago), from information_schema.columns",
+  "tables": {
+    "dca_executions": ["id", "trade_date_chicago", "pair", "cl_ord_id", "order_id", "status", "reason", "execution_started_at", "execution_finished_at", "requested_quote_amount_base", "requested_quote_amount_bonus", "bid", "ask", "mid", "mid_ts", "filled_quote_cost", "fee_quote", "filled_base_volume", "avg_price", "raw", "user_id", "impact_bps", "all_in_bps", "mid_source", "h7", "h30", "ohlc_ts", "parent_event_id", "attempt_type", "limit_price", "dca_order_id", "h90", "cap_price", "ref_mid", "ref_mid_ts"],
+    "dca_mid_snapshots": ["id", "ts", "pair", "mid", "bid", "ask"],
+    "dca_notifications": ["id", "notification_type", "period_key", "sent_at", "payload", "user_id"],
+    "dca_repeg_log": ["id", "ts", "cl_ord_id", "dca_order_id", "trade_date_chicago", "pair", "limit_price", "bid", "ask", "ticks_above", "repeg_count", "action", "detail"],
+    "dca_commands": ["id", "user_id", "tg_chat_id", "requested_by", "requested_by_id", "command", "payload", "idempotency_key", "priority", "status", "claimed_by", "claimed_at", "started_at", "finished_at", "result", "error", "created_at", "updated_at"],
+    "dca_settings": ["id", "timezone", "target_time", "time_window_minutes", "dry_run", "updated_at", "taker_fee_rate", "user_id", "order_strategy", "maker_fee_rate", "repeg_enabled", "repeg_max", "repeg_min_ticks", "cap_mode", "cap_pct", "cap_require_above_h90", "low_balance_warn_days"],
+    "dca_orders": ["id", "pair", "enabled", "base_quote_amount", "bonus_quote_amount", "priority", "created_at", "updated_at", "user_id", "target_time", "time_window_minutes"],
+    "dca_ohlc_history": ["id", "pair", "interval_minutes", "ts", "open", "high", "low", "close", "vwap", "volume", "trade_count", "source", "created_at"],
+    "strike_dca_executions": ["id", "created_at", "executed_at", "decision_at", "status", "pair", "usd_amount_planned", "usd_spent", "btc_received", "quote_id", "execution_price_usd_per_btc", "fee_usd", "hard_cap_price", "cap_7d_value", "cap_7d_tolerance_pct", "decision_price", "skip_reason", "run_key", "raw_quote_json", "error_code", "error_message", "trade_date_chicago", "user_id", "cl_ord_id", "requested_quote_amount_base", "execution_started_at", "execution_finished_at", "bid", "ask", "mid", "mid_ts", "order_id", "filled_quote_cost", "fee_quote", "filled_base_volume", "avg_price", "reason", "raw", "impact_bps", "all_in_bps", "mid_source", "h7", "h30", "ohlc_ts", "parent_event_id", "attempt_type"],
+    "strike_dca_settings": ["id", "pair", "usd_amount", "is_active", "hard_cap_price", "cap_7d_tolerance_pct", "dry_run", "created_at", "updated_at", "user_id", "target_time", "time_window_minutes"],
+    "strike_dca_orders": ["id", "user_id", "pair", "base_quote_amount", "enabled", "priority", "target_time", "time_window_minutes", "created_at", "updated_at"],
+    "kraken_balances": ["id", "user_id", "snapshot_ts", "asset", "balance"],
+    "kraken_trades": ["trade_id", "user_id", "order_txid", "pair", "time_utc", "side", "ordertype", "price", "cost", "fee", "vol", "margin", "raw", "synced_at"],
+    "kraken_ledgers": ["ledger_id", "user_id", "refid", "time_utc", "type", "subtype", "asset", "amount", "fee", "balance", "raw", "synced_at"],
+    "kraken_sync_state": ["source", "last_time_utc", "last_run_at", "last_status", "detail", "rows_seen"]
+  }
+}
