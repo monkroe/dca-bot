@@ -6,6 +6,14 @@ History before 2026-07-18 (Phase 1 -- Kraken + Strike execution, notifications, 
 
 ## 2026-07-28 (antradienis -- Chicago, session 21)
 
+### test: the build fails when a write names a column that does not exist
+- The same gate as benas-bot, and it matters more here because these writes carry money. A misspelled key in a `dca_executions` update does not raise: PostgREST rejects the row and the fill is simply never recorded. Nothing else in the pipeline sees it -- `py_compile` accepts any dict, and the unit tests exercise pure decision functions that never touch Supabase
+- `scripts/check_schema_columns.py` uses `ast` rather than regular expressions, because these payloads are real Python dict literals and can be parsed properly. 50 payloads and filters checked against `db/schema-columns.json`, a committed snapshot -- CI has no database credentials. Run from `test.sh`
+- **Filters are checked too, not only payloads.** An `sb_update` whose match names a column that does not exist matches nothing and updates nothing. That is the quietest of the three failures: the row stays `claimed`, the purchase happened, and the system never learns of it
+- **Mutation-tested, and the first version missed the most important write in the bot.** `claim_row` -- the row that reserves the day's purchase -- is built as a variable and passed afterwards, so a literal-only check never looked at it. Names bound to a dict literal are now resolved, along with keys added later by subscript assignment. A name bound twice is DROPPED rather than merged, since two shapes under one name is exactly where a guess would be wrong. Resolving can only add keys to inspect, never invent one, so it cannot raise a false alarm
+- All three mutations now turn it red: a stray column inside `claim_row`, a misspelling in an update payload, and a misspelled filter column
+- Regenerate `db/schema-columns.json` after any migration that adds or removes a column; the SQL sits in the script's header
+
 ### test: the two decision functions are in the repo and gated
 - Until now the only evidence that `cap_decision` and `_repeg_decision` are correct was a pair of ad-hoc scripts run in a chat session and never committed -- the same category as a rotating Actions log, a proof that lasts until the window closes. The Phase 2 verdict leans on the re-peg suite in particular, and its deadline is 08-11
 - `tests/test_cap_decision.py` 19 branches / 30 assertions: the DP-4 missing-data paths, both boundaries (price == cap, price == H90), the crash-bounce case the H90 floor exists for, the reason-string format, `cap_params` fallbacks, and a regression pinning the real 07-26 numbers under both the legacy and the rebased rule
