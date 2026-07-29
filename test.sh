@@ -13,4 +13,11 @@ python3 -m py_compile src/strike_run.py && echo "${OK} strike_run.py OK" || { ec
 python3 -m py_compile src/ohlc.py       && echo "${OK} ohlc.py OK"       || { echo "${FAIL} ohlc.py FAIL"; failed=1; }
 python3 -m py_compile src/kraken_sync.py && echo "${OK} kraken_sync.py OK" || { echo "${FAIL} kraken_sync.py FAIL"; failed=1; }
 
+echo
+echo "${CHECK} Running unit tests (pure decision functions, no I/O)..."
+
+for t in tests/test_*.py; do
+  (cd tests && python3 "../$t") && echo "${OK} $(basename "$t") OK" || { echo "${FAIL} $(basename "$t") FAIL"; failed=1; }
+done
+
 exit $failed
