@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# NOTE: unlike the other workflows in this repo, this one really is triggered by
+# what you see above. The bot workflows say `workflow_dispatch` and look manual,
+# but their schedule lives in pg_cron -> the benas edge function -> workflow
+# dispatch. The schedule is not visible in the file that runs, which has already
+# misled one reader; if you are wondering when kraken_sync or kraken_dca run,
+# query cron.job rather than reading these files.
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run test.sh
+        run: |
+          chmod +x ./test.sh
+          ./test.sh
