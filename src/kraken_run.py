@@ -49,7 +49,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from ohlc import build_daily_metrics
 
-VERSION = "1.5.1"
+VERSION = "1.6.0"
 
 # ═══════════════════════════════════════════════════════════════
 #  ICONS — single source of truth for all UI symbols
@@ -1413,6 +1413,70 @@ def _inspect_dry_limit(row: dict, raw: dict, settings: dict, user_id: str, now_c
     _fallback_decision(fresh, settings, user_id, window_end, dry_run=True, scenario=scenario)
 
 
+# ── Retry after an explicit Kraken rejection ──────────────────────────────────
+#
+# WHY. On 2026-07-30 AddOrder was refused with EOrder:Insufficient funds at
+# 06:53 while the buy window ran to ~07:19. The row went terminal, the claim
+# locked the day by cl_ord_id, and the purchase was lost with usable funds still
+# on the account for another 26 minutes.
+#
+# WHY IT REUSES THE ROW. dca_exec_leg_per_event_uniq forbids a second
+# maker_limit row per (dca_order_id, trade_date_chicago) -- that is the I3
+# double-buy guard and it stays. So a retry rotates the client id on the SAME
+# row, exactly as the re-peg path already does.
+#
+# THE LINE THAT MUST NOT MOVE (DP-3). Retry is allowed ONLY when Kraken said no
+# and therefore no order exists. A timeout or a dropped connection is NOT a
+# rejection: the order may be live, and retrying it would buy twice. Hence an
+# ALLOWLIST of explicit rejections rather than a denylist of failures -- an
+# unrecognised error is treated as unknown, which means no retry.
+RETRYABLE_KRAKEN_ERRORS = (
+    "eorder:insufficient funds",
+    "eapi:rate limit exceeded",
+    "egeneral:temporary lockout",
+    "eservice:unavailable",
+    "eservice:busy",
+)
+RETRY_MAX_DEFAULT = 3
+
+
+def _retry_parts(cl_ord_id: str):
+    """PURE. Split a client id into (base, attempts already made).
+
+    The counter lives in the id and nowhere else. The obvious place for it was
+    `raw`, but the failure handler REPLACES `raw` with `{"error": ...}` on every
+    rejection -- so a counter kept there would reset to zero on the very event
+    that increments it, and retry_max would never be reached. The id is written
+    once per attempt and never overwritten, so it cannot lie.
+
+        dca-KASUSD-2026-07-30-0700        -> (..., 0)
+        dca-KASUSD-2026-07-30-0700-r2     -> (..., 2)
+    """
+    base, sep, tail = (cl_ord_id or "").rpartition("-r")
+    if sep and tail.isdigit():
+        return (base, int(tail))
+    return (cl_ord_id, 0)
+
+
+def _retry_decision(status, stored_error, retry_count, now_chicago, deadline,
+                    retry_max=RETRY_MAX_DEFAULT):
+    """PURE. Returns (True, reason) when the failed leg may be re-attempted.
+
+    `deadline` is the same window bound the fallback respects, so a retry can
+    never place an order the window would not have allowed.
+    """
+    if status != "failed_kraken":
+        return (False, f"status {status} is not retryable")
+    if now_chicago > deadline:
+        return (False, "window closed")
+    if retry_count >= retry_max:
+        return (False, f"retry_max {retry_max} reached")
+    low = (stored_error or "").lower()
+    if not any(sig in low for sig in RETRYABLE_KRAKEN_ERRORS):
+        return (False, "error not an explicit rejection -- order may exist")
+    return (True, "explicit rejection, window open")
+
+
 def _repeg_decision(cur_price, bid, ask, ref_price, h90, cap_pct, require_above_h90,
                     tick, min_ticks, repeg_count, repeg_max, ordermin,
                     cost_target, lot_decimals):
@@ -1814,8 +1878,50 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
     print(f"  {pair} | ${total_target:.2f} | {strategy} | fee {fee_rate*100:.2f}% | {'DRY RUN' if dry_run else 'LIVE'}")
     print(f"  cl_ord_id: {cl_ord_id}")
 
+    # ── Phase 0: take over a leg that Kraken explicitly refused ───────────
+    #
+    # Same row, rotated client id (dca_exec_leg_per_event_uniq forbids a second
+    # maker_limit row for the day, and that guard stays). Only reached when the
+    # rejection is on the allowlist and the window is still open; see
+    # _retry_decision.
+    retry_takeover = False
+    if maker and not dry_run and not force:
+        try:
+            prev = sb_get("dca_executions", {
+                "dca_order_id": f"eq.{order.get('id')}",
+                "trade_date_chicago": f"eq.{today_chicago}",
+                "attempt_type": "eq.maker_limit",
+                "select": "id,status,cl_ord_id,reason,parent_event_id",
+            })
+        except Exception as e:
+            prev = []
+            print(f"  {ICONS['WARN']} retry lookup failed: {e}")
+        if prev:
+            prow = prev[0]
+            base_cl, rcount = _retry_parts(prow.get("cl_ord_id") or cl_ord_id)
+            _, wend = _window_bounds_for(
+                today_chicago,
+                order.get("target_time") or settings.get("target_time", "08:00"),
+                int(order.get("time_window_minutes") or settings.get("time_window_minutes") or 10))
+            rdeadline = wend - timedelta(minutes=CRON_CYCLE_MINUTES)
+            ok, why = _retry_decision(prow.get("status"), prow.get("reason"),
+                                      rcount, datetime.now(CHICAGO_TZ), rdeadline)
+            print(f"  Retry check: {'YES' if ok else 'no'} ({why})")
+            if ok:
+                cl_ord_id = f"{base_cl}-r{rcount + 1}"
+                sb_update("dca_executions", {"id": f"eq.{prow['id']}"}, {
+                    "cl_ord_id": cl_ord_id,
+                    "status": "claimed",
+                    "reason": None,
+                    "execution_started_at": datetime.now(timezone.utc).isoformat(),
+                })
+                event_id = prow.get("parent_event_id") or str(uuid.uuid4())
+                retry_takeover = True
+                print(f"  {ICONS['OK']} Retrying refused leg as {cl_ord_id}")
+
     # ── Phase 1: CLAIM ────────────────────────────────────────
-    event_id = str(uuid.uuid4())
+    if not retry_takeover:
+        event_id = str(uuid.uuid4())
     claim_row = {
         "user_id": user_id,
         "trade_date_chicago": today_chicago,
@@ -1832,8 +1938,9 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
         claim_row["dca_order_id"] = order.get("id")
 
     try:
-        sb_insert("dca_executions", claim_row)
-        print(f"  {ICONS['OK']} Claimed")
+        if not retry_takeover:
+            sb_insert("dca_executions", claim_row)
+            print(f"  {ICONS['OK']} Claimed")
     except urllib.error.HTTPError as e:
         if e.code == 409:
             try:

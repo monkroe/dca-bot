@@ -4,6 +4,19 @@ Conventions: dates are **Chicago** time (the bot's trading timezone); a "vakaras
 
 History before 2026-07-18 (Phase 1 -- Kraken + Strike execution, notifications, reconciliation, impact/all-in bps telemetry) is in `git log`; this changelog starts at Phase 2.
 
+## 2026-07-30 (ketvirtadienis -- Chicago, session 22)
+
+### fix(exec): a leg Kraken refused can be attempted again while the window is still open -- v1.6.0
+- **What happened this morning.** The maker leg was refused with `EOrder:Insufficient funds`. The window was still open and usable funds were on the account, but every later cron cycle in that window returned `already_claimed` and did nothing. The day was lost, and lost during the Phase 2 trial period, so it also damages the statistics the 08-11 verdict is read from
+- **Why `already_claimed` fired.** In live maker mode `cl_ord_id` is deterministic (`dca-PAIR-DATE-HHMM`), so the next cycle re-inserted the identical id, hit the unique constraint, and returned early. That guard is correct and stays -- it is what prevents a double buy. What was missing was a path through it
+- A retry now takes over the SAME row and rotates the client id, exactly as the re-peg path already does. `dca_exec_leg_per_event_uniq` still forbids a second `maker_limit` row per order per day, so the I3 double-buy guard is untouched; `parent_event_id` is carried over, keeping the event lineage intact
+- **THE LINE THAT MUST NOT MOVE (DP-3): retry is allowed only when Kraken said no.** An explicit rejection means no order was created and re-attempting is safe. A timeout or a dropped connection is NOT a rejection -- the order may be live, and retrying it would buy twice. So the trigger is an ALLOWLIST of explicit rejections, not a denylist of failures: an unrecognised error is treated as unknown, and unknown never retries
+- Bounded three ways: at most three attempts, only inside the window (deadline pulled back by one cron cycle so a retry can never place an order the window would not have allowed), and only from `failed_kraken`
+- **The attempt counter lives in the client id, not in `raw`.** `raw` was the obvious place and is the wrong one: the failure handler REPLACES `raw` on every rejection, so a counter kept there would reset to zero on the very event that increments it and the cap would never be reached. The id is written once per attempt and never overwritten
+- `tests/test_retry_decision.py`, 9 branches / 44 assertions, wired into `test.sh`. **Verified able to go RED:** eight mutations of the live source -- drop the status guard, flip the window comparison, loosen the cap to `>`, bypass the allowlist, remove case folding, `rpartition` to `partition`, drop the digit check, and an off-by-one in the count -- each turn it red. The first version of the tests survived two of those and was strengthened until none survived. Source restored, diff empty
+- **This alone would not have bought this morning.** If the funds are genuinely locked, the retry hits the same refusal and stops after three. It removes the structural block, not the funding one. Three known gaps stay open: the preflight reads the TOTAL balance rather than the available one, so it waves through an order Kraken will refuse; the failure `raw` records only the error and not the request that caused it; and the Kraken mirror has no OpenOrders, so what the funds were locked in is not visible from the database
+- **Also fixed: `VERSION` was never bumped for v1.5.2.** The commit and this changelog both call it v1.5.2 while the constant still said 1.5.1, so every Actions log from that fix printed the wrong version -- which is the one thing the constant exists for. Past logs cannot be corrected; the constant now reads 1.6.0
+
 ## 2026-07-28 (antradienis -- Chicago, session 21)
 
 ### test: the build fails when a write names a column that does not exist
