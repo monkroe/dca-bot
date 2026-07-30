@@ -50,7 +50,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from ohlc import build_daily_metrics
 
-VERSION = "1.7.1"
+VERSION = "1.7.2"
 
 # ═══════════════════════════════════════════════════════════════
 #  ICONS — single source of truth for all UI symbols
@@ -2448,7 +2448,17 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
                 "status": "limit_open",
                 "order_id": order_id,
                 "limit_price": limit_price,
-                "raw": json.dumps(result),
+                # The preflight reading is recorded on the SUCCESS path too.
+                # Failures carry it since v1.7.0, but a successful run left no
+                # trace of which balance source was used -- so "the spendable
+                # balance check is live" could only be shown from an Actions log
+                # that rotates. Additive: the re-peg machinery reads its own
+                # keys out of this same `raw` and is unaffected.
+                "raw": json.dumps({**result, "preflight": {
+                    "spendable_usd": usd_balance,
+                    "held_usd": usd_held,
+                    "balance_source": bal_source,
+                }}),
             })
             # No finalize here — the order rests; the next runs' inspection
             # phase owns it from now on (DP-2: cron cadence is the timer).
@@ -2461,7 +2471,8 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
                     "status": "rejected_postonly",
                     "limit_price": limit_price,
                     "execution_finished_at": datetime.now(timezone.utc).isoformat(),
-                    "raw": json.dumps({"error": str(e)}),
+                    "raw": _failure_raw(limit_params, e, spendable_usd=usd_balance,
+                                        held_usd=usd_held, balance_source=bal_source),
                 })
                 _fallback_decision(_pending_row(), settings, user_id, window_end,
                                    dry_run=False, scenario=None)

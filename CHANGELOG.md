@@ -6,6 +6,11 @@ History before 2026-07-18 (Phase 1 -- Kraken + Strike execution, notifications, 
 
 ## 2026-07-30 (ketvirtadienis -- Chicago, session 22)
 
+### fix(telemetry): a successful run now records WHICH balance source it used -- v1.7.2
+- v1.7.0 records the spendable/held reading when a buy fails, and nothing when it succeeds. So "the spendable-balance preflight is live" could only be shown from an Actions log that rotates -- and tomorrow's 06:03 verification is precisely a case where the evidence has to outlive the run
+- The `limit_open` row now carries `raw.preflight` with the reading and the source. Additive: the re-peg machinery reads its own keys out of the same `raw` and is unaffected
+- The post-only rejection path also records the request now, like the other three AddOrder failures did from v1.7.0
+
 ### feat(messages): the failure notification separates the sentence from the evidence -- v1.7.1
 - Roberto, on the 07-30 message: as the administrator he needs the ORIGINAL error text for debugging, and it should be set apart visually. The old message pasted Kraken's raw reply into the sentence, so it was bad at both jobs -- unreadable at a glance, and buried at the moment it mattered
 - Now a line to read and a block to debug: what was attempted, the cause in Lithuanian, then Kraken's untouched reply in its own monospace block. Applied to all five failure notifications, not only the one he saw
