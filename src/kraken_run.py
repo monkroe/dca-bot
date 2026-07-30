@@ -49,7 +49,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from ohlc import build_daily_metrics
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 
 # ═══════════════════════════════════════════════════════════════
 #  ICONS — single source of truth for all UI symbols
@@ -690,10 +690,39 @@ def kraken_public(endpoint: str, params: dict | None = None) -> dict:
 #  PREFLIGHT CHECKS
 # ═══════════════════════════════════════════════════════════════
 
-def check_balance_usd() -> float:
-    """Get available USD balance from Kraken."""
+def check_balance_usd() -> tuple[float, float, str]:
+    """SPENDABLE USD on Kraken. Returns (available, held, source).
+
+    The docstring used to say "available" while the call said `Balance`, which
+    is the TOTAL -- it includes USD already committed to resting orders. On
+    2026-07-30 that lie cost a day: the preflight saw enough, waved the order
+    through, and Kraken refused it with EOrder:Insufficient funds because the
+    money was locked in an open order. A preflight that cannot fail before the
+    exchange does is not a preflight.
+
+    `BalanceEx` returns `balance` and `hold_trade` per asset, so
+    available = balance - hold_trade (docs.kraken.com, POST /private/BalanceEx).
+
+    Falls back to `Balance` rather than blocking the buy: BalanceEx may need a
+    permission this key does not have, and a funding check must never be the
+    thing that stops trading. The fallback returns the OLD, optimistic number,
+    so the source is returned with it and gets printed -- a degraded check that
+    looks identical to a good one is how the first version of this went wrong.
+    """
+    try:
+        ex = kraken_private("BalanceEx")
+        row = ex.get("ZUSD") or {}
+        if "balance" in row:
+            total = float(row.get("balance") or 0)
+            held = float(row.get("hold_trade") or 0)
+            return (max(total - held, 0.0), held, "BalanceEx")
+    except Exception as e:
+        # Deliberately broad: a permission error, an unknown endpoint and a
+        # dropped connection must all degrade to the previous behaviour rather
+        # than stop a buy. Only the funding CHECK is weakened, never the buy.
+        print(f"  {ICONS['WARN']} BalanceEx unavailable ({e}) -- falling back to Balance (total, not spendable)")
     balances = kraken_private("Balance")
-    return float(balances.get("ZUSD", 0))
+    return (float(balances.get("ZUSD", 0)), 0.0, "Balance")
 
 
 # Days of remaining buys below which we warn. Notification only -- it never
@@ -1264,14 +1293,15 @@ def _fallback_decision(row: dict, settings: dict, user_id: str, window_end, dry_
 
     # LIVE fallback market order
     try:
-        result = kraken_private("AddOrder", {
+        fb_params = {
             "pair": pair,
             "type": "buy",
             "ordertype": "market",
             "volume": format_volume(vol, pair_info["lot_decimals"]),
             "oflags": "fciq",
             "cl_ordid": fb_cl,
-        })
+        }
+        result = kraken_private("AddOrder", fb_params)
         order_id = result.get("txid", [None])[0]
         update_fb({"status": "placed", "order_id": order_id, "raw": json.dumps(result)})
         print(f"    {ICONS['OK']} fallback placed: {order_id}")
@@ -1286,6 +1316,7 @@ def _fallback_decision(row: dict, settings: dict, user_id: str, window_end, dry_
             "status": "failed_kraken",
             "reason": f"fallback AddOrder failed: {e}",
             "execution_finished_at": _now_utc_iso(),
+            "raw": _failure_raw(fb_params, e, leg="fallback"),
         })
         mark("fallback_failed_kraken")
         tg_send(msg_fail("DCA FAIL", f"{trade_date} | {pair}\nFallback AddOrder failed: {e}"))
@@ -1438,6 +1469,78 @@ RETRYABLE_KRAKEN_ERRORS = (
     "eservice:busy",
 )
 RETRY_MAX_DEFAULT = 3
+
+
+def _failure_raw(params: dict, error, **context) -> str:
+    """What was SENT, next to what came back. JSON string for `raw`.
+
+    Failures used to store `{"error": ...}` and nothing else, so the record of
+    a rejected order said what Kraken thought of a request nobody kept. On
+    2026-07-30 `EOrder:Insufficient funds` was on file with no volume, no
+    price and no balance beside it -- every question worth asking afterwards
+    (how much did we ask for, against what balance) had to be reconstructed
+    from a rotating Actions log. The request is the cheap half of the answer
+    and it was the missing one.
+
+    Carries no credentials: the key, nonce and signature are added inside
+    `kraken_private` and never appear in these params.
+    """
+    return json.dumps(_failure_note(params, error, **context))
+
+
+def _open_orders_digest():
+    """What the money is committed to, RIGHT NOW. For failure records only.
+
+    `kraken_open_orders` (v10) keeps the history, but its sync is a manual
+    workflow -- so on the morning a buy is refused there is no snapshot from
+    that morning. This reads the state at the moment of the refusal and stores
+    it beside the error, which is the only place the timing is guaranteed to
+    line up.
+
+    Never raises: this runs while something has already gone wrong, and a
+    diagnostic that can turn a failure into a crash is worse than no
+    diagnostic. A failure here is recorded as its own note.
+    """
+    try:
+        result = kraken_private("OpenOrders")
+    except Exception as e:
+        return {"error": f"OpenOrders lookup failed: {e}"}
+    out = []
+    for txid, o in (result.get("open") or {}).items():
+        d = o.get("descr") or {}
+        vol = float(o.get("vol") or 0)
+        vol_exec = float(o.get("vol_exec") or 0)
+        # descr.price is the LIMIT price; the top-level `price` is the average
+        # fill and reads 0 on an untouched order, which would value every
+        # resting order at nothing.
+        price = float(d.get("price") or 0)
+        out.append({
+            "txid": txid,
+            "cl_ord_id": o.get("cl_ord_id"),
+            "pair": d.get("pair"),
+            "side": d.get("type"),
+            "ordertype": d.get("ordertype"),
+            "price": price,
+            "vol": vol,
+            "vol_exec": vol_exec,
+            "quote_locked": round((vol - vol_exec) * price, 6) if d.get("type") == "buy" else None,
+        })
+    return out
+
+
+def _failure_note(params: dict, error, **context) -> dict:
+    """The same record as a dict, for paths whose `raw` must be MERGED.
+
+    The re-peg leg keeps its counter and history in `raw`; replacing it there
+    would reset the count and the leg would re-peg forever. Same trap as the
+    retry counter, one function along.
+    """
+    return {
+        "error": str(error),
+        "request": {k: v for k, v in (params or {}).items() if k != "nonce"},
+        "at": _now_utc_iso(),
+        **context,
+    }
 
 
 def _retry_parts(cl_ord_id: str):
@@ -1656,14 +1759,15 @@ def _maybe_repeg(row: dict, o: dict, settings: dict, user_id: str, window_end) -
         "status": "claimed", "order_id": None, "raw": json.dumps(raw),
     })
 
+    repeg_params = {
+        "pair": pair, "type": "buy", "ordertype": "limit",
+        "price": new_price_str,
+        "volume": format_volume(new_vol, pair_info["lot_decimals"]),
+        "oflags": "post,fciq",
+        "cl_ordid": new_cl,
+    }
     try:
-        result = kraken_private("AddOrder", {
-            "pair": pair, "type": "buy", "ordertype": "limit",
-            "price": new_price_str,
-            "volume": format_volume(new_vol, pair_info["lot_decimals"]),
-            "oflags": "post,fciq",
-            "cl_ordid": new_cl,
-        })
+        result = kraken_private("AddOrder", repeg_params)
         new_oid = result.get("txid", [None])[0]
     except KrakenError as e:
         # Repost failed/rejected: the old leg is already canceled (zero-fill),
@@ -1672,9 +1776,13 @@ def _maybe_repeg(row: dict, o: dict, settings: dict, user_id: str, window_end) -
         low = str(e).lower()
         note = "post-only rejected" if "post only" in low else f"AddOrder failed: {e}"
         print(f"    repeg: repost {note} — routing to fallback")
+        # MERGE, never replace: raw carries repeg_count and the history, and
+        # overwriting it would reset the count so the leg re-pegs forever.
+        raw["last_failure"] = _failure_note(repeg_params, e, leg="repeg")
         sb_update("dca_executions", {"cl_ord_id": f"eq.{cl}"}, {
             "status": "rejected_postonly", "order_id": None,
             "limit_price": new_bid,
+            "raw": json.dumps(raw),
         })
         fresh = dict(row)
         fresh["status"] = "rejected_postonly"
@@ -1956,9 +2064,13 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
         sb_update("dca_executions", {"cl_ord_id": f"eq.{cl_ord_id}"}, updates)
 
     # ── Preflight: Balance ────────────────────────────────────
+    # Bound BEFORE the try: the except below deliberately continues, and these
+    # are read again further down when recording a failure.
+    usd_balance, usd_held, bal_source = -1.0, 0.0, "unavailable"
     try:
-        usd_balance = check_balance_usd()
-        print(f"  Balance: ${usd_balance:.2f} | Need: ${total_target:.2f}")
+        usd_balance, usd_held, bal_source = check_balance_usd()
+        held_note = f" (held in open orders ${usd_held:.2f})" if usd_held else ""
+        print(f"  Spendable: ${usd_balance:.2f}{held_note} | Need: ${total_target:.2f} [{bal_source}]")
 
         if usd_balance < total_target:
             if dry_run:
@@ -1967,17 +2079,27 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
                 # died here on a real $0.49 balance).
                 print(f"  {ICONS['DRYRUN']} Insufficient REAL balance — continuing, dry run spends nothing")
             else:
-                reason = f"USD balance ${usd_balance:.2f} < needed ${total_target:.2f}"
+                reason = (f"spendable USD ${usd_balance:.2f} < needed ${total_target:.2f}"
+                          f"{held_note} [{bal_source}]")
                 print(f"  {ICONS['FAIL']} {reason}")
                 update_execution({
                     "status": "skipped_insufficient_funds",
                     "reason": reason,
                     "execution_finished_at": datetime.now(timezone.utc).isoformat(),
+                    "raw": json.dumps({
+                        "spendable_usd": usd_balance,
+                        "held_usd": usd_held,
+                        "balance_source": bal_source,
+                        "needed_usd": total_target,
+                        "at": _now_utc_iso(),
+                        "open_orders": _open_orders_digest(),
+                    }),
                 })
                 ts_chi = datetime.now(timezone.utc).astimezone(CHICAGO_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
                 tg_send(msg_warn(
                     "DCA SKIP",
                     f"{ts_chi} | {pair}\nInsufficient funds: ${usd_balance:.2f} < ${total_target:.2f}"
+                    + (f"\nHeld in open orders: ${usd_held:.2f}" if usd_held else "")
                 ))
                 return {"pair": pair, "status": "skipped_insufficient_funds"}
         elif not dry_run:
@@ -2206,16 +2328,17 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
             })
             return {"pair": pair, "status": "limit_open"}
 
+        limit_params = {
+            "pair": pair,
+            "type": "buy",
+            "ordertype": "limit",
+            "price": price_str,
+            "volume": format_volume(base_volume, pair_info["lot_decimals"]),
+            "oflags": "post,fciq",
+            "cl_ordid": cl_ord_id,
+        }
         try:
-            result = kraken_private("AddOrder", {
-                "pair": pair,
-                "type": "buy",
-                "ordertype": "limit",
-                "price": price_str,
-                "volume": format_volume(base_volume, pair_info["lot_decimals"]),
-                "oflags": "post,fciq",
-                "cl_ordid": cl_ord_id,
-            })
+            result = kraken_private("AddOrder", limit_params)
             order_id = result.get("txid", [None])[0]
             print(f"  {ICONS['OK']} Post-only limit resting: {order_id} @ {price_str}")
             update_execution({
@@ -2246,7 +2369,9 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
                 "status": "failed_kraken",
                 "reason": reason,
                 "execution_finished_at": datetime.now(timezone.utc).isoformat(),
-                "raw": json.dumps({"error": str(e)}),
+                "raw": _failure_raw(limit_params, e, spendable_usd=usd_balance,
+                                    held_usd=usd_held, balance_source=bal_source,
+                                    open_orders=_open_orders_digest()),
             })
             tg_send(msg_fail("DCA FAIL", f"{today_chicago} | {pair}\n{reason}"))
             return {"pair": pair, "status": "failed_kraken"}
@@ -2315,7 +2440,9 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
             "status": "failed_kraken",
             "reason": reason,
             "execution_finished_at": datetime.now(timezone.utc).isoformat(),
-            "raw": json.dumps({"error": str(e)}),
+            "raw": _failure_raw(order_params, e, spendable_usd=usd_balance,
+                                held_usd=usd_held, balance_source=bal_source,
+                                open_orders=_open_orders_digest()),
         })
         tg_send(msg_fail("DCA FAIL", f"{today_chicago} | {pair}\n{reason}"))
         return {"pair": pair, "status": "failed_kraken"}

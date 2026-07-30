@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Mirror Kraken's private account state into Supabase — Balance, TradesHistory,
-Ledgers.
+"""Mirror Kraken's private account state into Supabase — Balance, OpenOrders,
+TradesHistory, Ledgers.
 
 WHY THIS EXISTS. Everything the system knows about the Kraken account is
 inferred from what the bot itself did, so anything done by hand in the Kraken
@@ -13,8 +13,8 @@ Kraken is the only source of truth for the account, and this is its mirror.
 reasoning from a note in a manual export. That was wrong: March and April held
 only buys. Corrected here so the code does not contradict the hub.)
 
-READ ONLY. This process calls Balance, TradesHistory and Ledgers. It never
-places, amends or cancels an order. It borrows kraken_run's request signing and
+READ ONLY. This process calls Balance, OpenOrders, TradesHistory and Ledgers.
+It never places, amends or cancels an order. It borrows kraken_run's request signing and
 Supabase helpers. Importing that module is NOT free: it reads KRAKEN_API_KEY,
 KRAKEN_API_SECRET, SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY with os.environ[...]
 at module level and raises KeyError if any is missing, so this job cannot start
@@ -38,7 +38,9 @@ The shared client reads its credentials from module-level names in kraken_run,
 so the workflow simply maps the read-only secret onto those names -- no second
 signing implementation, and nothing to keep in sync between two copies.
 
-PERMISSIONS. Balance already works (the buy preflight has used it since Phase 1).
+PERMISSIONS. Balance already works (the buy preflight has used it since Phase 1),
+and OpenOrders needs nothing beyond it -- the trading path has called that
+endpoint since Phase 2.
 TradesHistory and Ledgers additionally need the key's "Query Closed Orders & Trades"
 and "Query Ledger Entries" permissions, which cannot be checked from here. Each source is therefore
 attempted independently and a permission error is recorded against that source
@@ -56,7 +58,7 @@ from datetime import datetime, timedelta, timezone
 
 import kraken_run as kr
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 # Kraken pages these 50 at a time and exposes the total as `count`.
 PAGE = 50
@@ -208,6 +210,69 @@ def sync_balances() -> int:
     return len(rows)
 
 
+def sync_open_orders() -> int:
+    """What the money is SPOKEN FOR. The other three sources describe money
+    that has already moved; an open order is money that has not moved and
+    cannot be spent, and until 2026-07-30 that state had no record anywhere.
+    That morning a buy was refused for insufficient funds while the balance
+    looked sufficient, and nothing in this database could say what the funds
+    were committed to.
+
+    Append-only, like balances: the useful question is "what was resting at
+    06:53", and a table that overwrites itself can only answer "what is
+    resting now". Orders that fill or cancel simply stop appearing.
+
+    No pagination -- OpenOrders returns the whole set, unlike the history
+    endpoints.
+    """
+    print(f"\n{kr.ICONS['CHART']} OpenOrders")
+    try:
+        result = kr.kraken_private("OpenOrders")
+    except Exception as e:
+        status = "permission_denied" if is_permission_error(e) else "error"
+        print(f"  {kr.ICONS['FAIL']} {e}")
+        write_state("open_orders", status=status, detail=str(e))
+        return 0
+
+    now = datetime.now(timezone.utc).isoformat()
+    rows = []
+    for txid, o in (result.get("open") or {}).items():
+        d = o.get("descr") or {}
+        rows.append({
+            "order_txid": txid,
+            "user_id": USER_ID,
+            "snapshot_ts": now,
+            "cl_ord_id": o.get("cl_ord_id"),
+            "status": o.get("status"),
+            "opened_at_utc": ts(o.get("opentm") or 0),
+            "pair": d.get("pair"),
+            "side": d.get("type"),
+            "ordertype": d.get("ordertype"),
+            # descr.price is the LIMIT price; the top-level `price` is the
+            # average fill price and is 0 on an untouched order. Locked USD is
+            # (vol - vol_exec) * limit price, so the wrong one of those two
+            # would silently value every resting order at zero.
+            "price": float(d.get("price") or 0),
+            "vol": float(o.get("vol") or 0),
+            "vol_exec": float(o.get("vol_exec") or 0),
+            "cost": float(o.get("cost") or 0),
+            "fee": float(o.get("fee") or 0),
+            "oflags": o.get("oflags"),
+            "descr": d.get("order"),
+            "raw": json.dumps(o),
+        })
+
+    if rows:
+        sb_upsert("kraken_open_orders", rows, "snapshot_ts,order_txid")
+    for r in rows:
+        locked = (r["vol"] - r["vol_exec"]) * r["price"]
+        print(f"    {r['pair']:10s} {r['side']:4s} {r['ordertype']:8s}"
+              f" {r['vol']} @ {r['price']}  locked ~{locked:.2f}")
+    write_state("open_orders", last_time_utc=now, status="ok", rows_seen=len(rows))
+    print(f"  {kr.ICONS['OK']} {len(rows)} resting order(s)")
+    return len(rows)
+
+
 def _paged(endpoint: str, key: str, start: float | None):
     """Walk Kraken's `ofs` pagination, yielding one id->record dict per page."""
     offset = 0
@@ -332,8 +397,8 @@ def main() -> int:
 
     # Independent on purpose: one blocked endpoint must not hide the others.
     outcomes = {}
-    for name, fn in (("balances", sync_balances), ("trades", sync_trades),
-                     ("ledgers", sync_ledgers)):
+    for name, fn in (("balances", sync_balances), ("open_orders", sync_open_orders),
+                     ("trades", sync_trades), ("ledgers", sync_ledgers)):
         try:
             outcomes[name] = fn()
         except Exception as e:

@@ -4,6 +4,15 @@ CHECK=$'\U0001F50D'  # 🔍
 OK=$'\U00002705'     # ✅
 FAIL=$'\U0000274C'   # ❌
 
+# On 2026-07-30 two source mutations came back GREEN while the live code was in
+# fact broken: a stale __pycache__ held the previous bytecode and the import
+# never saw the change. This script happens to be safe from that -- py_compile
+# below rewrites the cache from current source before anything imports it --
+# but nothing said so, and the ad-hoc mutation runs that skip this step were
+# not safe at all. Belt as well as braces, and the reason is written down:
+# a gate that can report a pass for code it did not run is worse than no gate.
+export PYTHONDONTWRITEBYTECODE=1
+
 echo "${CHECK} Checking Python syntax..."
 
 failed=0
