@@ -6,6 +6,21 @@ History before 2026-07-18 (Phase 1 -- Kraken + Strike execution, notifications, 
 
 ## 2026-07-30 (ketvirtadienis -- Chicago, session 22)
 
+### feat(messages): the failure notification separates the sentence from the evidence -- v1.7.1
+- Roberto, on the 07-30 message: as the administrator he needs the ORIGINAL error text for debugging, and it should be set apart visually. The old message pasted Kraken's raw reply into the sentence, so it was bad at both jobs -- unreadable at a glance, and buried at the moment it mattered
+- Now a line to read and a block to debug: what was attempted, the cause in Lithuanian, then Kraken's untouched reply in its own monospace block. Applied to all five failure notifications, not only the one he saw
+- **An unrecognised code is never translated.** The sentence says to read the block instead, and the original text is shown verbatim. Inventing a plausible cause for an unknown failure is how a message ends up lying about what went wrong
+- 15 Kraken codes carry a Lithuanian cause, with diacritics -- a test fails the build on a Lithuanian word stripped of them, and on an em dash in any rendered message
+
+### fix(telegram): the tag allowlist matched spelling, not origin
+- `_tg_html` escaped the whole message and then turned `&lt;b&gt;` back into `<b>`, which restores the tag WHEREVER it appears -- including inside text the bot did not write. Harmless while every message was built from our own words; it stopped being harmless the same commit that started showing an external reply verbatim
+- Formatters now emit control-character markers that are converted to tags AFTER escaping, so a tag can only come from a formatter. The allowlist is about where the markup came from, which is what it was always meant to be
+- Found by a test written for the new message, not by review. `strike_run.py` carries its own copy of the old scheme; its messages are built entirely from our own strings, so the flaw is latent there rather than live, and it is left alone rather than changed unasked
+
+### fix(exec): two defects found while writing the tests
+- The Kraken code was pulled out with `E[A-Za-z]+:`, which matched "failed:" inside our own wrapper sentence once the match was made case-insensitive and reported the error code as `ed:`. Anchored on the real Kraken error classes
+- The lookup was case-sensitive against a lower-cased table, so a reason stored in a different case had no translation at all
+
 ### fix(exec): a leg Kraken refused can be attempted again while the window is still open -- v1.6.0
 - **What happened this morning.** The maker leg was refused with `EOrder:Insufficient funds`. The window was still open and usable funds were on the account, but every later cron cycle in that window returned `already_claimed` and did nothing. The day was lost, and lost during the Phase 2 trial period, so it also damages the statistics the 08-11 verdict is read from
 - **Why `already_claimed` fired.** In live maker mode `cl_ord_id` is deterministic (`dca-PAIR-DATE-HHMM`), so the next cycle re-inserted the identical id, hit the unique constraint, and returned early. That guard is correct and stays -- it is what prevents a double buy. What was missing was a path through it

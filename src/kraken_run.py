@@ -39,6 +39,7 @@ import uuid
 import hmac
 import base64
 import json
+import re
 import os
 import sys
 import time
@@ -49,7 +50,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from ohlc import build_daily_metrics
 
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 
 # ═══════════════════════════════════════════════════════════════
 #  ICONS — single source of truth for all UI symbols
@@ -411,11 +412,33 @@ def cap_decision(price, ref_price, h90, cap_pct, require_above_h90):
 #  TELEGRAM
 # ═══════════════════════════════════════════════════════════════
 
+# Formatting markers. NOT "<b>", deliberately.
+#
+# The old scheme escaped the whole message and then un-escaped `&lt;b&gt;` back
+# into `<b>`, which restores the tag WHEREVER it appears -- including inside
+# text the bot did not write. That was harmless while every message was built
+# from our own words. It stopped being harmless the moment Kraken's untouched
+# reply started being shown verbatim: an error string containing markup would
+# have had it rendered rather than displayed.
+#
+# These two characters cannot occur in a Kraken error or a pair name, so a tag
+# can only come from a formatter below -- the allowlist is about ORIGIN, which
+# is what it was always meant to be, rather than about spelling.
+B_ON, B_OFF = "\x00b\x01", "\x00/b\x01"
+CODE_ON, CODE_OFF = "\x00code\x01", "\x00/code\x01"
+
+_TG_TAGS = {
+    B_ON: "<b>", B_OFF: "</b>",
+    CODE_ON: "<code>", CODE_OFF: "</code>",
+}
+
+
 def _tg_html(text: str) -> str:
-    # Telegram parse_mode=HTML is strict. Escape user/variable content, but keep our simple formatting tags.
+    """Escape everything, then turn our own markers into tags. Order matters:
+    escaping first means nothing in the content can become a tag afterwards."""
     t = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    # Allowlist: only <b>...</b> (used by msg_ok/msg_warn/msg_fail/msg_recon/msg_dryrun)
-    t = t.replace("&lt;b&gt;", "<b>").replace("&lt;/b&gt;", "</b>")
+    for marker, tag in _TG_TAGS.items():
+        t = t.replace(marker, tag)
     return t
 
 def tg_send(text: str):
@@ -446,23 +469,23 @@ def tg_send(text: str):
 # ═══════════════════════════════════════════════════════════════
 
 def msg_ok(title: str, body: str) -> str:
-    return f"{ICONS['OK']} <b>{title}</b>\n{body}"
+    return f"{ICONS['OK']} {B_ON}{title}{B_OFF}\n{body}"
 
 
 def msg_warn(title: str, body: str) -> str:
-    return f"{ICONS['WARN']} <b>{title}</b>\n{body}"
+    return f"{ICONS['WARN']} {B_ON}{title}{B_OFF}\n{body}"
 
 
 def msg_fail(title: str, body: str) -> str:
-    return f"{ICONS['FAIL']} <b>{title}</b>\n{body}"
+    return f"{ICONS['FAIL']} {B_ON}{title}{B_OFF}\n{body}"
 
 
 def msg_recon(title: str, body: str) -> str:
-    return f"{ICONS['RECON']} <b>{title}</b>\n{body}"
+    return f"{ICONS['RECON']} {B_ON}{title}{B_OFF}\n{body}"
 
 
 def msg_dryrun(title: str, body: str) -> str:
-    return f"{ICONS['DRYRUN']} <b>{title}</b>\n{body}"
+    return f"{ICONS['DRYRUN']} {B_ON}{title}{B_OFF}\n{body}"
 
 
 def pair_label(pair: str) -> str:
@@ -471,6 +494,84 @@ def pair_label(pair: str) -> str:
         if pair.endswith(quote) and len(pair) > len(quote):
             return f"{pair[:-len(quote)]}/{quote}"
     return pair
+
+
+# ── Failure messages: one line to read, one block to debug ───────────
+#
+# A failure notification serves two people who are the same person in different
+# moods. Reading the phone, you want to know what happened in one line. Fixing
+# it afterwards, you want Kraken's exact words -- and a paraphrase is useless
+# there, because the string you search for has to be the string Kraken sent.
+# Previously the raw text was pasted into the sentence, so it was bad at both:
+# unreadable at a glance and buried when it mattered.
+#
+# So: a sentence, then the untouched original in its own monospace block.
+# Nothing is dropped -- if a code has no translation, the sentence says to read
+# the block rather than inventing a cause.
+
+KRAKEN_ERROR_LT = {
+    "eorder:insufficient funds":     "nepakanka lėšų",
+    "eorder:order minimum not met":  "suma mažesnė už minimalų orderį",
+    "eorder:invalid price":          "netinkama kaina",
+    "eorder:invalid volume":         "netinkamas kiekis",
+    "eorder:rate limit exceeded":    "viršytas orderių limitas",
+    "eapi:rate limit exceeded":      "viršytas užklausų limitas",
+    "eapi:invalid nonce":            "netinkamas nonce (raktas naudojamas lygiagrečiai)",
+    "eapi:invalid key":              "netinkamas API raktas",
+    "egeneral:permission denied":    "raktui trūksta leidimų",
+    "egeneral:temporary lockout":    "laikinas Kraken užraktas",
+    "egeneral:invalid arguments":    "netinkami užklausos parametrai",
+    "eservice:unavailable":          "Kraken paslauga neprieinama",
+    "eservice:busy":                 "Kraken serveris užimtas",
+    "eorder:cannot open position":   "pozicijos atidaryti negalima",
+    "eorder:post only order":        "post-only orderis atmestas",
+}
+
+# Anchored on the real Kraken error CLASSES rather than "E<word>:". The loose
+# pattern matched "failed:" inside our own wrapper sentence once the match
+# was made case-insensitive, and reported "ed:" as the error code.
+_KRAKEN_CODE_RE = re.compile(
+    r"E(?:General|API|Order|Service|Query|Funding|Trade|Database|Session|Auth)"
+    r":[A-Za-z0-9 _\-\.]+",
+    re.IGNORECASE)
+
+
+def kraken_error_code(error) -> str | None:
+    """PURE. The bare `EClass:Message` Kraken sent, out of whatever wraps it.
+
+    The stored reason is a sentence with a Python list inside it, e.g.
+    `limit AddOrder failed: ['EOrder:Insufficient funds']`. The code is the
+    only part worth putting in a debug block; the rest is our own wording.
+    Returns None when nothing matches, and then the ORIGINAL text is shown
+    untouched -- guessing at an unrecognised failure is how a message ends up
+    lying about what went wrong.
+    """
+    m = _KRAKEN_CODE_RE.search(str(error or ""))
+    return m.group(0).strip().rstrip("'\"]") if m else None
+
+
+def kraken_error_lt(error) -> str | None:
+    """PURE. Lithuanian cause, or None when we do not have one for this code."""
+    code = kraken_error_code(error)
+    if not code:
+        return None
+    return KRAKEN_ERROR_LT.get(code.lower())
+
+
+def msg_exec_fail(trade_date: str, pair: str, action: str, error) -> str:
+    """The failure notification: sentence first, Kraken's own words below."""
+    cause = kraken_error_lt(error)
+    code = kraken_error_code(error) or str(error or "").strip() or "(be teksto)"
+    lines = [
+        f"{ICONS['FAIL']} {B_ON}DCA KLAIDA{B_OFF}",
+        f"{trade_date} | {pair_label(pair)}",
+        action,
+        f"Priežastis: {cause}" if cause else "Priežastis: žr. Kraken atsakymą žemiau.",
+        "",
+        "Kraken atsakymas:",
+        f"{CODE_ON}{code}{CODE_OFF}",
+    ]
+    return "\n".join(lines)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1319,7 +1420,7 @@ def _fallback_decision(row: dict, settings: dict, user_id: str, window_end, dry_
             "raw": _failure_raw(fb_params, e, leg="fallback"),
         })
         mark("fallback_failed_kraken")
-        tg_send(msg_fail("DCA FAIL", f"{trade_date} | {pair}\nFallback AddOrder failed: {e}"))
+        tg_send(msg_exec_fail(trade_date, pair, "Nepavyko pateikti atsarginio pavedimo.", e))
         return
 
     mark("fallback_created")
@@ -2114,13 +2215,14 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
         print(f"  Min order: {pair_info['ordermin']} | Lot decimals: {pair_info['lot_decimals']}")
     except KrakenError as e:
         reason = f"AssetPairs lookup failed: {e}"
+        fail_action = "Nepavyko gauti poros duomenų iš Kraken."
         print(f"  {ICONS['FAIL']} {reason}")
         update_execution({
             "status": "failed_kraken",
             "reason": reason,
             "execution_finished_at": datetime.now(timezone.utc).isoformat(),
         })
-        tg_send(msg_fail("DCA FAIL", f"{today_chicago} | {pair}\n{reason}"))
+        tg_send(msg_exec_fail(today_chicago, pair, fail_action, e))
         return {"pair": pair, "status": "failed_kraken"}
 
     # ── Snapshot: bid/ask/mid ─────────────────────────────────
@@ -2198,14 +2300,15 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
     # Maker leg prices/sizes at BID (the limit rests there); market at ASK.
     price_ref = ticker["bid"] if maker else ticker["ask"]
     if not price_ref or price_ref <= 0:
-        reason = f"No valid {'BID' if maker else 'ASK'} price — can't compute base volume"
+        reason = f"No valid {'BID' if maker else 'ASK'} price – cannot compute base volume"
+        fail_action = "Nepavyko apskaičiuoti kiekio: nėra galiojančios kainos."
         print(f"  {ICONS['FAIL']} {reason}")
         update_execution({
             "status": "failed_kraken",
             "reason": reason,
             "execution_finished_at": datetime.now(timezone.utc).isoformat(),
         })
-        tg_send(msg_fail("DCA FAIL", f"{today_chicago} | {pair}\n{reason}"))
+        tg_send(msg_exec_fail(today_chicago, pair, fail_action, reason))
         return {"pair": pair, "status": "failed_kraken"}
 
     if fee_rate < 0:
@@ -2373,7 +2476,7 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
                                     held_usd=usd_held, balance_source=bal_source,
                                     open_orders=_open_orders_digest()),
             })
-            tg_send(msg_fail("DCA FAIL", f"{today_chicago} | {pair}\n{reason}"))
+            tg_send(msg_exec_fail(today_chicago, pair, "Nepavyko pateikti pavedimo.", e))
             return {"pair": pair, "status": "failed_kraken"}
 
     # ── Execute ───────────────────────────────────────────────
@@ -2444,7 +2547,7 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
                                 held_usd=usd_held, balance_source=bal_source,
                                 open_orders=_open_orders_digest()),
         })
-        tg_send(msg_fail("DCA FAIL", f"{today_chicago} | {pair}\n{reason}"))
+        tg_send(msg_exec_fail(today_chicago, pair, "Nepavyko pateikti pavedimo.", e))
         return {"pair": pair, "status": "failed_kraken"}
 
     # ── Finalize ──────────────────────────────────────────────
@@ -2671,7 +2774,7 @@ def send_weekly_summary(user_id: str):
             s["failed"] += 1
 
     lines = [
-        f"{ICONS['CHART']} <b>DCA Weekly Summary</b>",
+        f"{ICONS['CHART']} {B_ON}DCA Weekly Summary{B_OFF}",
         f"Week: {week_key}",
         "",
     ]
@@ -2682,7 +2785,7 @@ def send_weekly_summary(user_id: str):
         avg_eff = (all_in / s["total_vol"]) if s["total_vol"] > 0 else 0
         avg_slip = (sum(s["slippages"]) / len(s["slippages"])) if s["slippages"] else 0
 
-        lines.append(f"<b>{symbol}</b>")
+        lines.append(f"{B_ON}{symbol}{B_OFF}")
         lines.append(
             f"  {ICONS['OK']} {s['filled']} filled"
             + (f" | {ICONS['SKIP']} {s['skipped']} skip" if s["skipped"] else "")
