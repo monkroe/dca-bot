@@ -4,6 +4,20 @@ Conventions: dates are **Chicago** time (the bot's trading timezone); a "vakaras
 
 History before 2026-07-18 (Phase 1 -- Kraken + Strike execution, notifications, reconciliation, impact/all-in bps telemetry) is in `git log`; this changelog starts at Phase 2.
 
+## 2026-07-31 (penktadienis -- Chicago)
+
+### fix(telemetry): the fill overwrote the very record v1.7.2 added -- v1.7.3
+- First live run of v1.7.2 and the preflight reading was not there. `finalize_order` replaced `raw` wholesale with the Kraken order result, so the balance source written at `limit_open` was gone by the time anyone could read it. The commit message for v1.7.2 said the evidence has to outlive the run; it did not outlive the run
+- **Third time this trap has been walked into.** The retry counter could not live in `raw` because the failure handler replaces it; the re-peg count could not, for the same reason; and now the preflight reading. Twice it was noticed while writing the code and routed around. This time it was not, in the one commit whose entire purpose was durable evidence
+- Fixed at the WRITE rather than remembered at each caller: `finalize_order` now merges into whatever `raw` already holds. Every other writer to that column was already merging or deliberately replacing on a terminal failure
+- Verified first: mid_source, ref_mid and the impact figures were all correct on the same row, so this was the raw column alone and not the telemetry path
+
+### VERIFICATION -- 2026-07-31 06:58, three pendings on one run
+- **P2 PASS.** `mid_source = 'snapshot'`, impact +3.6 bps against a snapshot mid rather than a ten-minute-old ticker. v1.5.2 confirmed on the live path
+- **P3 fails to answer, for the reason above.** The mechanism itself is untested until tomorrow: whether the spendable-balance preflight ran cannot be told from a row whose evidence was overwritten
+- **P1 INCONCLUSIVE, and the query said FAIL.** The leg was placed 06:53:19, filled by Kraken 06:58:03 and inspected 06:58:11, by which time it was closed. `run_maker_inspection` finalizes a closed order and continues before reaching `_maybe_repeg`, which is the only caller of the probe. So zero probe rows is correct here, not a fault. The verification query treated `filled` as proof a leg had been inspected while open; corrected in the hub roadmap
+- A query written to remove ambiguity introduced a different one, and it took reading the code to tell a real failure from an expected silence
+
 ## 2026-07-30 (ketvirtadienis -- Chicago, session 22)
 
 ### fix(telemetry): a successful run now records WHICH balance source it used -- v1.7.2

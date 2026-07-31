@@ -50,7 +50,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from ohlc import build_daily_metrics
 
-VERSION = "1.7.2"
+VERSION = "1.7.3"
 
 # ═══════════════════════════════════════════════════════════════
 #  ICONS — single source of truth for all UI symbols
@@ -1007,6 +1007,23 @@ def finalize_order(cl_ord_id: str, order_id: str, mid: float | None = None, ohlc
             "ohlc_ts": datetime.now(timezone.utc).isoformat() if ohlc_ctx else None,
         }
 
+    # MERGE raw, never replace. `raw` is shared state: the re-peg path keeps its
+    # counter and history there, and v1.7.2 records the preflight balance
+    # reading there. Replacing it wholesale on the fill destroys both -- and it
+    # did, on the very first live run of the fix whose whole purpose was to make
+    # that reading outlive the run. Third time this trap has been walked into,
+    # so it is now closed at the write rather than remembered at each caller.
+    prior_raw = {}
+    try:
+        prior = sb_get("dca_executions", {"cl_ord_id": f"eq.{cl_ord_id}", "select": "raw"})
+        if prior:
+            loaded = _safe_json_load(prior[0].get("raw"))
+            if isinstance(loaded, dict):
+                prior_raw = loaded
+    except Exception as e:
+        print(f"  {ICONS['WARN']} raw merge lookup failed: {e}")
+    merged_raw = {**prior_raw, **(order_data if isinstance(order_data, dict) else {})}
+
     sb_update(
         "dca_executions",
         {"cl_ord_id": f"eq.{cl_ord_id}"},
@@ -1017,7 +1034,7 @@ def finalize_order(cl_ord_id: str, order_id: str, mid: float | None = None, ohlc
             "filled_base_volume": vol_exec,
             "avg_price": avg_px,
             "execution_finished_at": finished_at_iso,
-            "raw": json.dumps(order_data),
+            "raw": json.dumps(merged_raw),
             "impact_bps": impact_bps,
             "all_in_bps": all_in_bps,
             "mid_source": mid_source,
