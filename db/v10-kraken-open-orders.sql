@@ -27,8 +27,15 @@
 -- what makes it up.
 --
 -- READ ONLY, same as the rest of the mirror: src/kraken_sync.py calls
--- OpenOrders and nothing else. The trading path calls the same endpoint
--- already, so no new key permission is involved.
+-- OpenOrders and nothing else.
+--
+-- PERMISSION, corrected after the first live run: this said "the trading path
+-- calls the same endpoint already, so no new key permission is involved". The
+-- sync returned permission denied. The TRADING key can call OpenOrders; the
+-- read-only key the sync runs on cannot, because "Query open orders & trades"
+-- is a separate tick from "Query closed orders & trades". Until it is enabled
+-- this table stays empty -- which is why the trading path also captures the
+-- book into the failure record, on a key that does have the permission.
 --
 -- IDEMPOTENT: unique on (snapshot_ts, order_txid), so a re-run inside the same
 -- snapshot cannot duplicate a row.

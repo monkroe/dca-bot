@@ -38,9 +38,13 @@ The shared client reads its credentials from module-level names in kraken_run,
 so the workflow simply maps the read-only secret onto those names -- no second
 signing implementation, and nothing to keep in sync between two copies.
 
-PERMISSIONS. Balance already works (the buy preflight has used it since Phase 1),
-and OpenOrders needs nothing beyond it -- the trading path has called that
-endpoint since Phase 2.
+PERMISSIONS. Balance already works (the buy preflight has used it since Phase 1).
+OpenOrders does NOT: this file first claimed it "needs nothing beyond Balance,
+the trading path has called that endpoint since Phase 2", and the first live run
+returned permission denied. The trading key can call it; the read-only key this
+job runs on cannot, because "Query open orders & trades" is a SEPARATE tick from
+"Query closed orders & trades" and was never enabled. Two keys, two permission
+sets -- reasoning from what the trading key can do said nothing about this one.
 TradesHistory and Ledgers additionally need the key's "Query Closed Orders & Trades"
 and "Query Ledger Entries" permissions, which cannot be checked from here. Each source is therefore
 attempted independently and a permission error is recorded against that source
@@ -81,7 +85,8 @@ def check_credentials() -> bool:
     print(f"{kr.ICONS['FAIL']} No Kraken credentials in this job's environment.")
     print("   This sync expects its OWN read-only key, not the trading one:")
     print("   1. Kraken -> Settings -> API -> Add key")
-    print("      tick ONLY: Query (Funds), Query closed orders & trades, Query ledger entries")
+    print("      tick ONLY: Query (Funds), Query open orders & trades,")
+    print("                 Query closed orders & trades, Query ledger entries")
     print("      leave OFF: Create & modify orders, Cancel & close orders, Withdraw, Deposit, Earn")
     print("   2. GitHub -> repo Settings -> Secrets -> Actions, add")
     print("      KRAKEN_RO_API_KEY and KRAKEN_RO_API_SECRET")
@@ -231,6 +236,10 @@ def sync_open_orders() -> int:
     except Exception as e:
         status = "permission_denied" if is_permission_error(e) else "error"
         print(f"  {kr.ICONS['FAIL']} {e}")
+        if status == "permission_denied":
+            print("    → the read-only key lacks 'Query open orders & trades'.")
+            print("      It is a SEPARATE tick from 'Query closed orders & trades';")
+            print("      having the latter says nothing about the former.")
         write_state("open_orders", status=status, detail=str(e))
         return 0
 
