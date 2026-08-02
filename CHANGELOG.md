@@ -17,9 +17,11 @@ History before 2026-07-18 (Phase 1 -- Kraken + Strike execution, notifications, 
 - **The schema gate silently lost coverage in this change** and the count is the only thing that said so: 60 payloads before, 58 after. It resolves dict literals at the call site, and these rows now arrive from a function it cannot follow. Covered instead by `tests/test_snapshot_rows.py`, which checks the built keys against `db/schema-columns.json` directly -- stronger than the gate, because it proves the dicts that actually get written
 - 9 branches / 20 assertions, and the gate was shown able to go RED by two mutations (average fill price instead of the limit; dropping the non-zero filter). Source restored, diff clean
 
-### chore(sync): second daily run, 01:00 and 15:00 Chicago
+### chore(sync): second daily run, 01:00 and 13:00 Chicago
 - `kraken-sync` was `0 20 * * *`, one run a day. Anything done by hand in the evening waited until the next afternoon to appear -- a sale at 23:40 was invisible for fifteen hours
-- Now `0 6,20 * * *`. One job with two times rather than a second job: the cron health gap is still open, and every additional job is another thing that can stop without saying so
+- Now `0 6,18 * * *`. One job with two times rather than a second job: the cron health gap is still open, and every additional job is another thing that can stop without saying so
+- **The second hour was measured, not picked.** The first attempt kept the old 15:00 and simply added 01:00. Roberto asked whether 13:00 would be better -- twelve hours apart -- and the answer is yes, for a different reason than the symmetry that prompted it. Against 45 days of real ledger events, mean staleness falls from 6.39 h to 5.43 h and the WORST case from 12.68 h to 10.68 h. 13:00 gives the lowest worst case of any hour tested, because it lands just after the midday cluster of activity rather than two hours later
+- 11:00 scores a slightly better mean (5.07 h) and a worse worst case (12.76 h). The worst case is what went wrong here, so it won the tie
 - Deliberately NOT higher frequency. Trades and ledgers are immutable history, so more often buys freshness and no information; balances would add roughly 78,000 rows a month to a free-tier database. Roberto declined it for those reasons
 
 ## 2026-07-31 (penktadienis -- Chicago)
