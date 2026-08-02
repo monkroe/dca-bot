@@ -4,6 +4,24 @@ Conventions: dates are **Chicago** time (the bot's trading timezone); a "vakaras
 
 History before 2026-07-18 (Phase 1 -- Kraken + Strike execution, notifications, reconciliation, impact/all-in bps telemetry) is in `git log`; this changelog starts at Phase 2.
 
+## 2026-08-01 (šeštadienis vakaras -- Chicago; UTC jau 08-02)
+
+### feat(mirror): the run takes the snapshot, because the run is when it matters -- v1.7.4
+- `kraken_open_orders` was created to answer "what was my money committed to at 06:53" -- the question the 07-30 refusal could not be answered from. Its sync then ran once a day at 15:00, so the table could never observe the moment it exists for. A week later it held exactly one snapshot. For a point-in-time table cadence is not a detail, it IS the information
+- The trading run already happens at that moment, so it now writes one balance and one open-orders snapshot itself. No new scheduled job, two extra API calls
+- Placed in the preflight, BEFORE the funding branch, so the record exists on both outcomes. The case that motivated the table was a refusal, not a buy; a snapshot only on success would have missed exactly the day it was needed
+- **Once per day, not once per invocation.** Cron fires this process every five minutes through the window, but the preflight sits behind the day's claim, so later invocations return before reaching it. In `main()` it would have written roughly 120 snapshots a day for the same information
+- Wrapped whole and never raises. A snapshot is telemetry; the buy must not be able to fail because of it
+- Row shape extracted to `balance_rows` / `open_order_rows` and shared with `kraken_sync` (v1.1.1), which had its own copy. Two builders for one table is two chances to disagree about it
+- `balance_rows` accepts BOTH shapes Kraken returns: `Balance` gives a scalar per asset, `BalanceEx` a dict with `balance` and `hold_trade`. The sync calls the first and the trading path the second, and a builder that understood only one would write an empty snapshot for the other while reporting success
+- **The schema gate silently lost coverage in this change** and the count is the only thing that said so: 60 payloads before, 58 after. It resolves dict literals at the call site, and these rows now arrive from a function it cannot follow. Covered instead by `tests/test_snapshot_rows.py`, which checks the built keys against `db/schema-columns.json` directly -- stronger than the gate, because it proves the dicts that actually get written
+- 9 branches / 20 assertions, and the gate was shown able to go RED by two mutations (average fill price instead of the limit; dropping the non-zero filter). Source restored, diff clean
+
+### chore(sync): second daily run, 01:00 and 15:00 Chicago
+- `kraken-sync` was `0 20 * * *`, one run a day. Anything done by hand in the evening waited until the next afternoon to appear -- a sale at 23:40 was invisible for fifteen hours
+- Now `0 6,20 * * *`. One job with two times rather than a second job: the cron health gap is still open, and every additional job is another thing that can stop without saying so
+- Deliberately NOT higher frequency. Trades and ledgers are immutable history, so more often buys freshness and no information; balances would add roughly 78,000 rows a month to a free-tier database. Roberto declined it for those reasons
+
 ## 2026-07-31 (penktadienis -- Chicago)
 
 ### fix(telemetry): the fill overwrote the very record v1.7.2 added -- v1.7.3

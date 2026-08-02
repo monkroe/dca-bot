@@ -50,7 +50,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from ohlc import build_daily_metrics
 
-VERSION = "1.7.3"
+VERSION = "1.7.4"
 
 # ═══════════════════════════════════════════════════════════════
 #  ICONS — single source of truth for all UI symbols
@@ -1646,6 +1646,105 @@ def _open_orders_digest():
     return out
 
 
+def balance_rows(balances, user_id: str, snapshot_ts: str) -> list[dict]:
+    """PURE. One `kraken_balances` row per non-zero asset.
+
+    Accepts BOTH shapes Kraken returns. `Balance` gives a scalar per asset;
+    `BalanceEx` gives a dict with `balance` and `hold_trade`. The sync calls the
+    first and the trading path the second, so a builder that understood only one
+    would write an empty snapshot for the other and report success doing it.
+
+    Zero balances are dropped: Kraken keeps rows for assets long since sold, and
+    a snapshot is about what is held.
+    """
+    rows = []
+    for asset, amount in sorted((balances or {}).items()):
+        if isinstance(amount, dict):
+            amount = amount.get("balance")
+        try:
+            value = float(amount)
+        except (TypeError, ValueError):
+            continue
+        if value != 0:
+            rows.append({"user_id": user_id, "snapshot_ts": snapshot_ts,
+                         "asset": asset, "balance": value})
+    return rows
+
+
+def open_order_rows(result, user_id: str, snapshot_ts: str) -> list[dict]:
+    """PURE. One `kraken_open_orders` row per resting order."""
+    rows = []
+    for txid, o in ((result or {}).get("open") or {}).items():
+        d = o.get("descr") or {}
+        rows.append({
+            "order_txid": txid,
+            "user_id": user_id,
+            "snapshot_ts": snapshot_ts,
+            "cl_ord_id": o.get("cl_ord_id"),
+            "status": o.get("status"),
+            "opened_at_utc": datetime.fromtimestamp(
+                float(o.get("opentm") or 0), tz=timezone.utc).isoformat(),
+            "pair": d.get("pair"),
+            "side": d.get("type"),
+            "ordertype": d.get("ordertype"),
+            # descr.price is the LIMIT price; the top-level `price` is the
+            # average fill and reads 0 on an untouched order, which would value
+            # every resting order at nothing.
+            "price": float(d.get("price") or 0),
+            "vol": float(o.get("vol") or 0),
+            "vol_exec": float(o.get("vol_exec") or 0),
+            "cost": float(o.get("cost") or 0),
+            "fee": float(o.get("fee") or 0),
+            "oflags": o.get("oflags"),
+            "descr": d.get("order"),
+            "raw": json.dumps(o),
+        })
+    return rows
+
+
+def snapshot_mirror(user_id: str) -> None:
+    """Write ONE balance + open-orders snapshot from inside the trading run.
+
+    WHY THIS EXISTS HERE and not only in `kraken_sync.py`. The comment on
+    `kraken_open_orders` (db/v10) says the table answers "what was my money
+    committed to at 06:53" -- the question the 2026-07-30 refusal could not be
+    answered from. The sync then runs once a day at 15:00, so the table could
+    never observe the moment it was built for, and after a week it held exactly
+    one snapshot. Cadence is not a detail for a point-in-time table; it IS the
+    information.
+
+    This run already happens at the moment in question, so the snapshot costs
+    two API calls and no new scheduled job.
+
+    ONCE PER DAY, not once per invocation. Cron fires this process every five
+    minutes through the window, but the preflight that calls this sits behind
+    the day's claim, so later invocations return before reaching it. Putting it
+    in `main()` would have written ~120 snapshots a day for the same
+    information.
+
+    NEVER RAISES. A snapshot is telemetry; the buy does not depend on it and
+    must not be able to fail because of it.
+    """
+    now = _now_utc_iso()
+    try:
+        rows = balance_rows(kraken_private("Balance"), user_id, now)
+        for row in rows:
+            sb_insert("kraken_balances", row)
+        print(f"  {ICONS['OK']} mirror: {len(rows)} balance row(s)")
+    except Exception as e:
+        print(f"  {ICONS['WARN']} mirror balance snapshot failed: {e}")
+
+    try:
+        rows = open_order_rows(kraken_private("OpenOrders"), user_id, now)
+        for row in rows:
+            sb_insert("kraken_open_orders", row)
+        print(f"  {ICONS['OK']} mirror: {len(rows)} resting order(s)")
+    except Exception as e:
+        # The read-only key needed a separate permission for this; the trading
+        # key has it. Still guarded -- see the docstring.
+        print(f"  {ICONS['WARN']} mirror open-orders snapshot failed: {e}")
+
+
 def _failure_note(params: dict, error, **context) -> dict:
     """The same record as a dict, for paths whose `raw` must be MERGED.
 
@@ -2185,6 +2284,15 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
     # Bound BEFORE the try: the except below deliberately continues, and these
     # are read again further down when recording a failure.
     usd_balance, usd_held, bal_source = -1.0, 0.0, "unavailable"
+
+    # One mirror snapshot per day, taken HERE because this is the moment the
+    # buy decision is made. It runs before the funding branch below so the
+    # record exists on BOTH outcomes -- the 07-30 case that motivated the table
+    # was a refusal, not a buy, and a snapshot only on success would have missed
+    # exactly the day it was needed. Skipped in dry runs, which decide nothing.
+    if not dry_run:
+        snapshot_mirror(user_id)
+
     try:
         usd_balance, usd_held, bal_source = check_balance_usd()
         held_note = f" (held in open orders ${usd_held:.2f})" if usd_held else ""

@@ -62,7 +62,7 @@ from datetime import datetime, timedelta, timezone
 
 import kraken_run as kr
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 # Kraken pages these 50 at a time and exposes the total as `count`.
 PAGE = 50
@@ -201,11 +201,10 @@ def sync_balances() -> int:
         return 0
 
     now = datetime.now(timezone.utc).isoformat()
-    rows = [
-        {"user_id": USER_ID, "snapshot_ts": now, "asset": asset, "balance": float(amount)}
-        for asset, amount in sorted(balances.items())
-        if float(amount) != 0
-    ]
+    # Row shape lives in kraken_run so the trading path and this one cannot
+    # drift apart: both write the same table, and two builders for one table is
+    # two chances to disagree about it.
+    rows = kr.balance_rows(balances, USER_ID, now)
     if rows:
         kr.sb_insert("kraken_balances", rows)
     for r in rows:
@@ -244,32 +243,11 @@ def sync_open_orders() -> int:
         return 0
 
     now = datetime.now(timezone.utc).isoformat()
-    rows = []
-    for txid, o in (result.get("open") or {}).items():
-        d = o.get("descr") or {}
-        rows.append({
-            "order_txid": txid,
-            "user_id": USER_ID,
-            "snapshot_ts": now,
-            "cl_ord_id": o.get("cl_ord_id"),
-            "status": o.get("status"),
-            "opened_at_utc": ts(o.get("opentm") or 0),
-            "pair": d.get("pair"),
-            "side": d.get("type"),
-            "ordertype": d.get("ordertype"),
-            # descr.price is the LIMIT price; the top-level `price` is the
-            # average fill price and is 0 on an untouched order. Locked USD is
-            # (vol - vol_exec) * limit price, so the wrong one of those two
-            # would silently value every resting order at zero.
-            "price": float(d.get("price") or 0),
-            "vol": float(o.get("vol") or 0),
-            "vol_exec": float(o.get("vol_exec") or 0),
-            "cost": float(o.get("cost") or 0),
-            "fee": float(o.get("fee") or 0),
-            "oflags": o.get("oflags"),
-            "descr": d.get("order"),
-            "raw": json.dumps(o),
-        })
+    # Same reason as sync_balances: one builder, in kraken_run, shared with the
+    # trading path. `descr.price` vs the top-level `price` is the trap it
+    # encodes -- the latter is the average fill and reads 0 on an untouched
+    # order, which would value every resting order at nothing.
+    rows = kr.open_order_rows(result, USER_ID, now)
 
     if rows:
         sb_upsert("kraken_open_orders", rows, "snapshot_ts,order_txid")
