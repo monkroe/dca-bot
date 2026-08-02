@@ -193,7 +193,7 @@ def sync_balances() -> int:
     only visible if history is kept, and a single overwritten row hides it."""
     print(f"\n{kr.ICONS['CHART']} Balance")
     try:
-        balances = kr.kraken_private("Balance")
+        balances = kr.snapshot_balances()
     except Exception as e:
         status = "permission_denied" if is_permission_error(e) else "error"
         print(f"  {kr.ICONS['FAIL']} {e}")
@@ -208,7 +208,11 @@ def sync_balances() -> int:
     if rows:
         kr.sb_insert("kraken_balances", rows)
     for r in rows:
-        print(f"    {r['asset']:8s} {r['balance']}")
+        # The held amount is printed only when it is KNOWN. A blank column and a
+        # "0" mean different things here, and the run log is where that is first
+        # read.
+        held = "" if r.get("hold_trade") is None else f"  (held {r['hold_trade']})"
+        print(f"    {r['asset']:8s} {r['balance']}{held}")
     write_state("balances", last_time_utc=now, status="ok", rows_seen=len(rows))
     print(f"  {kr.ICONS['OK']} {len(rows)} asset(s)")
     return len(rows)

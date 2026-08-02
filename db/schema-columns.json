@@ -1,6 +1,6 @@
 {
   "_comment": "Column snapshot for the tables this bot WRITES to. Checked by scripts/check_schema_columns.py, run from test.sh and therefore in GitHub Actions, where there are no database credentials -- hence a committed snapshot rather than a live query. Regenerate after any migration that adds or removes a column; the SQL is in that script's header.",
-  "_generated": "2026-07-29 (Chicago), from information_schema.columns",
+  "_generated": "2026-08-02 (Chicago), from information_schema.columns",
   "tables": {
     "dca_commands": [
       "id",
@@ -142,7 +142,8 @@
       "user_id",
       "snapshot_ts",
       "asset",
-      "balance"
+      "balance",
+      "hold_trade"
     ],
     "kraken_ledgers": [
       "ledger_id",

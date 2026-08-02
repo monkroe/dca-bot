@@ -4,6 +4,14 @@ Conventions: dates are **Chicago** time (the bot's trading timezone); a "vakaras
 
 History before 2026-07-18 (Phase 1 -- Kraken + Strike execution, notifications, reconciliation, impact/all-in bps telemetry) is in `git log`; this changelog starts at Phase 2.
 
+## 2026-08-02 (sekmadienis -- Chicago)
+
+### fix(mirror): the snapshot stored what is held, never what is spendable -- v1.7.5
+- `kraken_balances` gained `hold_trade` (`db/v11`), and both snapshot writers now ask `BalanceEx` first, which is the only shape that reports it. `Balance` stays as the fallback: a snapshot without the held amount beats no snapshot
+- The gap was mine and it was in the same file as its own explanation. `balance_rows` read `hold_trade` out of the BalanceEx dict and then dropped it, while both callers were still passing `Balance` -- which has no such field, so the discard was invisible. The preflight has used BalanceEx since 07-30; only the mirror had not caught up
+- **NULL, never 0.0, when the shape cannot carry it.** "Not known at this snapshot" and "nothing was held" are opposite claims on the only day this matters, and a zero would have made the blind snapshot look like a healthy one. Rows written before v11 keep NULL honestly -- they were taken with `Balance`
+- Found while re-investigating the 07-30 refusal from scratch, which was itself the mistake: `db/v10`'s own header already stated the cause in one sentence. The mirror answers this question now; the documentation already did
+
 ## 2026-08-01 (šeštadienis vakaras -- Chicago; UTC jau 08-02)
 
 ### feat(mirror): the run takes the snapshot, because the run is when it matters -- v1.7.4

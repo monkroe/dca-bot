@@ -34,16 +34,49 @@ def columns(table):
 
 def test_balance_accepts_both_kraken_shapes(t):
     # `Balance` returns a scalar per asset; `BalanceEx` returns a dict with
-    # `balance` and `hold_trade`. The sync calls the first and the trading path
-    # the second. A builder that understood only one would write an EMPTY
-    # snapshot for the other and report success doing it.
+    # `balance` and `hold_trade`. Callers prefer BalanceEx and fall back, so a
+    # builder that understood only one would write an EMPTY snapshot for the
+    # other and report success doing it.
     plain = kr.balance_rows({"ZUSD": "21.66", "KAS": "4852.67"}, UID, TS)
     rich = kr.balance_rows(
         {"ZUSD": {"balance": "21.66", "hold_trade": "0.0"},
          "KAS": {"balance": "4852.67", "hold_trade": "0.0"}}, UID, TS)
     t.check("plain row count", len(plain), 2)
-    t.check("both shapes agree", [r["balance"] for r in plain],
+    t.check("both shapes agree on balance", [r["balance"] for r in plain],
             [r["balance"] for r in rich])
+
+
+def test_hold_trade_is_kept_and_absence_is_not_zero(t):
+    # THE 2026-07-30 ROW. The USD balance covered the order; the money was in a
+    # resting limit order; Kraken refused. The mirror stored the balance and
+    # dropped the held amount, so no row could say so.
+    rich = kr.balance_rows({"ZUSD": {"balance": "34.94", "hold_trade": "20.0"}},
+                           UID, TS)
+    t.check("held amount survives", rich[0]["hold_trade"], 20.0)
+    # Rounded because these are floats: 34.94 - 20.0 is 14.939999999999998, and
+    # a test that pretends otherwise is testing IEEE 754, not this builder.
+    t.check("spendable is derivable",
+            round(rich[0]["balance"] - rich[0]["hold_trade"], 2), 14.94)
+
+    # `Balance` has no such field. NULL means "this snapshot cannot know", which
+    # is a different claim from "nothing was held" -- and on the day that matters
+    # it is the opposite one. Writing 0.0 here would have made the broken
+    # snapshot look like a healthy one.
+    plain = kr.balance_rows({"ZUSD": "34.94"}, UID, TS)
+    t.check("unknown is None, never 0.0", plain[0]["hold_trade"], None)
+    t.check("and it is genuinely absent, not falsy-equal",
+            plain[0]["hold_trade"] is None, True)
+
+
+def test_hold_trade_junk_does_not_lose_the_row(t):
+    # A malformed held value must cost the field, never the snapshot: the
+    # balance is still worth recording, and an exception here would take the
+    # whole asset with it.
+    rows = kr.balance_rows({"KAS": {"balance": "1.5", "hold_trade": "abc"}},
+                           UID, TS)
+    t.check("row survives", len(rows), 1)
+    t.check("balance intact", rows[0]["balance"], 1.5)
+    t.check("bad held value degrades to None", rows[0]["hold_trade"], None)
 
 
 def test_balance_drops_zeros_and_junk(t):
@@ -134,6 +167,8 @@ if __name__ == "__main__":
     import sys
     sys.exit(Runner("snapshot row builders").run([
         ("balance accepts both Kraken shapes", test_balance_accepts_both_kraken_shapes),
+        ("hold_trade kept, absence is not zero", test_hold_trade_is_kept_and_absence_is_not_zero),
+        ("hold_trade junk does not lose the row", test_hold_trade_junk_does_not_lose_the_row),
         ("balance drops zeros and junk", test_balance_drops_zeros_and_junk),
         ("balance keeps negatives", test_balance_keeps_negatives),
         ("balance empty and None", test_balance_empty_and_none),

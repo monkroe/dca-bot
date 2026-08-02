@@ -50,7 +50,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from ohlc import build_daily_metrics
 
-VERSION = "1.7.4"
+VERSION = "1.7.5"
 
 # ═══════════════════════════════════════════════════════════════
 #  ICONS — single source of truth for all UI symbols
@@ -1646,28 +1646,66 @@ def _open_orders_digest():
     return out
 
 
+def snapshot_balances():
+    """Balances for a mirror snapshot, preferring the shape that carries holds.
+
+    `BalanceEx` is asked first because it is the only one that reports
+    `hold_trade`. `Balance` is the fallback rather than the failure: a snapshot
+    without the held amount is worth much more than no snapshot, and the missing
+    value is recorded as NULL so the two cannot be confused later.
+
+    Same fallback reasoning as `get_usd_balance`, and deliberately the same
+    breadth of `except`: a permission gap on one key must not cost the mirror
+    its history.
+    """
+    try:
+        ex = kraken_private("BalanceEx")
+        if isinstance(ex, dict) and ex:
+            return ex
+    except Exception as e:
+        print(f"  {ICONS['WARN']} BalanceEx unavailable ({e}) -- snapshot will have no hold_trade")
+    return kraken_private("Balance")
+
+
 def balance_rows(balances, user_id: str, snapshot_ts: str) -> list[dict]:
     """PURE. One `kraken_balances` row per non-zero asset.
 
     Accepts BOTH shapes Kraken returns. `Balance` gives a scalar per asset;
-    `BalanceEx` gives a dict with `balance` and `hold_trade`. The sync calls the
-    first and the trading path the second, so a builder that understood only one
-    would write an empty snapshot for the other and report success doing it.
+    `BalanceEx` gives a dict with `balance` and `hold_trade`. Callers prefer
+    BalanceEx and fall back, so a builder that understood only one would write an
+    empty snapshot for the other and report success doing it.
+
+    `hold_trade` is kept, not discarded. It is the difference between what is
+    held and what can be spent, and on 2026-07-30 that difference was the whole
+    incident: the USD balance covered the order, the money was in a resting
+    limit order, Kraken refused. The mirror recorded the balance and threw the
+    held amount away, so the row could not say what had actually happened.
+
+    NULL, never 0.0, when the shape does not carry it. `Balance` omits the field
+    entirely, and writing zero there would assert "nothing was held" on exactly
+    the snapshots that cannot know.
 
     Zero balances are dropped: Kraken keeps rows for assets long since sold, and
     a snapshot is about what is held.
     """
     rows = []
     for asset, amount in sorted((balances or {}).items()):
+        held = None
         if isinstance(amount, dict):
+            raw_held = amount.get("hold_trade")
             amount = amount.get("balance")
+            if raw_held is not None:
+                try:
+                    held = float(raw_held)
+                except (TypeError, ValueError):
+                    held = None
         try:
             value = float(amount)
         except (TypeError, ValueError):
             continue
         if value != 0:
             rows.append({"user_id": user_id, "snapshot_ts": snapshot_ts,
-                         "asset": asset, "balance": value})
+                         "asset": asset, "balance": value, "hold_trade": held})
     return rows
 
 
@@ -1727,7 +1765,7 @@ def snapshot_mirror(user_id: str) -> None:
     """
     now = _now_utc_iso()
     try:
-        rows = balance_rows(kraken_private("Balance"), user_id, now)
+        rows = balance_rows(snapshot_balances(), user_id, now)
         for row in rows:
             sb_insert("kraken_balances", row)
         print(f"  {ICONS['OK']} mirror: {len(rows)} balance row(s)")
