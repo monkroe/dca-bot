@@ -16,6 +16,13 @@ History before 2026-07-18 (Phase 1 -- Kraken + Strike execution, notifications, 
 - `_buys_word` is tested (20 assertions): the Lithuanian plural has three branches and two exceptions, and it is wrong in a way nobody reports -- "0 pirkimas" is not broken, only foreign, and gets read past
 - Caught while writing it, by a mechanical name check rather than by review: the evening guard first used `ZoneInfo` without importing it. It compiled, and would have raised `NameError` inside a `try` that swallows -- a warning silently never sent. Now uses `kr.CHICAGO_TZ`, the single definition that already exists
 
+### chore(sync): the mirror moved to 08:00 / 13:00 / 22:00, and the hour was measured again
+- The evening job added for the warning turned out to be a FULL sync, not the balance-only check the design described -- so the mirror was already running three times a day. Recorded because the design and the implementation had drifted apart in a way only Roberto's question exposed
+- Given three runs, the question became which hours. Measured against **119 real ledger events since 2026-06-01**: `08/13/22` gives mean staleness **3.28 h**, worst **9.47 h**. The previous `01/13/22` gave 4.40 h and 10.68 h
+- Roberto proposed `10/22`. Measured at 5.64 h mean and 11.57 h worst -- **worse than both**, because two runs lose to three whatever the hours. But the half of his instinct that mattered was right: **01:00 was the wrong hour**, serving the night, when nothing happens
+- Not visible in the averages, and the second reason for 08:00: it puts the daily DCA fill (~06:57) into the mirror within an hour instead of six. That is the most frequent event in the system
+- Schedule lives in `pg_cron`, never in the workflow file, so the only written record is `robert-os-hub/STATUS.md`. Its line there had said "20:00 UTC" since before the 08-01 change and was corrected in the same pass
+
 ## 2026-08-02 (sekmadienis -- Chicago)
 
 ### fix(mirror): the snapshot stored what is held, never what is spendable -- v1.7.5
