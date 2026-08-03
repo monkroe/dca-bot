@@ -62,7 +62,7 @@ from datetime import datetime, timedelta, timezone
 
 import kraken_run as kr
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 
 # Kraken pages these 50 at a time and exposes the total as `count`.
 PAGE = 50
@@ -447,15 +447,36 @@ def notify_manual_fills() -> None:
             k = r.get("order_txid") or r["trade_id"]
             g = by_order.setdefault(k, {"pair": r.get("pair"), "side": r.get("side"),
                                         "vol": 0.0, "cost": 0.0, "fee": 0.0,
-                                        "when": r["time_utc"], "n": 0})
+                                        "when": r["time_utc"], "n": 0, "tids": []})
             g["vol"] += float(r.get("vol") or 0)
             g["cost"] += float(r.get("cost") or 0)
             g["fee"] += float(r.get("fee") or 0)
             g["when"] = max(g["when"], r["time_utc"])
             g["n"] += 1
+            g["tids"].append(r["trade_id"])
+
+        # WHICH CURRENCY THE FEE WAS ACTUALLY TAKEN IN, from the ledger.
+        # `kraken_trades.fee` is always stated in the quote currency, which is a
+        # conversion, not the event. On 2026-08-03 a KASUSDT buy was charged
+        # 47.57577 KAS -- the reason the balance rose by less than the order
+        # volume, and a number that appears nowhere in the trades table. The
+        # ledger row carrying a non-zero fee names the asset it left in.
+        fee_assets = _fee_assets_by_trade([t for g in by_order.values() for t in g["tids"]])
 
         for order_txid, g in by_order.items():
             avg = g["cost"] / g["vol"] if g["vol"] else 0.0
+            native: dict[str, float] = {}
+            for tid in g["tids"]:
+                for asset, amt in fee_assets.get(tid, {}).items():
+                    native[asset] = native.get(asset, 0.0) + amt
+            # Printed only when it says something the dollar figure does not:
+            # a fee in the quote currency is already what `Mokestis` shows.
+            quote = str(g["pair"] or "")
+            native_txt = "".join(
+                f"  ({amt:.5f} {asset})"
+                for asset, amt in native.items()
+                if amt > 0 and not quote.endswith(asset)
+            )
             when_ct = datetime.fromisoformat(str(g["when"]).replace("Z", "+00:00")) \
                 .astimezone(kr.CHICAGO_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
             verb = "PIRKIMAS" if str(g["side"]).lower() == "buy" else "PARDAVIMAS"
@@ -466,7 +487,7 @@ def notify_manual_fills() -> None:
                 f"Kiekis: {g['vol']:.8f}\n"
                 f"Kaina:  ${avg:.6f}\n"
                 f"Vertė:  ${g['cost']:.4f}\n"
-                f"Mokestis: ${g['fee']:.4f}"
+                f"Mokestis: ${g['fee']:.4f}{native_txt}"
                 f"{partial}\n\n"
                 f"Orderis: {order_txid}"
             ))
@@ -480,6 +501,35 @@ def notify_manual_fills() -> None:
             write_state("trade_notify", status="error", detail=str(e))
         except Exception:
             pass
+
+
+def _fee_assets_by_trade(trade_ids: list[str]) -> dict[str, dict[str, float]]:
+    """{trade_id: {asset: fee}} from `kraken_ledgers`, fee-bearing rows only.
+
+    The ledger's `refid` is the TRADE id, not the order id -- checked against
+    2026-08-03, where one order produced two ledger rows sharing one refid, and
+    only the KAS side carried the fee.
+
+    Returns {} on any failure: the fill message is worth sending without this
+    detail, and a missing parenthesis must not cost the notification.
+    """
+    if not trade_ids:
+        return {}
+    try:
+        rows = kr.sb_get("kraken_ledgers", {
+            "refid": "in.(" + ",".join(sorted(set(trade_ids))) + ")",
+            "select": "refid,asset,fee",
+        }) or []
+    except Exception as e:
+        print(f"  {kr.ICONS['WARN']} fee-asset lookup skipped: {e}")
+        return {}
+    out: dict[str, dict[str, float]] = {}
+    for r in rows:
+        fee = float(r.get("fee") or 0)
+        if fee <= 0:
+            continue
+        out.setdefault(r["refid"], {})[r.get("asset") or "?"] = fee
+    return out
 
 
 def sb_get_max_trade_time() -> str | None:
