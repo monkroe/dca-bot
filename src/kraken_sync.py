@@ -215,7 +215,54 @@ def sync_balances() -> int:
         print(f"    {r['asset']:8s} {r['balance']}{held}")
     write_state("balances", last_time_utc=now, status="ok", rows_seen=len(rows))
     print(f"  {kr.ICONS['OK']} {len(rows)} asset(s)")
+    maybe_warn_low_balance(balances)
     return len(rows)
+
+
+def maybe_warn_low_balance(balances) -> None:
+    """The ONE low-balance warning, sent from the EVENING run only.
+
+    WHY HERE AND NOT IN THE TRADING RUN. The warning used to fire in the buy
+    preflight, four minutes before the purchase, reporting the balance about to
+    be spent. Useless twice over: the number was wrong by one buy, and four
+    minutes is not time to move money.
+
+    WHY THE EVENING AND NOT MIDDAY. Measured over July's 23 shift payouts: 89%
+    of the money by value arrives after 16:00. A midday warning asks Roberto to
+    top up out of income he has not earned yet. The evening run lands after the
+    day's payouts and roughly nine hours before the next buy window -- the last
+    point at which a transfer can still change tomorrow's outcome.
+
+    THE HOUR GUARD IS THE WHOLE DEDUPLICATION. `kraken_sync` runs three times a
+    day; only the late one warns, so there is no day key to keep and no way for
+    three callers to send three copies of the same sentence. Written as an hour
+    range rather than an exact hour because the pg_cron schedule is UTC and
+    drifts an hour with DST -- 21:00 CST and 22:00 CDT both satisfy it.
+
+    NEVER RAISES. A warning is telemetry; the mirror must not fail because of it.
+    """
+    try:
+        # kr.CHICAGO_TZ, not a second ZoneInfo built here: one definition of the
+        # trading timezone, in the module that owns the trading day.
+        hour_ct = datetime.now(timezone.utc).astimezone(kr.CHICAGO_TZ).hour
+        if hour_ct < 20:
+            return
+        row = (balances or {}).get("ZUSD")
+        if isinstance(row, dict):
+            total = float(row.get("balance") or 0)
+            held = float(row.get("hold_trade") or 0)
+        else:
+            total, held = float(row or 0), 0.0
+        spendable = max(total - held, 0.0)
+
+        orders = kr.sb_get("dca_orders", {"enabled": "eq.true",
+                                          "select": "base_quote_amount,bonus_quote_amount"})
+        burn = sum(float(o.get("base_quote_amount") or 0)
+                   + float(o.get("bonus_quote_amount") or 0) for o in (orders or []))
+        settings = (kr.sb_get("dca_settings", {"select": "low_balance_warn_days"}) or [{}])[0]
+        kr.warn_if_low_balance(spendable, burn, settings)
+    except Exception as e:
+        print(f"  {kr.ICONS['WARN']} low-balance check skipped: {e}")
 
 
 def sync_open_orders() -> int:

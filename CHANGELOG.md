@@ -4,6 +4,18 @@ Conventions: dates are **Chicago** time (the bot's trading timezone); a "vakaras
 
 History before 2026-07-18 (Phase 1 -- Kraken + Strike execution, notifications, reconciliation, impact/all-in bps telemetry) is in `git log`; this changelog starts at Phase 2.
 
+## 2026-08-03 (pirmadienis -- Chicago)
+
+### fix(notify): the low-balance warning named the money it was about to spend -- v1.7.6
+- It fired in the buy preflight, four minutes before the purchase. On 08-03 it reported enough for roughly one more day; the answer that mattered, after that morning's fill, was **zero more buys**. Roberto found it by comparing the message against his own account, not from any check
+- Useless twice over: the number was wrong by exactly one buy, and four minutes is not enough time to move money. Removed from the preflight entirely
+- **The number now appears where it is true.** The FILL notification gained one line -- `Liko: <balance> (N pirkimų)` -- costing no new message, because it lands where Roberto is already reading. The COUNT is the point: a bare balance does not say the next buy fails, and `(0 pirkimų)` does
+- **The warning moved to the EVENING run of `kraken_sync`**, roughly nine hours before the next buy window. Measured reason for the evening rather than midday: of July's 23 shift payouts, **89% by value arrived after 16:00**, so a midday warning asks for a top-up out of income that does not exist yet. The evening is the last point at which a transfer still changes tomorrow's outcome
+- **Escalation, because the old message read identically at 4.9 days and at 0.2 days.** Below one day it is not "running low", it is a scheduled failure with a time on it, and it now says so: `RYTOJ DCA PIRKIMAS NEPAVYKS`
+- **One warning path, so no day key is needed.** Three callers would have sent three messages -- two of them identical -- and a warning that repeats stops being read. The hour guard (`>= 20:00` Chicago) is the whole deduplication, written as a range rather than an exact hour because the pg_cron schedule is UTC and drifts with DST
+- `_buys_word` is tested (20 assertions): the Lithuanian plural has three branches and two exceptions, and it is wrong in a way nobody reports -- "0 pirkimas" is not broken, only foreign, and gets read past
+- Caught while writing it, by a mechanical name check rather than by review: the evening guard first used `ZoneInfo` without importing it. It compiled, and would have raised `NameError` inside a `try` that swallows -- a warning silently never sent. Now uses `kr.CHICAGO_TZ`, the single definition that already exists
+
 ## 2026-08-02 (sekmadienis -- Chicago)
 
 ### fix(mirror): the snapshot stored what is held, never what is spendable -- v1.7.5

@@ -50,7 +50,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from ohlc import build_daily_metrics
 
-VERSION = "1.7.5"
+VERSION = "1.7.6"
 
 # ═══════════════════════════════════════════════════════════════
 #  ICONS — single source of truth for all UI symbols
@@ -852,14 +852,27 @@ def warn_if_low_balance(usd_balance: float, daily_burn: float, settings: dict) -
     if days_left >= threshold:
         return
     print(f"  {ICONS['WARN']} Low balance: ${usd_balance:.2f} = ~{days_left:.1f} days of buys")
+
+    # ESCALATION, because the old message read identically at 4.9 days and at
+    # 0.2 days. A fraction below one is not "running low", it is a scheduled
+    # failure with a time on it, and it has to be said that way or it gets
+    # skimmed like every other warning that cried the same wolf yesterday.
+    if days_left < 1:
+        headline = "RYTOJ DCA PIRKIMAS NEPAVYKS"
+        tail = (f"Reikia bent ${daily_burn:.2f} Kraken sąskaitoje iki rytojaus ryto.\n"
+                f"Praleisti pirkimai atgaline data NEVYKDOMI.")
+    else:
+        headline = "Dėmesio: senka DCA lėšų likutis"
+        tail = "Prašome papildyti sąskaitą. Praleisti DCA pirkimai atgaline data nevykdomi."
+
     tg_send(msg_warn(
-        "Dėmesio: senka DCA lėšų likutis",
+        headline,
         f"\n"
         f"• Kraken USD: ${usd_balance:.2f}\n"
         f"• Dienos biudžetas: ${daily_burn:.2f}\n"
         f"• Likutis pirkimams: ~{days_left:.1f} d. (riba – {threshold:.0f} d.)\n"
         f"\n"
-        f"Prašome papildyti sąskaitą. Praleisti DCA pirkimai atgaline data nevykdomi."
+        f"{tail}"
     ))
 
 
@@ -899,6 +912,44 @@ def _pair_from_cl_ord_id(cl_ord_id: str) -> str:
     except Exception:
         pass
     return "?"
+
+
+def _buys_word(n: int) -> str:
+    """Lithuanian plural for `pirkimas`. 1 -> pirkimas, 2-9 -> pirkimai, else pirkimų."""
+    if n % 10 == 1 and n % 100 != 11:
+        return "pirkimas"
+    if 2 <= n % 10 <= 9 and not 11 <= n % 100 <= 19:
+        return "pirkimai"
+    return "pirkimų"
+
+
+def _remaining_after_buy_line() -> str:
+    """What is ACTUALLY left, read after the fill, for the fill notification.
+
+    This is where the low-balance number belongs. The preflight used to report
+    it four minutes BEFORE the buy, so it named the money about to be spent --
+    on 2026-08-03 it said $11.66 while the answer that mattered was $1.66.
+
+    The count is the part worth reading: "$1.66 (0 pirkimų)" says the next buy
+    fails, which "$1.66" alone does not.
+
+    RETURNS "" ON ANY FAILURE. A fill notification must never depend on a second
+    API call succeeding -- the buy already happened and the message about it is
+    more important than the extra line.
+    """
+    try:
+        avail, _held, _src = check_balance_usd()
+        rows = sb_get("dca_orders", {"enabled": "eq.true",
+                                     "select": "base_quote_amount,bonus_quote_amount"})
+        burn = sum(float(r.get("base_quote_amount") or 0)
+                   + float(r.get("bonus_quote_amount") or 0) for r in (rows or []))
+        if burn <= 0:
+            return f"\nLiko:   ${avail:.2f}"
+        n = int(avail // burn)
+        return f"\nLiko:   ${avail:.2f}  ({n} {_buys_word(n)})"
+    except Exception as e:
+        print(f"  {ICONS['WARN']} remaining-balance line skipped: {e}")
+        return ""
 
 
 def finalize_order(cl_ord_id: str, order_id: str, mid: float | None = None, ohlc_ctx: dict | None = None, label: str = "FILLED"):
@@ -1096,6 +1147,7 @@ def finalize_order(cl_ord_id: str, order_id: str, mid: float | None = None, ohlc
             f"Cost:   ${cost:.4f}\n"
             f"Fee:    ${fee:.4f}\n"
             f"Total:  ${all_in:.4f}"
+            f"{_remaining_after_buy_line()}"
             f"{market_block}"
         ))
 
@@ -2366,9 +2418,20 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
                     + (f"\nHeld in open orders: ${usd_held:.2f}" if usd_held else "")
                 ))
                 return {"pair": pair, "status": "skipped_insufficient_funds"}
-        elif not dry_run:
-            # Balance still covers today -- warn if it will not cover many more.
-            warn_if_low_balance(usd_balance, daily_burn or total_target, settings)
+        # NO LOW-BALANCE WARNING HERE ANY MORE, and its absence is the fix.
+        #
+        # This is four minutes before the buy, so the figure it reported was the
+        # balance about to be spent. On 2026-08-03 it said "$11.66 = ~1.2 days"
+        # and the real answer after the fill was $1.66 = zero more buys. Roberto
+        # caught it by comparing the message with his own account.
+        #
+        # The number now appears twice, in the two places where it is true and
+        # useful: on the FILL notification (what is actually left, see
+        # `finalize_order`) and on the evening run of `kraken_sync`, roughly nine
+        # hours before the next buy, which is the last moment a top-up can still
+        # be made. Measured reason for the evening rather than midday: 89% of
+        # July's shift payouts by value landed after 16:00, so at 13:00 the money
+        # that would fund the top-up does not exist yet.
     except KrakenError as e:
         print(f"  {ICONS['WARN']} Balance check failed: {e} — continuing anyway")
 
