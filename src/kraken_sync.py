@@ -62,7 +62,7 @@ from datetime import datetime, timedelta, timezone
 
 import kraken_run as kr
 
-VERSION = "1.1.1"
+VERSION = "1.2.0"
 
 # Kraken pages these 50 at a time and exposes the total as `count`.
 PAGE = 50
@@ -376,6 +376,119 @@ def sync_trades() -> int:
     return seen
 
 
+def notify_manual_fills() -> None:
+    """Tell Roberto when an order HE placed by hand has filled.
+
+    THE GAP THIS CLOSES. On 2026-08-03 a limit order for the whole USDT balance
+    filled at 02:44. He found out from a conversation at 07:30, because nothing
+    in the system says anything about an order it did not place. The DCA
+    announces its own fills; a manual order announced nothing.
+
+    ITS OWN WATERMARK, deliberately not the `trades` one. That watermark is
+    rewound by WATERMARK_REWIND_MINUTES on every read, so trades already seen
+    come back on purpose -- correct for an upsert, and it would mean sending the
+    same message again on every run. `trade_notify` moves forward only.
+
+    THE FIRST RUN SENDS NOTHING. With no watermark it would announce every trade
+    in the account's history, which is how a new notification trains its reader
+    to mute it. It records the current position and stays quiet.
+
+    DCA FILLS ARE EXCLUDED by `order_txid`, checked against both execution
+    tables. The DCA already sends its own message and does it better -- with
+    impact, all-in bps and the OHLC bands, none of which are known here.
+
+    LAG IS REAL AND IS NOT HIDDEN: the sync runs at 08:00, 13:00 and 22:00, so
+    a fill can wait up to ten hours. That is the cost of not polling Kraken more
+    often, and it was chosen. The message therefore leads with the fill time,
+    not with the word "now".
+
+    NEVER RAISES.
+    """
+    try:
+        st = read_state("trade_notify")
+        last = st.get("last_time_utc")
+        if not last:
+            newest = sb_get_max_trade_time()
+            write_state("trade_notify", last_time_utc=newest or ts(time.time()),
+                        status="ok", detail="initialised, nothing sent")
+            print(f"  {kr.ICONS['OK']} trade_notify initialised (no messages on first run)")
+            return
+
+        rows = kr.sb_get("kraken_trades", {
+            "time_utc": f"gt.{last}",
+            "select": "trade_id,order_txid,pair,side,price,cost,fee,vol,time_utc",
+            "order": "time_utc.asc",
+        }) or []
+        if not rows:
+            write_state("trade_notify", status="ok", rows_seen=0)
+            return
+
+        txids = sorted({r.get("order_txid") for r in rows if r.get("order_txid")})
+        dca_txids: set[str] = set()
+        if txids:
+            in_list = "(" + ",".join(txids) + ")"
+            for table in ("dca_executions", "strike_dca_executions"):
+                got = kr.sb_get(table, {"order_id": f"in.{in_list}",
+                                        "select": "order_id"}) or []
+                dca_txids |= {g["order_id"] for g in got if g.get("order_id")}
+
+        manual = [r for r in rows if r.get("order_txid") not in dca_txids]
+        newest_ts = max(r["time_utc"] for r in rows)
+
+        if not manual:
+            write_state("trade_notify", last_time_utc=newest_ts, status="ok", rows_seen=0)
+            print(f"  {kr.ICONS['OK']} {len(rows)} new trade(s), all DCA — nothing to announce")
+            return
+
+        # Grouped by order: a partly filled limit order arrives as several
+        # trades, and three messages about one decision is noise.
+        by_order: dict[str, dict] = {}
+        for r in manual:
+            k = r.get("order_txid") or r["trade_id"]
+            g = by_order.setdefault(k, {"pair": r.get("pair"), "side": r.get("side"),
+                                        "vol": 0.0, "cost": 0.0, "fee": 0.0,
+                                        "when": r["time_utc"], "n": 0})
+            g["vol"] += float(r.get("vol") or 0)
+            g["cost"] += float(r.get("cost") or 0)
+            g["fee"] += float(r.get("fee") or 0)
+            g["when"] = max(g["when"], r["time_utc"])
+            g["n"] += 1
+
+        for order_txid, g in by_order.items():
+            avg = g["cost"] / g["vol"] if g["vol"] else 0.0
+            when_ct = datetime.fromisoformat(str(g["when"]).replace("Z", "+00:00")) \
+                .astimezone(kr.CHICAGO_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
+            verb = "PIRKIMAS" if str(g["side"]).lower() == "buy" else "PARDAVIMAS"
+            partial = f"\nDalys:  {g['n']}" if g["n"] > 1 else ""
+            kr.tg_send(kr.msg_ok(
+                f"Rankinis {verb} įvykdytas — {g['pair']}",
+                f"{when_ct}\n\n"
+                f"Kiekis: {g['vol']:.8f}\n"
+                f"Kaina:  ${avg:.6f}\n"
+                f"Vertė:  ${g['cost']:.4f}\n"
+                f"Mokestis: ${g['fee']:.4f}"
+                f"{partial}\n\n"
+                f"Orderis: {order_txid}"
+            ))
+            print(f"  {kr.ICONS['OK']} announced manual fill {order_txid}")
+
+        write_state("trade_notify", last_time_utc=newest_ts, status="ok",
+                    rows_seen=len(by_order))
+    except Exception as e:
+        print(f"  {kr.ICONS['WARN']} manual-fill notify skipped: {e}")
+        try:
+            write_state("trade_notify", status="error", detail=str(e))
+        except Exception:
+            pass
+
+
+def sb_get_max_trade_time() -> str | None:
+    """Newest trade already in the mirror, for initialising the notify watermark."""
+    rows = kr.sb_get("kraken_trades", {"select": "time_utc", "order": "time_utc.desc",
+                                       "limit": "1"}) or []
+    return rows[0]["time_utc"] if rows else None
+
+
 def sync_ledgers() -> int:
     """Every movement. Trades alone cannot answer where an asset went: a
     withdrawal to a cold wallet is not a trade, and the disposal this whole
@@ -442,6 +555,11 @@ def main() -> int:
         except Exception as e:
             print(f"  {kr.ICONS['FAIL']} {name} crashed: {e}")
             outcomes[name] = -1
+
+    # AFTER the sources, never inside the loop: this announces what the mirror
+    # just learned, so it must not run before `trades` has written it, and a
+    # failure here must not colour the sync's own outcome.
+    notify_manual_fills()
 
     # Success is judged on the RECORDED STATUS, not the row count. A denied
     # source catches its own error and returns 0 rows, which is
