@@ -26,9 +26,9 @@ def t_code_extraction(r):
 
 
 def t_translation(r):
-    L = kr.kraken_error_lt
-    r.check("the 07-30 one", L(REAL), "nepakanka lėšų")
-    r.check("case insensitive", L("eorder:insufficient funds"), "nepakanka lėšų")
+    L = kr.kraken_error_en
+    r.check("the 07-30 one", L(REAL), "insufficient funds")
+    r.check("case insensitive", L("eorder:insufficient funds"), "insufficient funds")
     # An unknown code must NOT be translated into something plausible.
     r.check("unknown code", L("EOrder:Something New"), None)
     r.check("not a kraken error", L("Connection timed out"), None)
@@ -38,12 +38,12 @@ def t_message_shape(r):
     # Assert on what Telegram actually receives, not on the intermediate form.
     lines = kr._tg_html(kr.msg_exec_fail(
         "2026-07-30", "KASUSD", "Nepavyko pateikti pavedimo.", REAL)).split("\n")
-    r.check_true("titled", lines[0].endswith("<b>DCA KLAIDA</b>"))
+    r.check_true("titled", lines[0].endswith("<b>DCA ERROR</b>"))
     r.check("date and pair", lines[1], "2026-07-30 | KAS/USD")
     r.check("what was attempted", lines[2], "Nepavyko pateikti pavedimo.")
-    r.check("cause in Lithuanian", lines[3], "Priežastis: nepakanka lėšų")
+    r.check("cause named", lines[3], "Cause: insufficient funds")
     r.check("blank line separates the debug block", lines[4], "")
-    r.check("block is labelled", lines[5], "Kraken atsakymas:")
+    r.check("block is labelled", lines[5], "Kraken replied:")
     r.check("original, in monospace", lines[6], "<code>EOrder:Insufficient funds</code>")
 
 
@@ -51,7 +51,7 @@ def t_unknown_error_keeps_the_original(r):
     # THE property: nothing is dropped and nothing is guessed.
     weird = "urlopen error [Errno 110] Connection timed out"
     m = kr.msg_exec_fail("2026-07-30", "KASUSD", "Nepavyko pateikti pavedimo.", weird)
-    r.check_true("no invented cause", "Priežastis: žr. Kraken atsakymą žemiau." in m)
+    r.check_true("no invented cause", "Cause: see Kraken's reply below." in m)
     r.check_true("original text survives verbatim", weird in kr._tg_html(m))
 
 
@@ -60,31 +60,33 @@ def t_empty_error_still_sends(r):
     # that anything went wrong.
     for bad in ("", None, "   "):
         m = kr._tg_html(kr.msg_exec_fail("2026-07-30", "KASUSD", "Nepavyko.", bad))
-        r.check_true(f"{bad!r} still renders", "<code>(be teksto)</code>" in m)
+        r.check_true(f"{bad!r} still renders", "<code>(no text)</code>" in m)
 
 
-def t_lithuanian_writing_rules(r):
-    # Roberto's two standing rules for anything he reads on the phone.
+def t_no_lithuanian_left_in_the_error_family(r):
+    # These messages were Lithuanian until 2026-08-04 and are now English, like
+    # every other message the bot sends. The check is on the CHARACTER SET
+    # rather than on a word list: a list only catches the words someone
+    # remembered, and half of what was here was Lithuanian written WITHOUT
+    # diacritics, which no diacritic test can see.
+    lithuanian = set("ąčęėįšųūžĄČĘĖĮŠŲŪŽ")
+    offenders = [v for v in kr.KRAKEN_ERROR_EN.values()
+                 if set(v) & lithuanian]
+    r.check("no Lithuanian in the table", offenders, [])
     for err in (REAL, "EAPI:Rate limit exceeded", "EGeneral:Permission denied",
                 "EService:Busy", "totally unknown"):
         m = kr._tg_html(kr.msg_exec_fail("2026-07-30", "KASUSD",
-                                         "Nepavyko pateikti pavedimo.", err))
+                                         "Could not place the order.", err))
         r.check(f"no em dash ({err[:18]})", "—" in m, False)
-    # Every translation carries its diacritics: a Lithuanian word stripped of
-    # them is the specific thing he asked never to see.
-    bare = [v for v in kr.KRAKEN_ERROR_LT.values()
-            if any(w in v.split() for w in
-                   ("lesu", "uzraktas", "virsytas", "truksta", "mazesne", "uzimtas",
-                    "uzklausu", "orderiu", "leidimu", "minimalu", "orderi"))]
-    r.check("no undiacriticed Lithuanian", bare, [])
+        r.check(f"no Lithuanian ({err[:18]})", bool(set(m) & lithuanian), False)
 
 
 def t_html_is_escaped_inside_the_block(r):
     # The block shows text we did not write. It must not be able to inject
     # markup into a message Telegram parses as HTML.
-    m = kr.msg_exec_fail("2026-07-30", "KASUSD", "Nepavyko.", "<b>fake</b> & <i>tags</i>")
+    m = kr.msg_exec_fail("2026-07-30", "KASUSD", "Failed.", "<b>fake</b> & <i>tags</i>")
     sent = kr._tg_html(m)
-    r.check_true("our own bold survives", "<b>DCA KLAIDA</b>" in sent)
+    r.check_true("our own bold survives", "<b>DCA ERROR</b>" in sent)
     r.check_true("our own code tag survives", "<code>" in sent)
     r.check("injected bold is neutralised", "<b>fake</b>" in sent, False)
     r.check_true("injected bold is shown as text", "&lt;b&gt;fake&lt;/b&gt;" in sent)
@@ -97,7 +99,7 @@ TESTS = [
     ("message shape", t_message_shape),
     ("unknown error keeps the original", t_unknown_error_keeps_the_original),
     ("empty error still sends", t_empty_error_still_sends),
-    ("Lithuanian writing rules", t_lithuanian_writing_rules),
+    ("no Lithuanian left in the error family", t_no_lithuanian_left_in_the_error_family),
     ("html escaped inside the block", t_html_is_escaped_inside_the_block),
 ]
 

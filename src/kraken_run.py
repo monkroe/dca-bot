@@ -50,7 +50,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from ohlc import build_daily_metrics
 
-VERSION = "1.7.9"
+VERSION = "1.8.0"
 
 # ═══════════════════════════════════════════════════════════════
 #  ICONS — single source of truth for all UI symbols
@@ -509,22 +509,22 @@ def pair_label(pair: str) -> str:
 # Nothing is dropped -- if a code has no translation, the sentence says to read
 # the block rather than inventing a cause.
 
-KRAKEN_ERROR_LT = {
-    "eorder:insufficient funds":     "nepakanka lėšų",
-    "eorder:order minimum not met":  "suma mažesnė už minimalų orderį",
-    "eorder:invalid price":          "netinkama kaina",
-    "eorder:invalid volume":         "netinkamas kiekis",
-    "eorder:rate limit exceeded":    "viršytas orderių limitas",
-    "eapi:rate limit exceeded":      "viršytas užklausų limitas",
-    "eapi:invalid nonce":            "netinkamas nonce (raktas naudojamas lygiagrečiai)",
-    "eapi:invalid key":              "netinkamas API raktas",
-    "egeneral:permission denied":    "raktui trūksta leidimų",
-    "egeneral:temporary lockout":    "laikinas Kraken užraktas",
-    "egeneral:invalid arguments":    "netinkami užklausos parametrai",
-    "eservice:unavailable":          "Kraken paslauga neprieinama",
-    "eservice:busy":                 "Kraken serveris užimtas",
-    "eorder:cannot open position":   "pozicijos atidaryti negalima",
-    "eorder:post only order":        "post-only orderis atmestas",
+KRAKEN_ERROR_EN = {
+    "eorder:insufficient funds":     "insufficient funds",
+    "eorder:order minimum not met":  "amount below the minimum order",
+    "eorder:invalid price":          "invalid price",
+    "eorder:invalid volume":         "invalid volume",
+    "eorder:rate limit exceeded":    "order rate limit exceeded",
+    "eapi:rate limit exceeded":      "API rate limit exceeded",
+    "eapi:invalid nonce":            "invalid nonce (key used concurrently)",
+    "eapi:invalid key":              "invalid API key",
+    "egeneral:permission denied":    "key lacks the required permission",
+    "egeneral:temporary lockout":    "temporary Kraken lockout",
+    "egeneral:invalid arguments":    "invalid request arguments",
+    "eservice:unavailable":          "Kraken service unavailable",
+    "eservice:busy":                 "Kraken server busy",
+    "eorder:cannot open position":   "cannot open position",
+    "eorder:post only order":        "post-only order rejected",
 }
 
 # Anchored on the real Kraken error CLASSES rather than "E<word>:". The loose
@@ -550,25 +550,25 @@ def kraken_error_code(error) -> str | None:
     return m.group(0).strip().rstrip("'\"]") if m else None
 
 
-def kraken_error_lt(error) -> str | None:
+def kraken_error_en(error) -> str | None:
     """PURE. Lithuanian cause, or None when we do not have one for this code."""
     code = kraken_error_code(error)
     if not code:
         return None
-    return KRAKEN_ERROR_LT.get(code.lower())
+    return KRAKEN_ERROR_EN.get(code.lower())
 
 
 def msg_exec_fail(trade_date: str, pair: str, action: str, error) -> str:
     """The failure notification: sentence first, Kraken's own words below."""
-    cause = kraken_error_lt(error)
-    code = kraken_error_code(error) or str(error or "").strip() or "(be teksto)"
+    cause = kraken_error_en(error)
+    code = kraken_error_code(error) or str(error or "").strip() or "(no text)"
     lines = [
-        f"{ICONS['FAIL']} {B_ON}DCA KLAIDA{B_OFF}",
+        f"{ICONS['FAIL']} {B_ON}DCA ERROR{B_OFF}",
         f"{trade_date} | {pair_label(pair)}",
         action,
-        f"Priežastis: {cause}" if cause else "Priežastis: žr. Kraken atsakymą žemiau.",
+        f"Cause: {cause}" if cause else "Cause: see Kraken's reply below.",
         "",
-        "Kraken atsakymas:",
+        "Kraken replied:",
         f"{CODE_ON}{code}{CODE_OFF}",
     ]
     return "\n".join(lines)
@@ -1466,7 +1466,7 @@ def _mark_manual_required(row: dict, note: str):
         "DCA MANUAL REQUIRED",
         f"{row['trade_date_chicago']} | {row['pair']}\n"
         f"order_id: {row.get('order_id') or '?'}\n{note}\n"
-        f"Automatika sustabdyta siam ivykiui. Patikrink orderi Kraken'e ranka."
+        f"Automation stopped for this event. Check the order on Kraken by hand."
     ))
 
 
@@ -1570,8 +1570,8 @@ def _fallback_decision(row: dict, settings: dict, user_id: str, window_end, dry_
         tg_send(msg_warn(
             "DCA PARTIAL",
             f"{trade_date} | {pair}\n"
-            f"Maker lega baigesi uz I6 ribos — fallback nekuriamas.\n"
-            f"Ivykdyta: ${spent:.4f} is ${total_target:.2f}"
+            f"Maker leg ended past the I6 deadline, no fallback created.\n"
+            f"Executed: ${spent:.4f} of ${total_target:.2f}"
         ))
         return
 
@@ -1597,8 +1597,8 @@ def _fallback_decision(row: dict, settings: dict, user_id: str, window_end, dry_
             tg_send(msg_warn(
                 "DCA PARTIAL",
                 f"{trade_date} | {pair}\n"
-                f"Fallback skip: mid {detail} virs {label} cap.\n"
-                f"Ivykdyta: ${spent:.4f} is ${total_target:.2f}"
+                f"Fallback skip: mid {detail} above the {label} cap.\n"
+                f"Executed: ${spent:.4f} of ${total_target:.2f}"
             ))
             return
 
@@ -1622,8 +1622,8 @@ def _fallback_decision(row: dict, settings: dict, user_id: str, window_end, dry_
         tg_send(msg_warn(
             "DCA PARTIAL",
             f"{trade_date} | {pair}\n"
-            f"Likutis ${b_rem:.4f} < min orderis — diena priimta daline apimtimi.\n"
-            f"Ivykdyta: ${spent:.4f} is ${total_target:.2f}"
+            f"Remainder ${b_rem:.4f} < min order, day accepted as partial.\n"
+            f"Executed: ${spent:.4f} of ${total_target:.2f}"
         ))
         return
 
@@ -1721,7 +1721,7 @@ def _fallback_decision(row: dict, settings: dict, user_id: str, window_end, dry_
             "raw": _failure_raw(fb_params, e, leg="fallback"),
         })
         mark("fallback_failed_kraken")
-        tg_send(msg_exec_fail(trade_date, pair, "Nepavyko pateikti atsarginio pavedimo.", e))
+        tg_send(msg_exec_fail(trade_date, pair, "Could not place the fallback order.", e))
         return
 
     mark("fallback_created")
@@ -2207,7 +2207,7 @@ def _maybe_repeg(row: dict, o: dict, settings: dict, user_id: str, window_end) -
 
     # MVP: zero-fill only (vol_exec from the QueryOrders result we already have)
     if float(o.get("vol_exec", 0) or 0) > 0:
-        log_repeg_probe(row, "not_evaluated", "partial fill — MVP re-pegs zero-fill legs only")
+        log_repeg_probe(row, "not_evaluated", "partial fill, MVP re-pegs zero-fill legs only")
         return False
 
     cl = row["cl_ord_id"]
@@ -2421,7 +2421,7 @@ def run_maker_inspection(settings: dict, user_id: str, now_chicago):
         oid = row.get("order_id")
         if not oid:
             if now_chicago > ttl_at:
-                _mark_manual_required(row, "limit_open be order_id, TTL virsytas")
+                _mark_manual_required(row, "limit_open with no order_id, TTL exceeded")
             continue
 
         try:
@@ -2433,7 +2433,7 @@ def run_maker_inspection(settings: dict, user_id: str, now_chicago):
 
         if o is None:
             if now_chicago > ttl_at:
-                _mark_manual_required(row, f"orderis {oid} neuzklausiamas, TTL virsytas")
+                _mark_manual_required(row, f"order {oid} not queryable, TTL exceeded")
             continue
 
         st = o.get("status", "")
@@ -2673,7 +2673,7 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
         print(f"  Min order: {pair_info['ordermin']} | Lot decimals: {pair_info['lot_decimals']}")
     except KrakenError as e:
         reason = f"AssetPairs lookup failed: {e}"
-        fail_action = "Nepavyko gauti poros duomenų iš Kraken."
+        fail_action = "Could not fetch pair data from Kraken."
         print(f"  {ICONS['FAIL']} {reason}")
         update_execution({
             "status": "failed_kraken",
@@ -2748,7 +2748,7 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
                     "execution_finished_at": datetime.now(timezone.utc).isoformat(),
                     **cap_cols,
                 })
-                tg_send(f"{ICONS['SKIP']} {pair.replace('USD','')} +{pct_over:.2f}% virš cap – skip")
+                tg_send(f"{ICONS['SKIP']} {pair.replace('USD','')} +{pct_over:.2f}% above cap - skip")
                 return {"pair": pair, "status": "skipped_above_cap"}
             print(f"  {ICONS['OK']} Below cap — proceeding")
             update_execution(cap_cols)
@@ -2759,7 +2759,7 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
     price_ref = ticker["bid"] if maker else ticker["ask"]
     if not price_ref or price_ref <= 0:
         reason = f"No valid {'BID' if maker else 'ASK'} price – cannot compute base volume"
-        fail_action = "Nepavyko apskaičiuoti kiekio: nėra galiojančios kainos."
+        fail_action = "Could not compute volume: no valid price."
         print(f"  {ICONS['FAIL']} {reason}")
         update_execution({
             "status": "failed_kraken",
@@ -2945,7 +2945,7 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
                                     held_usd=usd_held, balance_source=bal_source,
                                     open_orders=_open_orders_digest()),
             })
-            tg_send(msg_exec_fail(today_chicago, pair, "Nepavyko pateikti pavedimo.", e))
+            tg_send(msg_exec_fail(today_chicago, pair, "Could not place the order.", e))
             return {"pair": pair, "status": "failed_kraken"}
 
     # ── Execute ───────────────────────────────────────────────
@@ -3016,7 +3016,7 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
                                 held_usd=usd_held, balance_source=bal_source,
                                 open_orders=_open_orders_digest()),
         })
-        tg_send(msg_exec_fail(today_chicago, pair, "Nepavyko pateikti pavedimo.", e))
+        tg_send(msg_exec_fail(today_chicago, pair, "Could not place the order.", e))
         return {"pair": pair, "status": "failed_kraken"}
 
     # ── Finalize ──────────────────────────────────────────────
@@ -3142,7 +3142,7 @@ def run_reconciliation(user_id: str):
                     )
                     tg_send(msg_recon(
                         "DCA RECONCILIATION",
-                        f"{row['trade_date_chicago']} | {row['pair']}\nClaimed but never placed — marked failed"
+                        f"{row['trade_date_chicago']} | {row['pair']}\nClaimed but never placed, marked failed"
                     ))
             else:
                 print("    Not found in Kraken — marking failed")
@@ -3157,7 +3157,7 @@ def run_reconciliation(user_id: str):
                 )
                 tg_send(msg_recon(
                     "DCA RECONCILIATION",
-                    f"{row['trade_date_chicago']} | {row['pair']}\nClaimed but never placed — marked failed"
+                    f"{row['trade_date_chicago']} | {row['pair']}\nClaimed but never placed, marked failed"
                 ))
 
         elif row["status"] == "placed" and order_id:

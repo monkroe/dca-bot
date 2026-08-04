@@ -62,7 +62,7 @@ from datetime import datetime, timedelta, timezone
 
 import kraken_run as kr
 
-VERSION = "1.2.2"
+VERSION = "1.2.3"
 
 # What THIS run fetched, handed to `maybe_warn_low_balance` after the source
 # loop. Not read from the mirror tables on purpose: those hold every snapshot
@@ -508,7 +508,7 @@ def notify_manual_fills() -> None:
                 for asset, amt in fee_assets.get(tid, {}).items():
                     native[asset] = native.get(asset, 0.0) + amt
             # Printed only when it says something the dollar figure does not:
-            # a fee in the quote currency is already what `Mokestis` shows.
+            # a fee in the quote currency is already what `Fee` shows.
             quote = str(g["pair"] or "")
             native_txt = "".join(
                 f"  ({amt:.5f} {asset})"
@@ -517,17 +517,17 @@ def notify_manual_fills() -> None:
             )
             when_ct = datetime.fromisoformat(str(g["when"]).replace("Z", "+00:00")) \
                 .astimezone(kr.CHICAGO_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
-            verb = "PIRKIMAS" if str(g["side"]).lower() == "buy" else "PARDAVIMAS"
-            partial = f"\nDalys:  {g['n']}" if g["n"] > 1 else ""
+            verb = "BUY" if str(g["side"]).lower() == "buy" else "SELL"
+            partial = f"\nParts:  {g['n']}" if g["n"] > 1 else ""
             kr.tg_send(kr.msg_ok(
-                f"Rankinis {verb} įvykdytas — {g['pair']}",
+                f"Manual {verb} filled: {g['pair']}",
                 f"{when_ct}\n\n"
-                f"Kiekis: {g['vol']:.8f}\n"
-                f"Kaina:  ${avg:.6f}\n"
-                f"Vertė:  ${g['cost']:.4f}\n"
-                f"Mokestis: ${g['fee']:.4f}{native_txt}"
+                f"Amount: {g['vol']:.8f}\n"
+                f"Price:  ${avg:.6f}\n"
+                f"Cost:   ${g['cost']:.4f}\n"
+                f"Fee:    ${g['fee']:.4f}{native_txt}"
                 f"{partial}\n\n"
-                f"Orderis: {order_txid}"
+                f"Order:  {order_txid}"
             ))
             print(f"  {kr.ICONS['OK']} announced manual fill {order_txid}")
 
