@@ -916,8 +916,23 @@ def low_balance_message(usd_balance: float, daily_burn: float, threshold: float,
         headline = "Dėmesio: senka DCA lėšų likutis"
         action = "Prašome papildyti sąskaitą."
         never = "Praleisti DCA pirkimai atgaline data nevykdomi."
-    if held > 0.005:
-        action += f" Arba atšauk orderį – jame guli ${held:.2f}."
+
+    # THE HELD MONEY IS MENTIONED AS A FACT, NEVER AS AN INSTRUCTION, AND ONLY
+    # WHEN IT WOULD ACTUALLY CHANGE THE OUTCOME.
+    #
+    # The first version of this line said "arba atšauk orderį" on every warning
+    # that had a hold. Roberto's objection killed it in one sentence: with
+    # enough money for the buy, there is nothing to fix, and a resting limit
+    # order is not a mistake to undo -- it is a deliberate position at a price
+    # he chose. Telling him to unwind it is the bot overriding a decision it
+    # was never asked about.
+    #
+    # So: only when the next buy is ALREADY going to fail, and only when the
+    # held amount would by itself cover it. Then it is not advice, it is
+    # information he cannot see from the app in one glance -- the money for
+    # tomorrow exists, and it is here. What to do about it stays his.
+    if days_left < 1 and held >= daily_burn:
+        action += f"\nOrderyje užšaldyta ${held:.2f} – jų pakaktų rytojaus pirkimui."
 
     return headline, "\n" + "\n".join(lines) + "\n\n" + action + "\n" + never
 

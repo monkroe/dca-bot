@@ -68,8 +68,10 @@ def test_message_names_the_order(t):
     t.check("free shown", "• Laisva pirkimams: $10.00" in body, True)
     # The number that used to be labelled "Kraken USD" must no longer be.
     t.check("no lying label", "• Kraken USD: $" in body, False)
-    # The second option Roberto actually had, and the message did not offer.
-    t.check("cancel offered", "atšauk orderį" in body, True)
+    # NO INSTRUCTION. There is enough for the buy; the resting order is a
+    # position Roberto chose, not a problem to fix.
+    t.check("no cancel advice", "atšauk" in body, False)
+    t.check("no would-cover line", "pakaktų" in body, False)
 
 
 def test_message_stays_short_when_nothing_is_held(t):
@@ -89,7 +91,6 @@ def test_held_without_orders_states_amount_only(t):
     _, body = kr.low_balance_message(10.0, 10.0, 5.0, total=20.0, held=10.0, holds=[])
     t.check("amount stated", "• Užšaldyta orderiuose: $10.00" in body, True)
     t.check("no invented order", "@" in body, False)
-    t.check("cancel still offered", "atšauk orderį" in body, True)
 
 
 def test_escalation_below_one_day(t):
@@ -98,6 +99,23 @@ def test_escalation_below_one_day(t):
     t.check("headline", headline, "RYTOJ DCA PIRKIMAS NEPAVYKS")
     t.check("says LAISVŲ", "LAISVŲ" in body, True)
     t.check("says never", "NEVYKDOMI" in body, True)
+
+
+def test_held_money_named_only_when_it_would_change_the_outcome(t):
+    # Tomorrow fails AND the held amount alone would cover it: worth saying,
+    # because the app does not show that in one glance. Still a fact, not an
+    # order to unwind the position.
+    _, body = kr.low_balance_message(4.0, 10.0, 5.0, total=24.0, held=20.0,
+                                     holds=kr.usd_holds([dict(REAL_ORDER, price=0.05, vol=400.0)]))
+    t.check("named", "Orderyje užšaldyta $20.00 – jų pakaktų rytojaus pirkimui." in body, True)
+    t.check("still no imperative", "atšauk" in body, False)
+
+
+def test_held_money_not_named_when_it_would_not_help(t):
+    # Tomorrow fails and the hold is too small to save it. Naming it would be
+    # a false lead: cancelling changes nothing, the money still is not there.
+    _, body = kr.low_balance_message(4.0, 10.0, 5.0, total=7.0, held=3.0, holds=[])
+    t.check("not named", "pakaktų" in body, False)
 
 
 def test_exactly_one_day_does_not_escalate(t):
@@ -133,6 +151,10 @@ if __name__ == "__main__":
         ("message stays short with no hold", test_message_stays_short_when_nothing_is_held),
         ("held without orders states amount only", test_held_without_orders_states_amount_only),
         ("escalation below one day", test_escalation_below_one_day),
+        ("held money named only when it changes the outcome",
+         test_held_money_named_only_when_it_would_change_the_outcome),
+        ("held money not named when it would not help",
+         test_held_money_not_named_when_it_would_not_help),
         ("exactly one day does not escalate", test_exactly_one_day_does_not_escalate),
         ("more than three orders summarised", test_more_than_three_orders_are_summarised),
         ("no em dash", test_no_em_dash_anywhere),
