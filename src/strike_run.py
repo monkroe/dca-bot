@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from ohlc import build_daily_metrics
 
-VERSION = "1.1.1-STRIKE"
+VERSION = "1.1.2-STRIKE"
 
 ICONS = {
     "OK":        "\u2705",
@@ -120,32 +120,60 @@ def strike_request(method, endpoint, body=None):
 #  TELEGRAM & FORMATTERS
 # ═══════════════════════════════════════════════════════════════
 
+# ── HTML escaping, ported from kraken_run ────────────────────────────
+#
+# Messages go out with `parse_mode: HTML` and NOTHING was escaped. Every
+# failure and reconciliation message interpolates an exception whose text comes
+# from Strike or from Python, and a single `<` in it makes Telegram reject the
+# whole message with HTTP 400. `tg_send` swallows that, so the alert that says
+# a trade could not be closed out would have vanished without a trace -- the
+# quiet-failure shape this repo keeps finding, in the one message that exists
+# to summon a human.
+#
+# The formatters emit SENTINELS rather than tags, and tags appear only after
+# escaping. The order is the whole point: escape first, and nothing carried in
+# from an exception can become markup afterwards. These two control characters
+# cannot occur in a Strike error or a pair name, so a tag can only originate in
+# a formatter below -- the allowlist is about ORIGIN, not spelling.
+B_ON, B_OFF = "\x00b\x01", "\x00/b\x01"
+
+_TG_TAGS = {B_ON: "<b>", B_OFF: "</b>"}
+
+
+def _tg_html(text):
+    """Escape everything, then turn our own markers into tags. PURE."""
+    t = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    for marker, tag in _TG_TAGS.items():
+        t = t.replace(marker, tag)
+    return t
+
+
 def tg_send(text):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         print(f"[TG skip] {text}")
         return
     try:
         url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-        data = json.dumps({"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"}).encode()
+        data = json.dumps({"chat_id": TG_CHAT_ID, "text": _tg_html(text), "parse_mode": "HTML"}).encode()
         req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
         urllib.request.urlopen(req, timeout=10)
     except Exception as e:
         print(f"[TG error] {e}")
 
 def msg_ok(title, body):
-    return f"{ICONS['OK']} <b>{title}</b>\n{body}"
+    return f"{ICONS['OK']} {B_ON}{title}{B_OFF}\n{body}"
 
 def msg_warn(title, body):
-    return f"{ICONS['WARN']} <b>{title}</b>\n{body}"
+    return f"{ICONS['WARN']} {B_ON}{title}{B_OFF}\n{body}"
 
 def msg_fail(title, body):
-    return f"{ICONS['FAIL']} <b>{title}</b>\n{body}"
+    return f"{ICONS['FAIL']} {B_ON}{title}{B_OFF}\n{body}"
 
 def msg_recon(title, body):
-    return f"{ICONS['RECON']} <b>{title}</b>\n{body}"
+    return f"{ICONS['RECON']} {B_ON}{title}{B_OFF}\n{body}"
 
 def msg_dryrun(title, body):
-    return f"{ICONS['DRYRUN']} <b>{title}</b>\n{body}"
+    return f"{ICONS['DRYRUN']} {B_ON}{title}{B_OFF}\n{body}"
 
 
 # ═══════════════════════════════════════════════════════════════

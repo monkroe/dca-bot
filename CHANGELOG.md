@@ -6,6 +6,12 @@ History before 2026-07-18 (Phase 1 -- Kraken + Strike execution, notifications, 
 
 ## 2026-08-04 (antradienis -- Chicago)
 
+### fix(strike): messages went out as HTML with nothing escaped -- `strike_run` v1.1.2-STRIKE
+- Every Strike message is sent with `parse_mode: HTML`, and the failure and reconciliation messages paste in an exception whose text comes from Strike or from Python. **A single `<` in it makes Telegram reject the whole message with HTTP 400**, and `tg_send` swallows the error -- so the alert saying a trade could not be closed out would have disappeared with no trace. Not markup rendering wrongly: the message never arriving. The same quiet-failure shape as `cron.job_run_details` reporting success for a statement that was only queued
+- `_tg_html` ported from `kraken_run`, sentinels and all. The formatters emit control-character markers instead of `<b>`, and tags appear only AFTER escaping -- so nothing carried in from an exception can become markup. The allowlist is about ORIGIN, not spelling: a title that merely looks like a tag is still content
+- **Order is the property being protected.** Escape first, then substitute. Reversed, the escaper would eat the tags it just produced and quietly do nothing -- the classic way this is written wrong, and invisible in the happy case
+- 18 assertions, including the `&`-before-`<` pass order and an enumeration of all five formatters. Enumerated rather than sampled: one formatter left with a literal `<b>` would keep working everywhere except in its own message. **First tests `strike_run.py` has ever had**
+
 ### fix(strike): a hand-typed timezone, a lost apostrophe, and the last Lithuanian messages -- `strike_run` v1.1.1-STRIKE
 - Found by checking whether the Strike path shared the Kraken messages' Lithuanian, which it did in two places. The language was the smallest of what turned up
 - **`strftime("... CST")` had the three letters typed by hand.** The conversion to `America/Chicago` was always correct and the zone label beside it was a constant, so from March to November it stamped a correct time with the wrong zone -- on the one Strike message that asks for money to be moved. Now `%Z`. The dry-run notice a few dozen lines below has used `%Z` since it was written: the file disagreed with itself, which is why no one reading either half would notice
