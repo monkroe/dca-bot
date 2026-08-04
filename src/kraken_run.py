@@ -50,7 +50,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from ohlc import build_daily_metrics
 
-VERSION = "1.7.7"
+VERSION = "1.7.8"
 
 # ═══════════════════════════════════════════════════════════════
 #  ICONS — single source of truth for all UI symbols
@@ -856,9 +856,28 @@ def usd_holds(order_rows) -> list[dict]:
         cost = vol_left * price
         if cost <= 0:
             continue
-        out.append({"cost": cost, "label": f"{vol_left:,.2f} {pair[:-3] or pair} @ {price:g}"})
+        # `label` is the warning's rendering and is frozen by its test. The raw
+        # parts ride along so a second caller can render differently without
+        # re-parsing a string that was built for someone else.
+        out.append({"cost": cost, "pair": pair, "price": price, "vol": vol_left,
+                    "label": f"{vol_left:,.2f} {pair[:-3] or pair} @ {price:g}"})
     out.sort(key=lambda h: h["cost"], reverse=True)
     return out
+
+
+def distance_to_market(price: float, mid: float) -> str:
+    """How far a resting limit sits from the market, signed, as a percent.
+
+    PURE. Returns "" rather than a number when either side is missing -- an
+    empty string drops the parenthetical, while a "0.0%" from a failed ticker
+    read would state that the order is about to fill.
+
+    The sign carries the meaning and replaces the words: a buy limit under the
+    market reads "-3.5%", which is the answer to "how far until it executes".
+    """
+    if not mid or mid <= 0 or not price or price <= 0:
+        return ""
+    return f"{(price - mid) / mid * 100:+.1f}%"
 
 
 def low_balance_message(usd_balance: float, daily_burn: float, threshold: float,
@@ -1036,13 +1055,76 @@ def _remaining_after_buy_line() -> str:
                                      "select": "base_quote_amount,bonus_quote_amount"})
         burn = sum(float(r.get("base_quote_amount") or 0)
                    + float(r.get("bonus_quote_amount") or 0) for r in (rows or []))
-        if burn <= 0:
-            return f"\nLiko:   ${avail:.2f}"
-        n = int(avail // burn)
-        return f"\nLiko:   ${avail:.2f}  ({n} {_buys_word(n)})"
+        # MONEY IN A RESTING ORDER IS STILL HIS MONEY. "Liko: $0.00" was true
+        # about spendable cash and read as an empty account: on 2026-08-04 the
+        # fill notification said $0.00 while $10.00 sat in a KASUSD limit order
+        # placed the evening before. The warning was taught to say this on
+        # 08-03; this path was not, which is the same one-fact-two-paths shape
+        # as the car wash fee.
+        if held > 0.005:
+            head = f"\nLiko:   ${avail:.2f} laisvi + ${held:.2f} rezerve"
+        elif burn <= 0:
+            head = f"\nLiko:   ${avail:.2f}"
+        else:
+            n = int(avail // burn)
+            head = f"\nLiko:   ${avail:.2f}  ({n} {_buys_word(n)})"
+        return head + _resting_orders_lines(held)
     except Exception as e:
         print(f"  {ICONS['WARN']} remaining-balance line skipped: {e}")
         return ""
+
+
+def _resting_orders_lines(held: float) -> str:
+    """Which orders hold the reserve, and how far each is from executing.
+
+    Only asked when `hold_trade` says something IS held -- otherwise this would
+    spend two API calls to print nothing.
+
+    RETURNS "" ON ANY FAILURE, and the reserve amount above survives without
+    it. OpenOrders is a separate key permission from Balance, so "cannot see
+    the orders" is a normal state and must degrade to naming the amount rather
+    than to naming nothing.
+    """
+    if held <= 0.005:
+        return ""
+    try:
+        # Read-only use of the row builder: user_id and snapshot_ts are the
+        # mirror's columns and nothing here writes a row.
+        holds = usd_holds(open_order_rows(kraken_private("OpenOrders"), "", ""))
+    except Exception as e:
+        print(f"  {ICONS['WARN']} resting-order lines skipped: {e}")
+        return ""
+
+    out = ""
+    for h in holds[:3]:
+        # Per PAIR, not one shared mid: two USD-quoted orders on different
+        # pairs would otherwise both be measured against whichever ticker was
+        # fetched last.
+        try:
+            mid = float(get_ticker_snapshot(h["pair"]).get("mid") or 0)
+        except Exception:
+            mid = 0.0
+        out += resting_order_line(h, mid)
+    if len(holds) > 3:
+        out += f"\n... ir dar {len(holds) - 3}"
+    return out
+
+
+def resting_order_line(hold: dict, mid: float | None) -> str:
+    """One resting order as the fill notification prints it. PURE.
+
+    Split out for the same reason `low_balance_message` was: the wording is the
+    part that gets read and the part that has been wrong, and it must be
+    checkable without a Kraken key.
+
+    Deliberately NOT reusing `hold["label"]`. That string belongs to the
+    warning, whose test pins it exactly; rendering both from the same string
+    would mean neither message can be reworded without disturbing the other.
+    """
+    symbol = str(hold["pair"])[:-3] or str(hold["pair"])
+    dist = distance_to_market(float(hold["price"]), float(mid or 0))
+    tail = f" ({dist})" if dist else ""
+    return f"\nOrderis: {float(hold['vol']):,.2f} {symbol} @ ${float(hold['price']):g}{tail}"
 
 
 def finalize_order(cl_ord_id: str, order_id: str, mid: float | None = None, ohlc_ctx: dict | None = None, label: str = "FILLED"):
