@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from ohlc import build_daily_metrics
 
-VERSION = "1.1.0-STRIKE"
+VERSION = "1.1.1-STRIKE"
 
 ICONS = {
     "OK":        "\u2705",
@@ -356,13 +356,20 @@ def execute_pair(order, settings, today_chicago, user_id, force=False):
             upd({"status": "skipped_insufficient_funds", "reason": reason, "skip_reason": "insufficient_funds",
                  "execution_finished_at": datetime.now(timezone.utc).isoformat()})
             
-            now_ct = datetime.now(timezone.utc).astimezone(ZoneInfo("America/Chicago")).strftime("%Y-%m-%d %H:%M:%S CST")
+            # %Z, not the literal "CST". The conversion was always right and the
+            # three letters after it were typed by hand, so from March to
+            # November this line stamped a correct time with the wrong zone --
+            # and it is the timestamp on the one Strike message that asks for
+            # money to be moved. The dry-run notice four dozen lines below has
+            # used %Z since it was written; this is the same file disagreeing
+            # with itself.
+            now_ct = datetime.now(timezone.utc).astimezone(ZoneInfo("America/Chicago")).strftime("%Y-%m-%d %H:%M:%S %Z")
             tg_send(msg_warn(
-                f"DCA {pair} LĖŠŲ TRŪKUMAS (Strike)",
+                f"STRIKE {pair} INSUFFICIENT FUNDS",
                 f"{now_ct}\n\n"
-                f"Reikia:   ${total_target:.2f}\n"
-                f"Balanse:  ${usd_balance:.2f}\n"
-                f"Trūksta:  ${missing:.2f}"
+                f"Needed:   ${total_target:.2f}\n"
+                f"Balance:  ${usd_balance:.2f}\n"
+                f"Missing:  ${missing:.2f}"
             ))
             return {"pair": pair, "status": "skipped_insufficient_funds"}
     except StrikeError as e:
@@ -406,7 +413,7 @@ def execute_pair(order, settings, today_chicago, user_id, force=False):
                 print(f"  {ICONS['SKIP']} {reason}")
                 upd({"status": "skipped_above_cap", "reason": reason, "skip_reason": "7d_cap",
                      "execution_finished_at": datetime.now(timezone.utc).isoformat()})
-                tg_send(f"{ICONS['SKIP']} STRIKE {pair.replace('USD','')} +{pct_over:.2f}% virš cap – skip")
+                tg_send(f"{ICONS['SKIP']} STRIKE {pair.replace('USD','')} +{pct_over:.2f}% above cap - skip")
                 return {"pair": pair, "status": "skipped_above_cap"}
             print(f"  {ICONS['OK']} Below cap — proceeding")
         else:
@@ -514,8 +521,12 @@ def run_reconciliation(user_id):
                     "reason": str(e),
                     "execution_finished_at": datetime.now(timezone.utc).isoformat(),
                 })
+                # "Cannot", not "Can't": the apostrophe was already lost once
+                # here, and this message is the one that says a trade could not
+                # be closed out. A word with nothing to strip cannot lose it
+                # again.
                 tg_send(msg_recon("STRIKE RECONCILIATION",
-                    f"{row['trade_date_chicago']} | {row['pair']}\nCan t finalize: {e}\nManual check required."))
+                    f"{row['trade_date_chicago']} | {row['pair']}\nCannot finalize: {e}\nManual check required."))
         else:
             # claimed but no quote_id — crash before quote was placed
             sb_update("strike_dca_executions", {"cl_ord_id": f"eq.{cl_id}"}, {

@@ -6,6 +6,14 @@ History before 2026-07-18 (Phase 1 -- Kraken + Strike execution, notifications, 
 
 ## 2026-08-04 (antradienis -- Chicago)
 
+### fix(strike): a hand-typed timezone, a lost apostrophe, and the last Lithuanian messages -- `strike_run` v1.1.1-STRIKE
+- Found by checking whether the Strike path shared the Kraken messages' Lithuanian, which it did in two places. The language was the smallest of what turned up
+- **`strftime("... CST")` had the three letters typed by hand.** The conversion to `America/Chicago` was always correct and the zone label beside it was a constant, so from March to November it stamped a correct time with the wrong zone -- on the one Strike message that asks for money to be moved. Now `%Z`. The dry-run notice a few dozen lines below has used `%Z` since it was written: the file disagreed with itself, which is why no one reading either half would notice
+- **`Can t finalize` -> `Cannot finalize`.** The apostrophe had already been stripped once in a message that reports a trade could not be closed out and demands a manual check. A word with nothing to strip cannot lose it again
+- `DCA {pair} LĖŠŲ TRŪKUMAS (Strike)` -> `STRIKE {pair} INSUFFICIENT FUNDS`, with `Needed / Balance / Missing`; the cap skip line now reads `above cap` . Same vocabulary as the Kraken messages
+- **Context, because it decides how much this is worth:** Strike is dormant. `strike_dca.yml` has no `cron`, only `workflow_dispatch`, and the last row in `strike_dca_executions` is dated 2026-04-25. So none of this has misfired recently -- and none of it would have been noticed before the next manual run either
+- NOT changed, recorded so it is a decision rather than an oversight: the Strike `FILLED` message still has no balance line at all, so it says nothing about what is left or committed after a buy. That is the whole of today's Kraken work, unported. Left alone deliberately -- the path is dormant and Roberto asked for three fixes, not for a port
+
 ### notify: both DCA messages now speak one language and one vocabulary -- v1.7.9
 - The evening warning was Lithuanian prose, the fill notification English fields, and after the reserve line landed in both they described the same three numbers with different words. Roberto rewrote both messages himself and chose English: the Kraken app he reconciles against is English too, so the terms now match the screen he checks them on
 - `Kraken USD iš viso` -> `Total USD balance`, `Užšaldyta orderyje` -> `Pending order`, `Laisva pirkimams` -> `Available for buys`, plus the escalation, the action and the never-retroactive line. Roberto's wording, not a translation of the old text
