@@ -4,6 +4,18 @@ Conventions: dates are **Chicago** time (the bot's trading timezone); a "vakaras
 
 History before 2026-07-18 (Phase 1 -- Kraken + Strike execution, notifications, reconciliation, impact/all-in bps telemetry) is in `git log`; this changelog starts at Phase 2.
 
+## 2026-08-04 (antradienis -- Chicago)
+
+### fix(notify): the low-balance warning knew about held money and never mentioned it -- v1.7.7, `kraken_sync` v1.2.2
+- The 08-03 22:00 warning printed a Kraken USD figure that was **half of what the app showed**, because the other half was resting in a KASUSD limit buy. The arithmetic was already right -- `maybe_warn_low_balance` subtracts `hold_trade` -- but the line was labelled `Kraken USD`, which is not what that number is. Roberto reconciles against the app, and a number that cannot be found there teaches him to distrust the one message that must not be skimmed
+- **Worse than the wording: the advice was wrong.** The message said "top up" while enough money for the next buy sat in an order he could cancel. That second option now appears, because the message finally names the order
+- This is the same blind spot as 2026-07-30 seen from the other side. `hold_trade` was added to the mirror *because* that morning's buy failed against money committed to a resting order -- and then the warning built on top of it never said the word "order"
+- The breakdown appears **only when something is held**. With nothing on hold, `Kraken USD` is true, and two lines reading zero would be noise
+- **Held amount and held reason are separate permissions.** `hold_trade` comes from `Balance`; the orders behind it come from `OpenOrders`, a separate Kraken key tick. A key with the first and not the second now states the amount and does not invent a reason
+- `usd_holds` filters to **USD-quoted buys only**. A `KASUSDT` buy holds USDT and would be a false explanation for a USD shortfall -- and on 08-02 one of each was open at the same time. `endswith("USD")` is the check; a prefix test would have blamed the wrong order. Sells are excluded (they hold the base asset), and `vol_exec` is subtracted so a partly filled order is counted at its remainder
+- **The warning moved out of `sync_balances` to after the whole source loop**, alongside `notify_manual_fills` and for the same reason: open orders are synced after balances, so asking from inside the balance step would have described the *previous* run's orders, up to nine hours stale. It now also refuses to fire at all if this run's balance fetch failed, rather than warning from the newest row in the table
+- Message text is a pure function (`low_balance_message`) so it can be read without sending it; 27 assertions covering the live 08-03 snapshot, the USDT decoy, sells, partial fills, the no-hold short form, the denied-permission form, escalation, and the exactly-1.0-day boundary that correctly did **not** escalate that evening
+
 ## 2026-08-03 (pirmadienis -- Chicago)
 
 ### fix(notify): the low-balance warning named the money it was about to spend -- v1.7.6

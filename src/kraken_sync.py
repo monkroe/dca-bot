@@ -62,7 +62,15 @@ from datetime import datetime, timedelta, timezone
 
 import kraken_run as kr
 
-VERSION = "1.2.1"
+VERSION = "1.2.2"
+
+# What THIS run fetched, handed to `maybe_warn_low_balance` after the source
+# loop. Not read from the mirror tables on purpose: those hold every snapshot
+# ever taken, and a warning built on the newest row cannot tell "written four
+# seconds ago" from "written before the endpoint started failing". None means
+# the source did not run or was denied, which is a different message from zero.
+_LAST_BALANCES = None
+_LAST_OPEN_ORDER_ROWS = None
 
 # Kraken pages these 50 at a time and exposes the total as `count`.
 PAGE = 50
@@ -215,11 +223,14 @@ def sync_balances() -> int:
         print(f"    {r['asset']:8s} {r['balance']}{held}")
     write_state("balances", last_time_utc=now, status="ok", rows_seen=len(rows))
     print(f"  {kr.ICONS['OK']} {len(rows)} asset(s)")
-    maybe_warn_low_balance(balances)
+    # Handed to the warning, which now runs AFTER the whole source loop --
+    # see `maybe_warn_low_balance`.
+    global _LAST_BALANCES
+    _LAST_BALANCES = balances
     return len(rows)
 
 
-def maybe_warn_low_balance(balances) -> None:
+def maybe_warn_low_balance() -> None:
     """The ONE low-balance warning, sent from the EVENING run only.
 
     WHY HERE AND NOT IN THE TRADING RUN. The warning used to fire in the buy
@@ -239,6 +250,17 @@ def maybe_warn_low_balance(balances) -> None:
     range rather than an exact hour because the pg_cron schedule is UTC and
     drifts an hour with DST -- 21:00 CST and 22:00 CDT both satisfy it.
 
+    WHY IT MOVED OUT OF `sync_balances`. The message now names the ORDERS
+    holding the money, and open orders are synced after balances -- reading
+    them from inside the balance step would have shown the PREVIOUS run's
+    orders, up to nine hours stale. Same reason `notify_manual_fills` sits
+    after the loop: a message about what the mirror learned cannot be sent
+    before the mirror has learned it.
+
+    A blocked OpenOrders key degrades to the held AMOUNT without the reason,
+    which is honest; `hold_trade` comes from Balance and is a separate
+    permission.
+
     NEVER RAISES. A warning is telemetry; the mirror must not fail because of it.
     """
     try:
@@ -247,7 +269,13 @@ def maybe_warn_low_balance(balances) -> None:
         hour_ct = datetime.now(timezone.utc).astimezone(kr.CHICAGO_TZ).hour
         if hour_ct < 20:
             return
-        row = (balances or {}).get("ZUSD")
+        if _LAST_BALANCES is None:
+            # Balance sync failed or was denied. Warning on the last snapshot in
+            # the table would put a stale number in the one message that exists
+            # to be acted on tonight.
+            print(f"  {kr.ICONS['WARN']} low-balance check skipped: no fresh balances")
+            return
+        row = (_LAST_BALANCES or {}).get("ZUSD")
         if isinstance(row, dict):
             total = float(row.get("balance") or 0)
             held = float(row.get("hold_trade") or 0)
@@ -260,7 +288,8 @@ def maybe_warn_low_balance(balances) -> None:
         burn = sum(float(o.get("base_quote_amount") or 0)
                    + float(o.get("bonus_quote_amount") or 0) for o in (orders or []))
         settings = (kr.sb_get("dca_settings", {"select": "low_balance_warn_days"}) or [{}])[0]
-        kr.warn_if_low_balance(spendable, burn, settings)
+        kr.warn_if_low_balance(spendable, burn, settings, total=total, held=held,
+                               holds=kr.usd_holds(_LAST_OPEN_ORDER_ROWS))
     except Exception as e:
         print(f"  {kr.ICONS['WARN']} low-balance check skipped: {e}")
 
@@ -302,6 +331,11 @@ def sync_open_orders() -> int:
 
     if rows:
         sb_upsert("kraken_open_orders", rows, "snapshot_ts,order_txid")
+    # Handed to the low-balance warning so it can say WHICH order holds the
+    # money, not just how much. Set even when empty -- "no resting orders" is
+    # an answer, and it is not the same as "could not ask".
+    global _LAST_OPEN_ORDER_ROWS
+    _LAST_OPEN_ORDER_ROWS = rows
     for r in rows:
         locked = (r["vol"] - r["vol_exec"]) * r["price"]
         print(f"    {r['pair']:10s} {r['side']:4s} {r['ordertype']:8s}"
@@ -606,10 +640,13 @@ def main() -> int:
             print(f"  {kr.ICONS['FAIL']} {name} crashed: {e}")
             outcomes[name] = -1
 
-    # AFTER the sources, never inside the loop: this announces what the mirror
-    # just learned, so it must not run before `trades` has written it, and a
+    # AFTER the sources, never inside the loop: these announce what the mirror
+    # just learned, so they must not run before it has been written, and a
     # failure here must not colour the sync's own outcome.
     notify_manual_fills()
+    # Needs BOTH balances (how much is held) and open orders (what is holding
+    # it), so it cannot live inside either one of them.
+    maybe_warn_low_balance()
 
     # Success is judged on the RECORDED STATUS, not the row count. A denied
     # source catches its own error and returns 0 rows, which is

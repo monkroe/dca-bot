@@ -50,7 +50,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from ohlc import build_daily_metrics
 
-VERSION = "1.7.6"
+VERSION = "1.7.7"
 
 # ═══════════════════════════════════════════════════════════════
 #  ICONS — single source of truth for all UI symbols
@@ -831,16 +831,110 @@ def check_balance_usd() -> tuple[float, float, str]:
 LOW_BALANCE_WARN_DAYS_DEFAULT = 5
 
 
-def warn_if_low_balance(usd_balance: float, daily_burn: float, settings: dict) -> None:
+def usd_holds(order_rows) -> list[dict]:
+    """Resting BUY orders that are tying up ZUSD, largest first.
+
+    ONLY USD-QUOTED BUYS. A `KASUSDT` buy holds USDT and would be a false
+    explanation for a USD shortfall. That is not hypothetical: on 2026-08-02 a
+    KASUSDT order and a KASUSD order were open at the same time, and only the
+    second one had anything to do with the DCA budget.
+
+    `vol_exec` is subtracted because a partially filled order holds only what
+    is left. `price` is `descr.price` -- the limit -- not the top-level
+    `price`, which is the average fill and reads 0 on an untouched order.
+    """
+    out = []
+    for r in order_rows or []:
+        pair = str(r.get("pair") or "")
+        if str(r.get("side") or "") != "buy":
+            continue
+        # endswith("USD") is true for "KASUSD" and false for "KASUSDT".
+        if not pair.endswith("USD"):
+            continue
+        vol_left = float(r.get("vol") or 0) - float(r.get("vol_exec") or 0)
+        price = float(r.get("price") or 0)
+        cost = vol_left * price
+        if cost <= 0:
+            continue
+        out.append({"cost": cost, "label": f"{vol_left:,.2f} {pair[:-3] or pair} @ {price:g}"})
+    out.sort(key=lambda h: h["cost"], reverse=True)
+    return out
+
+
+def low_balance_message(usd_balance: float, daily_burn: float, threshold: float,
+                        total: float | None = None, held: float = 0.0,
+                        holds=None) -> tuple[str, str]:
+    """The warning's text, split out so it can be read without sending it.
+
+    `usd_balance` is SPENDABLE USD -- balance minus `hold_trade` -- because
+    that is the only number the buy can actually use. But naming that number
+    "Kraken USD" was a lie the app disproves at a glance: on 2026-08-03 at
+    22:00 the account held $20.00 with $10.00 resting in a KASUSD limit order,
+    and the warning said "$10.00" with no explanation. Roberto reads the app,
+    sees twice the number, and now has to decide which of the two is broken.
+
+    Worse than the wording: the message told him to TOP UP while ten dollars of
+    his own money sat in an order he could cancel. Naming the order restores
+    the second option. `hold_trade` was added to the mirror precisely because
+    2026-07-30's buy failed against money committed to a resting order -- and
+    then the warning built on top of it never mentioned orders at all.
+
+    The three-line breakdown appears ONLY when something is actually held.
+    With nothing on hold, "Kraken USD" is true and two extra lines reading
+    "$0.00" would be noise in the one message that must not be skimmed.
+    """
+    days_left = usd_balance / daily_burn
+    lines = []
+    if held > 0.005:
+        lines.append(f"• Kraken USD iš viso: ${(usd_balance + held if total is None else total):.2f}")
+        if holds:
+            for h in holds[:3]:
+                lines.append(f"• Užšaldyta orderyje: ${h['cost']:.2f} ({h['label']})")
+            if len(holds) > 3:
+                lines.append(f"• ... ir dar {len(holds) - 3} orderis(-iai)")
+        else:
+            # Held is known from `hold_trade`; the orders behind it are not.
+            # OpenOrders is a SEPARATE key permission, so this is the normal
+            # state of a key that can read balances and not orders -- say the
+            # amount, do not invent the reason.
+            lines.append(f"• Užšaldyta orderiuose: ${held:.2f}")
+        lines.append(f"• Laisva pirkimams: ${usd_balance:.2f}")
+    else:
+        lines.append(f"• Kraken USD: ${usd_balance:.2f}")
+    lines.append(f"• Dienos biudžetas: ${daily_burn:.2f}")
+    lines.append(f"• Likutis pirkimams: ~{days_left:.1f} d. (riba – {threshold:.0f} d.)")
+
+    # ESCALATION, because the old message read identically at 4.9 days and at
+    # 0.2 days. A fraction below one is not "running low", it is a scheduled
+    # failure with a time on it, and it has to be said that way or it gets
+    # skimmed like every other warning that cried the same wolf yesterday.
+    if days_left < 1:
+        headline = "RYTOJ DCA PIRKIMAS NEPAVYKS"
+        action = f"Reikia bent ${daily_burn:.2f} LAISVŲ Kraken sąskaitoje iki rytojaus ryto."
+        never = "Praleisti pirkimai atgaline data NEVYKDOMI."
+    else:
+        headline = "Dėmesio: senka DCA lėšų likutis"
+        action = "Prašome papildyti sąskaitą."
+        never = "Praleisti DCA pirkimai atgaline data nevykdomi."
+    if held > 0.005:
+        action += f" Arba atšauk orderį – jame guli ${held:.2f}."
+
+    return headline, "\n" + "\n".join(lines) + "\n\n" + action + "\n" + never
+
+
+def warn_if_low_balance(usd_balance: float, daily_burn: float, settings: dict,
+                        total: float | None = None, held: float = 0.0,
+                        holds=None) -> None:
     """Telegram warning while the Kraken USD balance can still be topped up.
 
     A funding gap does not fail loudly: the day is simply skipped, and a
     skipped day is never bought back because there is no carryover. That is
     how 2026-07-23 was lost. This fires while there is still time to act.
 
-    Fires at most once per day: the balance preflight sits AFTER the claim
-    insert, which is day-unique, so later runs inside the same window return
-    at the 409 long before reaching here."""
+    Fires once per day: the only caller is the evening `kraken_sync` run,
+    which is gated on the hour. `usd_balance` is SPENDABLE -- see
+    `low_balance_message` for why that distinction is now printed.
+    """
     raw = settings.get("low_balance_warn_days")
     try:
         threshold = LOW_BALANCE_WARN_DAYS_DEFAULT if raw is None else float(raw)
@@ -851,29 +945,13 @@ def warn_if_low_balance(usd_balance: float, daily_burn: float, settings: dict) -
     days_left = usd_balance / daily_burn
     if days_left >= threshold:
         return
-    print(f"  {ICONS['WARN']} Low balance: ${usd_balance:.2f} = ~{days_left:.1f} days of buys")
+    print(f"  {ICONS['WARN']} Low balance: ${usd_balance:.2f} free"
+          f"{f' (${held:.2f} held)' if held > 0.005 else ''}"
+          f" = ~{days_left:.1f} days of buys")
 
-    # ESCALATION, because the old message read identically at 4.9 days and at
-    # 0.2 days. A fraction below one is not "running low", it is a scheduled
-    # failure with a time on it, and it has to be said that way or it gets
-    # skimmed like every other warning that cried the same wolf yesterday.
-    if days_left < 1:
-        headline = "RYTOJ DCA PIRKIMAS NEPAVYKS"
-        tail = (f"Reikia bent ${daily_burn:.2f} Kraken sąskaitoje iki rytojaus ryto.\n"
-                f"Praleisti pirkimai atgaline data NEVYKDOMI.")
-    else:
-        headline = "Dėmesio: senka DCA lėšų likutis"
-        tail = "Prašome papildyti sąskaitą. Praleisti DCA pirkimai atgaline data nevykdomi."
-
-    tg_send(msg_warn(
-        headline,
-        f"\n"
-        f"• Kraken USD: ${usd_balance:.2f}\n"
-        f"• Dienos biudžetas: ${daily_burn:.2f}\n"
-        f"• Likutis pirkimams: ~{days_left:.1f} d. (riba – {threshold:.0f} d.)\n"
-        f"\n"
-        f"{tail}"
-    ))
+    headline, body = low_balance_message(usd_balance, daily_burn, threshold,
+                                         total=total, held=held, holds=holds)
+    tg_send(msg_warn(headline, body))
 
 
 def get_asset_pair_info(pair: str) -> dict:
