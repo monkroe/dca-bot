@@ -50,7 +50,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from ohlc import build_daily_metrics
 
-VERSION = "1.7.8"
+VERSION = "1.7.9"
 
 # ═══════════════════════════════════════════════════════════════
 #  ICONS — single source of truth for all UI symbols
@@ -861,7 +861,7 @@ def usd_holds(order_rows) -> list[dict]:
         # re-parsing a string that was built for someone else.
         out.append({"cost": cost, "pair": pair, "price": price, "vol": vol_left,
                     "ordertype": str(r.get("ordertype") or ""),
-                    "label": f"{vol_left:,.2f} {pair[:-3] or pair} @ {price:g}"})
+                    "label": f"{vol_left:,.2f} {pair[:-3] or pair} @ ${price:g}"})
     out.sort(key=lambda h: h["cost"], reverse=True)
     return out
 
@@ -879,6 +879,33 @@ def distance_to_market(price: float, mid: float) -> str:
     if not mid or mid <= 0 or not price or price <= 0:
         return ""
     return f"{(price - mid) / mid * 100:+.1f}%"
+
+
+def attach_distances(holds):
+    """Fill each hold's `dist` from a live ticker. IO, and it NEVER raises.
+
+    One place for the ticker reads because both messages ask the same question
+    of the same dict. The alternative -- each renderer fetching its own -- is
+    how the fill notification and the warning came to disagree about held money
+    in the first place.
+
+    Per PAIR: two USD-quoted orders on different pairs would otherwise both be
+    scored against whichever ticker happened to be fetched last.
+
+    A pair whose ticker fails simply has no `dist`, and both renderers drop the
+    figure rather than printing a zero that would read as "about to execute".
+    """
+    mids: dict = {}
+    for h in holds or []:
+        pair = h.get("pair")
+        if pair not in mids:
+            try:
+                mids[pair] = float(get_ticker_snapshot(pair).get("mid") or 0)
+            except Exception as e:
+                print(f"  {ICONS['WARN']} ticker for {pair} unavailable: {e}")
+                mids[pair] = 0.0
+        h["dist"] = distance_to_market(float(h.get("price") or 0), mids[pair])
+    return holds
 
 
 def low_balance_message(usd_balance: float, daily_burn: float, threshold: float,
@@ -906,36 +933,45 @@ def low_balance_message(usd_balance: float, daily_burn: float, threshold: float,
     days_left = usd_balance / daily_burn
     lines = []
     if held > 0.005:
-        lines.append(f"• Kraken USD iš viso: ${(usd_balance + held if total is None else total):.2f}")
+        lines.append(f"• Total USD balance: ${(usd_balance + held if total is None else total):.2f}")
         if holds:
             for h in holds[:3]:
-                lines.append(f"• Užšaldyta orderyje: ${h['cost']:.2f} ({h['label']})")
+                # The distance is what says whether this money is coming back
+                # today or is parked. Absent when the ticker could not be read;
+                # the order is still named, because the commitment is the point.
+                dist = h.get("dist")
+                detail = f"{h['label']}, {dist}" if dist else h["label"]
+                lines.append(f"• Pending order: ${h['cost']:.2f} ({detail})")
             if len(holds) > 3:
-                lines.append(f"• ... ir dar {len(holds) - 3} orderis(-iai)")
+                lines.append(f"• ... and {len(holds) - 3} more")
         else:
             # Held is known from `hold_trade`; the orders behind it are not.
             # OpenOrders is a SEPARATE key permission, so this is the normal
             # state of a key that can read balances and not orders -- say the
             # amount, do not invent the reason.
-            lines.append(f"• Užšaldyta orderiuose: ${held:.2f}")
-        lines.append(f"• Laisva pirkimams: ${usd_balance:.2f}")
+            lines.append(f"• Reserved in orders: ${held:.2f}")
+        lines.append(f"• Available for buys: ${usd_balance:.2f}")
     else:
-        lines.append(f"• Kraken USD: ${usd_balance:.2f}")
-    lines.append(f"• Dienos biudžetas: ${daily_burn:.2f}")
-    lines.append(f"• Likutis pirkimams: ~{days_left:.1f} d. (riba – {threshold:.0f} d.)")
+        lines.append(f"• USD balance: ${usd_balance:.2f}")
+    lines.append(f"• Daily budget: ${daily_burn:.2f}")
+    # One decimal, deliberately, though the drafted wording said "~1 d.".
+    # The escalation exists because 4.9 days and 0.2 days used to read alike,
+    # and "~0 d." would collapse that distinction again at exactly the values
+    # where it matters most.
+    lines.append(f"• Remaining days: ~{days_left:.1f} d. (threshold – {threshold:.0f} d.)")
 
     # ESCALATION, because the old message read identically at 4.9 days and at
     # 0.2 days. A fraction below one is not "running low", it is a scheduled
     # failure with a time on it, and it has to be said that way or it gets
     # skimmed like every other warning that cried the same wolf yesterday.
     if days_left < 1:
-        headline = "RYTOJ DCA PIRKIMAS NEPAVYKS"
-        action = f"Reikia bent ${daily_burn:.2f} LAISVŲ Kraken sąskaitoje iki rytojaus ryto."
-        never = "Praleisti pirkimai atgaline data NEVYKDOMI."
+        headline = "TOMORROW'S DCA BUY WILL FAIL"
+        action = f"At least ${daily_burn:.2f} must be AVAILABLE on Kraken before tomorrow morning."
+        never = "Missed purchases are NOT executed retroactively."
     else:
-        headline = "Dėmesio: senka DCA lėšų likutis"
-        action = "Prašome papildyti sąskaitą."
-        never = "Praleisti DCA pirkimai atgaline data nevykdomi."
+        headline = "Warning: DCA balance running low"
+        action = "Please fund your account."
+        never = "Missed DCA purchases are not executed retroactively."
 
     # THE HELD MONEY IS MENTIONED AS A FACT, NEVER AS AN INSTRUCTION, AND ONLY
     # WHEN IT WOULD ACTUALLY CHANGE THE OUTCOME.
@@ -952,7 +988,7 @@ def low_balance_message(usd_balance: float, daily_burn: float, threshold: float,
     # information he cannot see from the app in one glance -- the money for
     # tomorrow exists, and it is here. What to do about it stays his.
     if days_left < 1 and held >= daily_burn:
-        action += f"\nOrderyje užšaldyta ${held:.2f} – jų pakaktų rytojaus pirkimui."
+        action += f"\nA pending order holds ${held:.2f}, which alone would cover tomorrow's buy."
 
     return headline, "\n" + "\n".join(lines) + "\n\n" + action + "\n" + never
 
@@ -1100,23 +1136,22 @@ def _resting_orders_lines(held: float) -> str:
         print(f"  {ICONS['WARN']} resting-order lines skipped: {e}")
         return ""
 
+    attach_distances(holds)
     out = ""
     for h in holds[:3]:
-        # Per PAIR, not one shared mid: two USD-quoted orders on different
-        # pairs would otherwise both be measured against whichever ticker was
-        # fetched last.
-        try:
-            mid = float(get_ticker_snapshot(h["pair"]).get("mid") or 0)
-        except Exception:
-            mid = 0.0
-        out += resting_order_line(h, mid)
+        out += resting_order_line(h)
     if len(holds) > 3:
         out += f"\n... and {len(holds) - 3} more"
     return out
 
 
-def resting_order_line(hold: dict, mid: float | None) -> str:
+def resting_order_line(hold: dict) -> str:
     """One resting order as the fill notification prints it. PURE.
+
+    Reads `dist` off the hold rather than taking a mid, so this and the warning
+    render the SAME figure from the SAME dict. Two renderers each fetching
+    their own ticker is how the two messages came to disagree about held money
+    to begin with.
 
     Split out for the same reason `low_balance_message` was: the wording is the
     part that gets read and the part that has been wrong, and it must be
@@ -1134,7 +1169,7 @@ def resting_order_line(hold: dict, mid: float | None) -> str:
     numbers beside it.
     """
     symbol = str(hold["pair"])[:-3] or str(hold["pair"])
-    dist = distance_to_market(float(hold["price"]), float(mid or 0))
+    dist = hold.get("dist") or ""
     tail = f" ({dist})" if dist else ""
     caption = order_type_label(hold.get("ordertype"))
     return f"\n{caption}: {float(hold['vol']):,.2f} {symbol} @ ${float(hold['price']):g}{tail}"

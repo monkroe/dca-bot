@@ -36,7 +36,7 @@ def test_usd_holds_picks_only_usd_quoted_buys(t):
     holds = kr.usd_holds([REAL_ORDER, USDT_ORDER])
     t.check("one hold", len(holds), 1)
     t.check("cost", round(holds[0]["cost"], 2), 10.00)
-    t.check("label", holds[0]["label"], "391.39 KAS @ 0.02555")
+    t.check("label", holds[0]["label"], "391.39 KAS @ $0.02555")
 
 
 def test_usd_holds_ignores_sells(t):
@@ -59,29 +59,33 @@ def test_usd_holds_empty_and_none(t):
 
 
 def test_message_names_the_order(t):
+    # `dist` is what attach_distances() writes from a live ticker. Set here by
+    # hand so the wording stays testable without a network call -- the same
+    # split as the message text itself.
     headline, body = kr.low_balance_message(
         10.0023, 10.0, 5.0, total=20.0023, held=10.0,
-        holds=kr.usd_holds([REAL_ORDER, USDT_ORDER]))
-    t.check("headline", headline, "Dėmesio: senka DCA lėšų likutis")
-    t.check("total shown", "• Kraken USD iš viso: $20.00" in body, True)
-    t.check("hold shown", "• Užšaldyta orderyje: $10.00 (391.39 KAS @ 0.02555)" in body, True)
-    t.check("free shown", "• Laisva pirkimams: $10.00" in body, True)
+        holds=[dict(h, dist="-3.5%")
+               for h in kr.usd_holds([REAL_ORDER, USDT_ORDER])])
+    t.check("headline", headline, "Warning: DCA balance running low")
+    t.check("total shown", "• Total USD balance: $20.00" in body, True)
+    t.check("hold shown", "• Pending order: $10.00 (391.39 KAS @ $0.02555, -3.5%)" in body, True)
+    t.check("free shown", "• Available for buys: $10.00" in body, True)
     # The number that used to be labelled "Kraken USD" must no longer be.
-    t.check("no lying label", "• Kraken USD: $" in body, False)
+    t.check("no lying label", "• USD balance: $" in body, False)
     # NO INSTRUCTION. There is enough for the buy; the resting order is a
     # position Roberto chose, not a problem to fix.
-    t.check("no cancel advice", "atšauk" in body, False)
-    t.check("no would-cover line", "pakaktų" in body, False)
+    t.check("no cancel advice", "cancel" in body.lower(), False)
+    t.check("no would-cover line", "would cover" in body, False)
 
 
 def test_message_stays_short_when_nothing_is_held(t):
     # With no hold, "Kraken USD" is TRUE, and two extra lines reading $0.00
     # would be noise in the one message that must not be skimmed.
     _, body = kr.low_balance_message(10.0, 10.0, 5.0, total=10.0, held=0.0, holds=[])
-    t.check("plain label", "• Kraken USD: $10.00" in body, True)
-    t.check("no total line", "iš viso" in body, False)
-    t.check("no hold line", "Užšaldyta" in body, False)
-    t.check("no cancel hint", "atšauk" in body, False)
+    t.check("plain label", "• USD balance: $10.00" in body, True)
+    t.check("no total line", "Total USD balance" in body, False)
+    t.check("no hold line", "Pending order" in body, False)
+    t.check("no cancel hint", "cancel" in body.lower(), False)
 
 
 def test_held_without_orders_states_amount_only(t):
@@ -89,16 +93,16 @@ def test_held_without_orders_states_amount_only(t):
     # can read balances and not orders knows the amount and not the reason --
     # and must not invent one.
     _, body = kr.low_balance_message(10.0, 10.0, 5.0, total=20.0, held=10.0, holds=[])
-    t.check("amount stated", "• Užšaldyta orderiuose: $10.00" in body, True)
+    t.check("amount stated", "• Reserved in orders: $10.00" in body, True)
     t.check("no invented order", "@" in body, False)
 
 
 def test_escalation_below_one_day(t):
     # A fraction below one day is not "running low", it is a scheduled failure.
     headline, body = kr.low_balance_message(4.0, 10.0, 5.0, total=4.0, held=0.0)
-    t.check("headline", headline, "RYTOJ DCA PIRKIMAS NEPAVYKS")
-    t.check("says LAISVŲ", "LAISVŲ" in body, True)
-    t.check("says never", "NEVYKDOMI" in body, True)
+    t.check("headline", headline, "TOMORROW'S DCA BUY WILL FAIL")
+    t.check("says AVAILABLE", "AVAILABLE" in body, True)
+    t.check("says never", "NOT executed retroactively" in body, True)
 
 
 def test_held_money_named_only_when_it_would_change_the_outcome(t):
@@ -107,15 +111,15 @@ def test_held_money_named_only_when_it_would_change_the_outcome(t):
     # order to unwind the position.
     _, body = kr.low_balance_message(4.0, 10.0, 5.0, total=24.0, held=20.0,
                                      holds=kr.usd_holds([dict(REAL_ORDER, price=0.05, vol=400.0)]))
-    t.check("named", "Orderyje užšaldyta $20.00 – jų pakaktų rytojaus pirkimui." in body, True)
-    t.check("still no imperative", "atšauk" in body, False)
+    t.check("named", "A pending order holds $20.00, which alone would cover tomorrow's buy." in body, True)
+    t.check("still no imperative", "cancel" in body.lower(), False)
 
 
 def test_held_money_not_named_when_it_would_not_help(t):
     # Tomorrow fails and the hold is too small to save it. Naming it would be
     # a false lead: cancelling changes nothing, the money still is not there.
     _, body = kr.low_balance_message(4.0, 10.0, 5.0, total=7.0, held=3.0, holds=[])
-    t.check("not named", "pakaktų" in body, False)
+    t.check("not named", "would cover" in body, False)
 
 
 def test_exactly_one_day_does_not_escalate(t):
@@ -123,19 +127,19 @@ def test_exactly_one_day_does_not_escalate(t):
     # escalate: that evening's buy still had its money. Off-by-one here would
     # cry wolf on the night before the night that matters.
     headline, _ = kr.low_balance_message(10.0, 10.0, 5.0, total=20.0, held=10.0)
-    t.check("no escalation at 1.0", headline, "Dėmesio: senka DCA lėšų likutis")
+    t.check("no escalation at 1.0", headline, "Warning: DCA balance running low")
 
 
 def test_more_than_three_orders_are_summarised(t):
     many = [dict(REAL_ORDER, price=0.01 * (i + 1)) for i in range(5)]
     _, body = kr.low_balance_message(10.0, 10.0, 5.0, total=60.0, held=50.0,
                                      holds=kr.usd_holds(many))
-    t.check("three listed", body.count("• Užšaldyta orderyje:"), 3)
-    t.check("rest counted", "ir dar 2 orderis(-iai)" in body, True)
+    t.check("three listed", body.count("• Pending order:"), 3)
+    t.check("rest counted", "... and 2 more" in body, True)
 
 
 def test_no_em_dash_anywhere(t):
-    # Standing rule: Lithuanian messages never use the long dash.
+    # Standing rule: no long dash in any message, in either language.
     _, body = kr.low_balance_message(10.0023, 10.0, 5.0, total=20.0023, held=10.0,
                                      holds=kr.usd_holds([REAL_ORDER]))
     t.check("no em dash", "—" in body, False)

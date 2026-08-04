@@ -6,6 +6,15 @@ History before 2026-07-18 (Phase 1 -- Kraken + Strike execution, notifications, 
 
 ## 2026-08-04 (antradienis -- Chicago)
 
+### notify: both DCA messages now speak one language and one vocabulary -- v1.7.9
+- The evening warning was Lithuanian prose, the fill notification English fields, and after the reserve line landed in both they described the same three numbers with different words. Roberto rewrote both messages himself and chose English: the Kraken app he reconciles against is English too, so the terms now match the screen he checks them on
+- `Kraken USD iš viso` -> `Total USD balance`, `Užšaldyta orderyje` -> `Pending order`, `Laisva pirkimams` -> `Available for buys`, plus the escalation, the action and the never-retroactive line. Roberto's wording, not a translation of the old text
+- **The distance from market moved into the warning as well.** Same reason it earned its place in the fill message: the amount alone does not distinguish an order about to execute from one that has been out of reach for a week, and this is the message that asks him to move money
+- **One field, one source, two renderers.** `attach_distances` writes `dist` onto each hold and both messages read it, rather than each fetching its own ticker. Two renderers asking the same question separately is precisely how these two messages came to disagree about held money in the first place -- the bug this whole day started from
+- Degrades identically in both: a pair whose ticker fails simply has no `dist`, the order is still named, and no figure is invented. Wiring `attach_distances` into `kraken_sync` therefore cannot turn a missing percentage into a wrong one
+- **`~0.4 d.` is kept to one decimal although the drafted wording said `~1 d.`** The escalation exists because 4.9 days and 0.2 days used to read alike; rounding to whole days would collapse that distinction again exactly where it matters
+- The `$` moved inside `usd_holds`'s label so a price is never printed bare in either message
+
 ### fix(notify): the fill notification called a committed balance an empty one -- v1.7.8
 - The morning's buy ended with `Liko: $0.00 (0 pirkimų)`. True about spendable cash, and read as an empty account: the mirror's 06:53 snapshot shows the total, with **half of it committed to a KASUSD limit buy opened at 20:09 the previous evening**. Roberto reads the Kraken app, sees money, and the message says none. Reported by him, not by any check
 - **This is the 08-03 fix, missed on its second path.** `low_balance_message` was taught the same day that held money must be named; `_remaining_after_buy_line` was not, and it calls the very function that returns the held figure -- `check_balance_usd` hands back `(available, held, source)` and the fill line discarded `held` on the line it was written on. One fact, two renderings, one of them corrected: the same shape as the car wash fee counted twice

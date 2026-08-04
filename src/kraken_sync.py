@@ -288,8 +288,12 @@ def maybe_warn_low_balance() -> None:
         burn = sum(float(o.get("base_quote_amount") or 0)
                    + float(o.get("bonus_quote_amount") or 0) for o in (orders or []))
         settings = (kr.sb_get("dca_settings", {"select": "low_balance_warn_days"}) or [{}])[0]
+        # attach_distances adds how far each resting order sits from the market.
+        # Without it the warning still names the order and simply omits the
+        # figure -- the same degradation as a failed ticker read, so a change
+        # here can never turn a missing percentage into a wrong one.
         kr.warn_if_low_balance(spendable, burn, settings, total=total, held=held,
-                               holds=kr.usd_holds(_LAST_OPEN_ORDER_ROWS))
+                               holds=kr.attach_distances(kr.usd_holds(_LAST_OPEN_ORDER_ROWS)))
     except Exception as e:
         print(f"  {kr.ICONS['WARN']} low-balance check skipped: {e}")
 

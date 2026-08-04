@@ -26,6 +26,10 @@ REAL_ORDER = {"pair": "KASUSD", "side": "buy", "ordertype": "limit",
 # The market at the moment of the 2026-08-04 fill notification.
 MID_AT_FILL = 0.02649
 
+# What attach_distances() computes for the fixture above; the renderers read
+# this field rather than a mid, so both messages print one figure from one dict.
+DIST_AT_FILL = "-3.5%"
+
 
 def test_usd_holds_exposes_raw_parts(t):
     # The warning renders from `label`; this message renders from the parts.
@@ -36,7 +40,7 @@ def test_usd_holds_exposes_raw_parts(t):
     t.check("vol", round(h["vol"], 5), 391.38943)
     t.check("ordertype", h["ordertype"], "limit")
     # The warning's rendering must be untouched by the parts riding along.
-    t.check("label unchanged", h["label"], "391.39 KAS @ 0.02555")
+    t.check("label unchanged", h["label"], "391.39 KAS @ $0.02555")
 
 
 def test_distance_is_signed_and_measured_from_the_market(t):
@@ -60,7 +64,7 @@ def test_distance_is_empty_rather_than_zero_when_unknown(t):
 
 def test_line_names_the_order_and_the_distance(t):
     h = kr.usd_holds([REAL_ORDER])[0]
-    t.check("line", kr.resting_order_line(h, MID_AT_FILL),
+    t.check("line", kr.resting_order_line(dict(h, dist=DIST_AT_FILL)),
             "\nLimit Order: 391.39 KAS @ $0.02555 (-3.5%)")
 
 
@@ -68,7 +72,7 @@ def test_line_survives_a_missing_mid(t):
     # No mid, no parenthetical -- but the order itself is still named, because
     # the money being committed is the part that matters.
     h = kr.usd_holds([REAL_ORDER])[0]
-    t.check("no tail", kr.resting_order_line(h, None),
+    t.check("no tail", kr.resting_order_line(h),
             "\nLimit Order: 391.39 KAS @ $0.02555")
 
 
@@ -76,7 +80,7 @@ def test_price_is_not_padded_to_a_fixed_scale(t):
     # `:.5f` would print a $60,000 order as "$60000.00000". `:g` keeps both a
     # sub-cent altcoin and a five-figure price readable.
     big = {"pair": "XBTUSD", "price": 60000.0, "vol": 0.001, "ordertype": "limit"}
-    t.check("no trailing zeros", kr.resting_order_line(big, None),
+    t.check("no trailing zeros", kr.resting_order_line(big),
             "\nLimit Order: 0.00 XBT @ $60000")
 
 
@@ -96,13 +100,13 @@ def test_caption_comes_from_the_order_not_from_a_guess(t):
 def test_caption_follows_a_stop_order_through_the_line(t):
     stop = dict(REAL_ORDER, ordertype="stop-loss-limit")
     h = kr.usd_holds([stop])[0]
-    t.check("captioned by type", kr.resting_order_line(h, MID_AT_FILL),
+    t.check("captioned by type", kr.resting_order_line(dict(h, dist=DIST_AT_FILL)),
             "\nStop Loss Limit Order: 391.39 KAS @ $0.02555 (-3.5%)")
 
 
 def test_no_em_dash_anywhere(t):
     h = kr.usd_holds([REAL_ORDER])[0]
-    t.check("no em dash", "—" in kr.resting_order_line(h, MID_AT_FILL), False)
+    t.check("no em dash", "—" in kr.resting_order_line(dict(h, dist=DIST_AT_FILL)), False)
 
 
 if __name__ == "__main__":
