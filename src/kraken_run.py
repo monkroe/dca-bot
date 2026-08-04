@@ -860,6 +860,7 @@ def usd_holds(order_rows) -> list[dict]:
         # parts ride along so a second caller can render differently without
         # re-parsing a string that was built for someone else.
         out.append({"cost": cost, "pair": pair, "price": price, "vol": vol_left,
+                    "ordertype": str(r.get("ordertype") or ""),
                     "label": f"{vol_left:,.2f} {pair[:-3] or pair} @ {price:g}"})
     out.sort(key=lambda h: h["cost"], reverse=True)
     return out
@@ -1061,13 +1062,17 @@ def _remaining_after_buy_line() -> str:
         # placed the evening before. The warning was taught to say this on
         # 08-03; this path was not, which is the same one-fact-two-paths shape
         # as the car wash fee.
+        # ONE label in both branches, and it is English like every other label
+        # in this message. `Liko` was the only Lithuanian word among Amount,
+        # Price, Cost, Fee and Total; the buy count stays Lithuanian because it
+        # is a sentence about the next buy, not a field name.
         if held > 0.005:
-            head = f"\nLiko:   ${avail:.2f} laisvi + ${held:.2f} rezerve"
+            head = f"\nBalance: ${avail:.2f} available | ${held:.2f} reserved"
         elif burn <= 0:
-            head = f"\nLiko:   ${avail:.2f}"
+            head = f"\nBalance: ${avail:.2f}"
         else:
             n = int(avail // burn)
-            head = f"\nLiko:   ${avail:.2f}  ({n} {_buys_word(n)})"
+            head = f"\nBalance: ${avail:.2f}  ({n} {_buys_word(n)})"
         return head + _resting_orders_lines(held)
     except Exception as e:
         print(f"  {ICONS['WARN']} remaining-balance line skipped: {e}")
@@ -1106,7 +1111,7 @@ def _resting_orders_lines(held: float) -> str:
             mid = 0.0
         out += resting_order_line(h, mid)
     if len(holds) > 3:
-        out += f"\n... ir dar {len(holds) - 3}"
+        out += f"\n... and {len(holds) - 3} more"
     return out
 
 
@@ -1120,11 +1125,36 @@ def resting_order_line(hold: dict, mid: float | None) -> str:
     Deliberately NOT reusing `hold["label"]`. That string belongs to the
     warning, whose test pins it exactly; rendering both from the same string
     would mean neither message can be reworded without disturbing the other.
+
+    THE ORDER TYPE IS READ, NOT ASSUMED. Every resting order this bot places
+    today is a plain limit, so "Limit Order" would be right by accident -- but
+    `usd_holds` filters on side and quote currency and never on type, so a
+    stop-loss-limit resting on the account would be captioned as something it
+    is not. The caption is the one part a reader cannot check against the
+    numbers beside it.
     """
     symbol = str(hold["pair"])[:-3] or str(hold["pair"])
     dist = distance_to_market(float(hold["price"]), float(mid or 0))
     tail = f" ({dist})" if dist else ""
-    return f"\nOrderis: {float(hold['vol']):,.2f} {symbol} @ ${float(hold['price']):g}{tail}"
+    caption = order_type_label(hold.get("ordertype"))
+    return f"\n{caption}: {float(hold['vol']):,.2f} {symbol} @ ${float(hold['price']):g}{tail}"
+
+
+def order_type_label(ordertype) -> str:
+    """Kraken's order type as a caption. PURE.
+
+    "limit" is spelled out because it is the only one that appears in practice
+    and the phrase is the standard one. Anything else is title-cased from what
+    Kraken actually returned rather than mapped through a table -- an unknown
+    type printed verbatim is honest, while a table that has not been updated
+    would silently caption a new type as a limit order.
+    """
+    t = str(ordertype or "").strip()
+    if not t:
+        return "Order"
+    if t == "limit":
+        return "Limit Order"
+    return " ".join(w.capitalize() for w in t.replace("-", " ").split()) + " Order"
 
 
 def finalize_order(cl_ord_id: str, order_id: str, mid: float | None = None, ohlc_ctx: dict | None = None, label: str = "FILLED"):

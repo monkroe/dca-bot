@@ -34,6 +34,7 @@ def test_usd_holds_exposes_raw_parts(t):
     t.check("pair", h["pair"], "KASUSD")
     t.check("price", h["price"], 0.02555)
     t.check("vol", round(h["vol"], 5), 391.38943)
+    t.check("ordertype", h["ordertype"], "limit")
     # The warning's rendering must be untouched by the parts riding along.
     t.check("label unchanged", h["label"], "391.39 KAS @ 0.02555")
 
@@ -60,7 +61,7 @@ def test_distance_is_empty_rather_than_zero_when_unknown(t):
 def test_line_names_the_order_and_the_distance(t):
     h = kr.usd_holds([REAL_ORDER])[0]
     t.check("line", kr.resting_order_line(h, MID_AT_FILL),
-            "\nOrderis: 391.39 KAS @ $0.02555 (-3.5%)")
+            "\nLimit Order: 391.39 KAS @ $0.02555 (-3.5%)")
 
 
 def test_line_survives_a_missing_mid(t):
@@ -68,15 +69,35 @@ def test_line_survives_a_missing_mid(t):
     # the money being committed is the part that matters.
     h = kr.usd_holds([REAL_ORDER])[0]
     t.check("no tail", kr.resting_order_line(h, None),
-            "\nOrderis: 391.39 KAS @ $0.02555")
+            "\nLimit Order: 391.39 KAS @ $0.02555")
 
 
 def test_price_is_not_padded_to_a_fixed_scale(t):
     # `:.5f` would print a $60,000 order as "$60000.00000". `:g` keeps both a
     # sub-cent altcoin and a five-figure price readable.
-    big = {"pair": "XBTUSD", "price": 60000.0, "vol": 0.001}
+    big = {"pair": "XBTUSD", "price": 60000.0, "vol": 0.001, "ordertype": "limit"}
     t.check("no trailing zeros", kr.resting_order_line(big, None),
-            "\nOrderis: 0.00 XBT @ $60000")
+            "\nLimit Order: 0.00 XBT @ $60000")
+
+
+def test_caption_comes_from_the_order_not_from_a_guess(t):
+    # usd_holds filters on side and quote currency, never on type. A resting
+    # stop order captioned "Limit Order" would be the one claim in the line
+    # that cannot be checked against the numbers next to it.
+    t.check("plain limit", kr.order_type_label("limit"), "Limit Order")
+    t.check("stop", kr.order_type_label("stop-loss-limit"), "Stop Loss Limit Order")
+    t.check("take profit", kr.order_type_label("take-profit"), "Take Profit Order")
+    # Unknown types print verbatim rather than being mapped to "Limit".
+    t.check("unknown kept", kr.order_type_label("iceberg"), "Iceberg Order")
+    t.check("missing", kr.order_type_label(None), "Order")
+    t.check("blank", kr.order_type_label("  "), "Order")
+
+
+def test_caption_follows_a_stop_order_through_the_line(t):
+    stop = dict(REAL_ORDER, ordertype="stop-loss-limit")
+    h = kr.usd_holds([stop])[0]
+    t.check("captioned by type", kr.resting_order_line(h, MID_AT_FILL),
+            "\nStop Loss Limit Order: 391.39 KAS @ $0.02555 (-3.5%)")
 
 
 def test_no_em_dash_anywhere(t):
@@ -95,5 +116,7 @@ if __name__ == "__main__":
          test_line_names_the_order_and_the_distance),
         ("line survives a missing mid", test_line_survives_a_missing_mid),
         ("price not padded to a fixed scale", test_price_is_not_padded_to_a_fixed_scale),
+        ("caption comes from the order", test_caption_comes_from_the_order_not_from_a_guess),
+        ("caption follows a stop order", test_caption_follows_a_stop_order_through_the_line),
         ("no em dash", test_no_em_dash_anywhere),
     ]))
