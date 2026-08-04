@@ -1063,15 +1063,6 @@ def _pair_from_cl_ord_id(cl_ord_id: str) -> str:
     return "?"
 
 
-def _buys_word(n: int) -> str:
-    """Lithuanian plural for `pirkimas`. 1 -> pirkimas, 2-9 -> pirkimai, else pirkimų."""
-    if n % 10 == 1 and n % 100 != 11:
-        return "pirkimas"
-    if 2 <= n % 10 <= 9 and not 11 <= n % 100 <= 19:
-        return "pirkimai"
-    return "pirkimų"
-
-
 def _remaining_after_buy_line() -> str:
     """What is ACTUALLY left, read after the fill, for the fill notification.
 
@@ -1079,7 +1070,7 @@ def _remaining_after_buy_line() -> str:
     it four minutes BEFORE the buy, so it named the money about to be spent --
     on 2026-08-03 it said $11.66 while the answer that mattered was $1.66.
 
-    The count is the part worth reading: "$1.66 (0 pirkimų)" says the next buy
+    The count is the part worth reading: "$1.66 (0 buys)" says the next buy
     fails, which "$1.66" alone does not.
 
     RETURNS "" ON ANY FAILURE. A fill notification must never depend on a second
@@ -1098,17 +1089,18 @@ def _remaining_after_buy_line() -> str:
         # placed the evening before. The warning was taught to say this on
         # 08-03; this path was not, which is the same one-fact-two-paths shape
         # as the car wash fee.
-        # ONE label in both branches, and it is English like every other label
-        # in this message. `Liko` was the only Lithuanian word among Amount,
-        # Price, Cost, Fee and Total; the buy count stays Lithuanian because it
-        # is a sentence about the next buy, not a field name.
+        # ONE label in both branches, and the whole message is English.
+        # `_buys_word` and its 20 assertions were deleted with this line: the
+        # Lithuanian plural has three branches and two exceptions and needed
+        # a tested function, while the English one is a conditional. Keeping
+        # it for a caller that no longer exists is how dead code starts.
         if held > 0.005:
             head = f"\nBalance: ${avail:.2f} available | ${held:.2f} reserved"
         elif burn <= 0:
             head = f"\nBalance: ${avail:.2f}"
         else:
             n = int(avail // burn)
-            head = f"\nBalance: ${avail:.2f}  ({n} {_buys_word(n)})"
+            head = f"\nBalance: ${avail:.2f}  ({n} {'buy' if n == 1 else 'buys'})"
         return head + _resting_orders_lines(held)
     except Exception as e:
         print(f"  {ICONS['WARN']} remaining-balance line skipped: {e}")

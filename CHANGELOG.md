@@ -14,6 +14,7 @@ History before 2026-07-18 (Phase 1 -- Kraken + Strike execution, notifications, 
 - Degrades identically in both: a pair whose ticker fails simply has no `dist`, the order is still named, and no figure is invented. Wiring `attach_distances` into `kraken_sync` therefore cannot turn a missing percentage into a wrong one
 - **`~0.4 d.` is kept to one decimal although the drafted wording said `~1 d.`** The escalation exists because 4.9 days and 0.2 days used to read alike; rounding to whole days would collapse that distinction again exactly where it matters
 - The `$` moved inside `usd_holds`'s label so a price is never printed bare in either message
+- **`(0 pirkimų)` -> `(0 buys)`, and `_buys_word` was DELETED rather than left unused.** The Lithuanian plural has three branches and two exceptions, which is why it was a function with 20 assertions of its own; the English one is a conditional at its single call site. `tests/test_buys_word.py` went with it. A helper kept for a caller that no longer exists is where dead code starts, and this repo already carries enough of it
 
 ### fix(notify): the fill notification called a committed balance an empty one -- v1.7.8
 - The morning's buy ended with `Liko: $0.00 (0 pirkimų)`. True about spendable cash, and read as an empty account: the mirror's 06:53 snapshot shows the total, with **half of it committed to a KASUSD limit buy opened at 20:09 the previous evening**. Roberto reads the Kraken app, sees money, and the message says none. Reported by him, not by any check
