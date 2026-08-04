@@ -1,6 +1,13 @@
 # tools
 
-Offline, read-only skriptai. Nieko nerašo, jokių orderių nesiunčia.
+Read-only skriptai. Nieko nerašo, jokių orderių nesiunčia.
+
+## Kasdienis
+
+| Failas | Ką daro |
+|---|---|
+| `kaina.py` | Ką DCA botas mato DABAR, nelaukiant jo lango: gyvas bid/ask iš Kraken plius H7/H30/H90 standartas iš `ohlc.py` |
+| `install-kaina.sh` | Įdiegia `kaina` kaip Termux komandą. Paleisti kartą, iš native Termux, ne iš proot |
 
 ## Cap taisyklės backtest
 
