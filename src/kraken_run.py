@@ -50,7 +50,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from ohlc import build_daily_metrics
 
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 
 # ═══════════════════════════════════════════════════════════════
 #  ICONS — single source of truth for all UI symbols
@@ -933,7 +933,7 @@ def low_balance_message(usd_balance: float, daily_burn: float, threshold: float,
     days_left = usd_balance / daily_burn
     lines = []
     if held > 0.005:
-        lines.append(f"• Total USD balance: ${(usd_balance + held if total is None else total):.2f}")
+        lines.append(f"• Bendras USD likutis: ${(usd_balance + held if total is None else total):.2f}")
         if holds:
             for h in holds[:3]:
                 # The distance is what says whether this money is coming back
@@ -941,37 +941,37 @@ def low_balance_message(usd_balance: float, daily_burn: float, threshold: float,
                 # the order is still named, because the commitment is the point.
                 dist = h.get("dist")
                 detail = f"{h['label']}, {dist}" if dist else h["label"]
-                lines.append(f"• Pending order: ${h['cost']:.2f} ({detail})")
+                lines.append(f"• Laukia pirkimo: ${h['cost']:.2f} ({detail})")
             if len(holds) > 3:
-                lines.append(f"• ... and {len(holds) - 3} more")
+                lines.append(f"• ... ir dar {len(holds) - 3}")
         else:
             # Held is known from `hold_trade`; the orders behind it are not.
             # OpenOrders is a SEPARATE key permission, so this is the normal
             # state of a key that can read balances and not orders -- say the
             # amount, do not invent the reason.
-            lines.append(f"• Reserved in orders: ${held:.2f}")
-        lines.append(f"• Available for buys: ${usd_balance:.2f}")
+            lines.append(f"• Rezervuota orderiuose: ${held:.2f}")
+        lines.append(f"• Laisva pirkimams: ${usd_balance:.2f}")
     else:
-        lines.append(f"• USD balance: ${usd_balance:.2f}")
-    lines.append(f"• Daily budget: ${daily_burn:.2f}")
+        lines.append(f"• USD likutis: ${usd_balance:.2f}")
+    lines.append(f"• Dienos biudžetas: ${daily_burn:.2f}")
     # One decimal, deliberately, though the drafted wording said "~1 d.".
     # The escalation exists because 4.9 days and 0.2 days used to read alike,
     # and "~0 d." would collapse that distinction again at exactly the values
     # where it matters most.
-    lines.append(f"• Remaining days: ~{days_left:.1f} d. (threshold – {threshold:.0f} d.)")
+    lines.append(f"• Pakaks pirkimams: ~{days_left:.1f} d. (įspėjimo riba – {threshold:.0f} d.)")
 
     # ESCALATION, because the old message read identically at 4.9 days and at
     # 0.2 days. A fraction below one is not "running low", it is a scheduled
     # failure with a time on it, and it has to be said that way or it gets
     # skimmed like every other warning that cried the same wolf yesterday.
     if days_left < 1:
-        headline = "TOMORROW'S DCA BUY WILL FAIL"
-        action = f"At least ${daily_burn:.2f} must be AVAILABLE on Kraken before tomorrow morning."
-        never = "Missed purchases are NOT executed retroactively."
+        headline = "RYTOJ DCA PIRKIMAS NEPAVYKS"
+        action = f"Reikia bent ${daily_burn:.2f} LAISVŲ Kraken sąskaitoje iki rytojaus ryto."
+        never = "Praleisti pirkimai atgaline data NEVYKDOMI."
     else:
-        headline = "Warning: DCA balance running low"
-        action = "Please fund your account."
-        never = "Missed DCA purchases are not executed retroactively."
+        headline = "Dėmesio: senka DCA lėšų likutis"
+        action = "Prašome papildyti sąskaitą."
+        never = "Praleisti DCA pirkimai atgaline data nevykdomi."
 
     # THE HELD MONEY IS MENTIONED AS A FACT, NEVER AS AN INSTRUCTION, AND ONLY
     # WHEN IT WOULD ACTUALLY CHANGE THE OUTCOME.
@@ -988,7 +988,7 @@ def low_balance_message(usd_balance: float, daily_burn: float, threshold: float,
     # information he cannot see from the app in one glance -- the money for
     # tomorrow exists, and it is here. What to do about it stays his.
     if days_left < 1 and held >= daily_burn:
-        action += f"\nA pending order holds ${held:.2f}, which alone would cover tomorrow's buy."
+        action += f"\nOrderyje laukia ${held:.2f} – jų pakaktų rytojaus pirkimui."
 
     return headline, "\n" + "\n".join(lines) + "\n\n" + action + "\n" + never
 

@@ -14,22 +14,32 @@ invisible: every test passed, every day, while most of the surface went
 unchecked. Same shape as the schema gate this repo already has -- the value is
 in covering the SET, not a well-chosen member of it.
 
-METHOD: TWO LAYERS, because neither one is sufficient and the first draft of
-this file shipped with only one.
+WHAT IS CHECKED, AND WHAT DELIBERATELY IS NOT.
 
-  1. CHARACTER SET. Any Lithuanian letter in a string literal. This catches
-     words nobody thought to list, which is most of them.
-  2. WORD STEMS. Lithuanian written WITHOUT diacritics -- `Rankinis`,
-     `ivykdytas`, `virsytas`. Layer 1 is blind to these by construction, and
-     five of the messages found on 2026-08-04 were exactly this. Verified
-     rather than assumed: reinstating a real violation made layer 1 report only
-     the em dash beside it and say nothing about the two Lithuanian words.
+Checked: Lithuanian written WITHOUT its diacritics (`virsytas`, `ivykdyta`), and
+the em dash. Both are spelling and typography rules, and both hold whatever
+language a message is written in.
 
-The first version of this file dropped an existing word-list check in favour of
-layer 1 and described that as the stronger method. It was not stronger, it was
-DIFFERENT, and dropping the other left a hole exactly where the day's most
-common defect lived. Recorded here because the reasoning error is easier to
-repeat than the bug.
+NOT checked, removed the same evening it was added: "no Lithuanian anywhere".
+That layer swept the 2026-08-04 migration and then had to go, because LANGUAGE
+IS NOT AN INVARIANT OF THIS SYSTEM -- it is a property of presentation. Robert
+OS may be multilingual; the DB already keeps English identifiers
+(`utilities_electric`) with Lithuanian labels rendered from them. A rule
+forbidding a language would have frozen a presentation choice into a technical
+guard, which is the same layer confusion that produced the evening's other
+defects: a decision written where only a fact belongs.
+
+It was also a migration guard in the literal sense, like `LABEL_FUEL_LEGACY`
+the same morning: it did its sweep, and a migration that is never deleted
+becomes a permanent rule nobody chose.
+
+The removed layer had a second flaw worth remembering. It could not see
+Lithuanian stripped of diacritics -- that is what the word list below is for,
+and the first draft of this file dropped the word list IN FAVOUR of the
+character scan, calling it stronger. It was not stronger, it was DIFFERENT.
+Proved rather than argued: reinstating a real violation made the character scan
+report only the em dash beside it and say nothing about the two Lithuanian
+words.
 
 Scanning literals rather than call sites catches text assigned to a variable and
 passed in later, which is how `fail_action` and the `_mark_manual_required`
@@ -96,19 +106,28 @@ def _literals(filename):
     return out
 
 
-# Lithuanian stems that SURVIVE having their diacritics stripped, so layer 1
-# cannot see them. Chosen to have no English collision: "is" (for "iš") and
-# "be" are deliberately absent, because both are ordinary English words and a
-# guard that cries wolf gets switched off.
+# Lithuanian stems that LOSE a diacritic when stripped, and only those.
+#
+# EVERY ENTRY WAS CHECKED AGAINST WHAT THE WORD ACTUALLY IS, not against how it
+# looks. That check was skipped when this list was first written on 2026-08-04,
+# and the list quietly held `pirkimas`, `likutis`, `reikia`, `praleisti`,
+# `senka`, `kaina`, `diena`, `klaida` and a dozen more -- all CORRECT Lithuanian
+# needing no diacritic at all. It never fired, because every message was English
+# that day; the moment the warning came back in Lithuanian it reported seven
+# violations, none of them real.
+#
+# The same mistake had been found and fixed in benas-bot's guard hours earlier,
+# and was not carried across to this one. A guard that reports correct spelling
+# as a defect teaches its reader to skim past it, and then it catches nothing.
 BARE_LITHUANIAN = {
-    "rankinis", "ivykdytas", "ivykdyta", "pirkimas", "pirkimai", "pirkimu",
-    "pardavimas", "kiekis", "kaina", "verte", "mokestis", "orderis", "orderi",
-    "orderiu", "nepavyko", "priezastis", "klaida", "atsakymas", "atsakyma",
-    "likutis", "diena", "priimta", "daline", "apimtimi", "automatika",
-    "sustabdyta", "siam", "ivykiui", "patikrink", "ranka", "virsytas", "virs",
-    "neuzklausiamas", "uzklausu", "lesu", "dalys", "netinkamas", "netinkama",
-    "truksta", "uzimtas", "uzraktas", "mazesne", "minimalu", "leidimu",
-    "nepakanka", "praleisti", "reikia", "balanse", "senka", "demesio",
+    "ivykdyta", "ivykdytas", "ivykiui", "irasyta", "irasas",
+    "islaida", "islaidos", "verte", "priezastis", "uzsaldyta",
+    "virsytas", "virs", "lesu", "uzimtas", "uzraktas", "uzklausu",
+    "neuzklausiamas", "mazesne", "minimalu", "leidimu", "truksta",
+    "pirkimu", "orderi", "orderiu", "atsakyma", "daline", "siam",
+    "demesio", "menesio", "menesi", "savaite", "aciu", "siandien",
+    "biudzetas", "sekmingai", "atsauk", "istrinti", "isjungta",
+    "ijungta", "uzrasyta", "prasau",
 }
 
 
@@ -122,15 +141,6 @@ def test_no_bare_lithuanian_in_any_source_string(t):
         bad = [f"{f}:{ln} {v[:50]!r}" for ln, v, _ in _literals(f)
                if _words(v) & BARE_LITHUANIAN]
         t.check(f"{f} has no undiacriticed Lithuanian", bad, [])
-
-
-def test_no_lithuanian_in_any_source_string(t):
-    # Every message the bot sends is English as of 2026-08-04. Lithuanian
-    # anywhere in a literal now means either a message that was missed or a new
-    # one written in the old habit.
-    for f in FILES:
-        bad = [f"{f}:{ln} {v[:50]!r}" for ln, v, _ in _literals(f) if set(v) & LITHUANIAN]
-        t.check(f"{f} has no Lithuanian", bad, [])
 
 
 def test_no_em_dash_in_anything_that_can_be_sent(t):
@@ -166,7 +176,6 @@ def test_every_source_file_was_actually_read(t):
 
 if __name__ == "__main__":
     sys.exit(Runner("message charset: Lithuanian and em dash, all messages").run([
-        ("no Lithuanian in any source string", test_no_lithuanian_in_any_source_string),
         ("no undiacriticed Lithuanian either", test_no_bare_lithuanian_in_any_source_string),
         ("no em dash in anything sendable", test_no_em_dash_in_anything_that_can_be_sent),
         ("the scanner can actually fail", test_the_scanner_can_actually_fail),

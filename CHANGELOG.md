@@ -6,6 +6,34 @@ History before 2026-07-18 (Phase 1 -- Kraken + Strike execution, notifications, 
 
 ## 2026-08-04 (antradienis -- Chicago)
 
+### notify: ispejimas grazintas i lietuviu kalba, o sargyba susiaurinta -- v1.8.1
+- Roberto gavo pirma nauja formato ispejima gyvai ir pasake, kad angliskas
+  „neiprastas ir saltas". Pasirinkimas EN buvo padarytas is perziuros, o
+  sprendimas -- pagyvenus su juo
+- **Grazintas TIK ispejimas.** Pranesimas po pirkimo lieka angliskas, ir tai ne
+  nenuoseklumas: jis yra duomenu lentele (`Amount / Price / Cost / Fee`), o
+  ispejimas -- sakinys, kuriuo i Roberto kreipiamasi. Registrai skirtingi
+- **Is sargybos PASALINTAS sluoksnis „jokios lietuviu kalbos".** Ne ideta
+  isimtis -- isimciu sarasai ilgainiui priima naujus irasus. Priezastis
+  principine: kalba nera sios sistemos invariantas, ji yra pateikimo savybe.
+  DB jau laiko angliskus identifikatorius (`utilities_electric`) su lietuviskais
+  uzrasais, renderiuojamais is ju. Taisykle, draudzianti kalba, butu uzsaldziusi
+  pateikimo pasirinkima techninej sargyboj -- tas pats sluoksniu maisymas, kuris
+  ta vakara pagimde ir kitus defektus
+- Sluoksnis buvo migracijos sargyba tiesiogine prasme, kaip `LABEL_FUEL_LEGACY`
+  ta pati ryta: atliko savo perzvalga ir turejo dingti
+- **Ir ta pati sargyba iskart pagavo klaida savo paciame sarase.**
+  `BARE_LITHUANIAN` turejo `pirkimas`, `likutis`, `reikia`, `praleisti`,
+  `senka`, `kaina`, `diena`, `klaida` -- TAISYKLINGUS zodzius, kuriems
+  diakritiku nereikia. Sarasas niekada nesuveike, nes visos zinutes buvo
+  angliskos; grazinus lietuviska ispejima jis pranese septynis pazeidimus, ir
+  ne vienas ju nebuvo tikras. **Ta pati klaida buvo rasta ir istaisyta
+  benas-bot sargyboje kelias valandas anksciau ir neperkelta i sita.** Sarasas
+  perziuretas po viena zodi: liko tik tie, kurie NUSTOJA diakritiko
+- Lieka du sluoksniai, ir jie yra tikrosios rasymo taisykles: niekada be
+  diakritiku, niekada em bruksnio. Jie galioja bet kuria kalba parasytai
+  zinutei
+
 ### notify: every message the bot sends is now English, and the writing rules are enforced on all of them -- v1.8.0, `kraken_sync` v1.2.3
 - Found by asking whether `kraken_run` shared the defects just fixed in `strike_run`. It did not: escaping, timezones and apostrophes were all clean there. What the check turned up instead was a surface nobody had looked at as a SET
 - **Eighteen of twenty-six Telegram messages were still Lithuanian**, including the whole error family (`DCA KLAIDA`, `Priežastis:`, `Kraken atsakymas:`, fifteen translated Kraken error codes) and the manual-fill announcement in `kraken_sync`. They sat beside the two messages anglicised earlier the same day. The clearest case: the cap-skip line existed word for word in both files and, for about an hour, in two different languages
