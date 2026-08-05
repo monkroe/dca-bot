@@ -4,6 +4,17 @@ Conventions: dates are **Chicago** time (the bot's trading timezone); a "vakaras
 
 History before 2026-07-18 (Phase 1 -- Kraken + Strike execution, notifications, reconciliation, impact/all-in bps telemetry) is in `git log`; this changelog starts at Phase 2.
 
+## 2026-08-05 (trečiadienis -- Chicago)
+
+### notify: the fill message was stamped with the time we NOTICED the fill -- v1.8.2
+- Found while checking the morning KAS buy against the row it wrote. The message was headed `06:58:10 CDT`; Kraken's `closetm` for that order says `06:54:26 CDT`. **224 seconds of our own polling, printed under the word FILLED with nothing saying it was a reading time**
+- Not a rounding slip and not new: since the maker-first cutover the leg RESTS in the book, and a later cron cycle finalizes it. The gap is the poll interval, so it grows exactly when the order took longest to fill -- the case where the fill time is worth the most
+- **The right instant was already in the file.** `fill_timestamp()` was extracted for precisely this distinction, docstring and measured lag included (avg 17.7s, max 151.4s over 33 rows), and wired into the reference-mid join ALONE. So the ROW knew when the fill happened while the one rendering Roberto reads did not. Same shape as the reserve line the day before: one truth, two renderings, one of them fixed
+- `fill_time_label()` renders it, and `finalize_order` now resolves the instant ONCE and hands it to both the bps join and the message, so the two cannot drift apart again
+- **`execution_finished_at` deliberately unchanged.** It is the observation time and that is a real fact -- it is what measures the polling lag. The row keeps both; only the message had to choose which one it was claiming to show
+- `tests/test_fill_time.py`, 9 assertions off the real order as Kraken returned it: `closetm` wins, the shipped string is named as the defect rather than left implied, the fallback holds for absent/null/garbage `closetm`, and the zone label is READ (a January fixture must print CST -- `strike_run` shipped a hand-typed `CST` that was wrong half the year)
+- Dry-run fill message left on `now()`: there is no `closetm` to read when no order exists
+
 ## 2026-08-04 (antradienis -- Chicago)
 
 ### notify: ispejimas grazintas i lietuviu kalba, o sargyba susiaurinta -- v1.8.1

@@ -50,7 +50,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from ohlc import build_daily_metrics
 
-VERSION = "1.8.1"
+VERSION = "1.8.2"
 
 # ═══════════════════════════════════════════════════════════════
 #  ICONS — single source of truth for all UI symbols
@@ -299,6 +299,22 @@ def fill_timestamp(order_data: dict, observed_at: datetime) -> datetime:
     except (TypeError, ValueError, OSError, OverflowError):
         pass
     return observed_at
+
+
+def fill_time_label(fill_at: datetime) -> str:
+    """Chicago stamp for the line under the word FILLED.
+
+    It is fed `fill_timestamp`, not the moment a cron cycle noticed the fill.
+    On 2026-08-05 the KAS order closed at 06:54:26 CT and the message was
+    stamped 06:58:10 CT: 224s of our own polling, printed with nothing saying
+    it was a reading time. `fill_timestamp` had been extracted for exactly that
+    distinction months earlier and wired into the bps join ALONE, so the row
+    knew the right instant while the one rendering Roberto reads did not.
+
+    `execution_finished_at` stays the observation time on purpose. The two are
+    different facts, the row keeps both, and only the message had to choose.
+    """
+    return fill_at.astimezone(CHICAGO_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
 def get_7d_ref_price(pair: str, user_id: str) -> float | None:
@@ -1237,6 +1253,11 @@ def finalize_order(cl_ord_id: str, order_id: str, mid: float | None = None, ohlc
 
     finished_at_utc = datetime.now(timezone.utc)
     finished_at_iso = finished_at_utc.isoformat()
+    # WHEN it filled, as opposed to when we noticed. Resolved once and shared
+    # by the two places that must agree: the reference-mid join below and the
+    # Telegram stamp. Falls back to the observation time only when Kraken sent
+    # no closetm.
+    filled_at_utc = fill_timestamp(order_data, finished_at_utc)
 
     # ── pair ─────────────────────────────────────────────────
     # cl_ord_id carries OUR config's pair string; Kraken's descr.pair can use
@@ -1258,7 +1279,7 @@ def finalize_order(cl_ord_id: str, order_id: str, mid: float | None = None, ohlc
     ref_mid_ts = None
     if vol_exec > 0 and avg_px > 0 and pair != "?":
         ref_mid, mid_source, ref_mid_ts = resolve_reference_mid(
-            pair, fill_timestamp(order_data, finished_at_utc), mid)
+            pair, filled_at_utc, mid)
     elif mid is not None and mid > 0 and vol_exec > 0 and avg_px > 0:
         # No pair to look a snapshot up by — keep the pre-v1.5.0 behaviour
         # rather than dropping the metric entirely.
@@ -1328,7 +1349,7 @@ def finalize_order(cl_ord_id: str, order_id: str, mid: float | None = None, ohlc
     )
 
     if TG_NOTIFY_ON_FILL:
-        filled_ts = finished_at_utc.astimezone(CHICAGO_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
+        filled_ts = fill_time_label(filled_at_utc)
 
         # Market context is its own block, separated from the settlement
         # figures by a blank line: the numbers above are what was paid, the
