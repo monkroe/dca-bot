@@ -5,6 +5,13 @@ Part of the Robert OS ecosystem — see ~/robert-os-hub/CLAUDE.md for full conte
 
 ---
 
+## Code constraints
+
+- Stdlib-only Python: no external dependencies unless explicitly approved.
+- Never commit secrets. All keys stay in GitHub Actions / Supabase secrets.
+
+---
+
 ## Termux / Android Constraints
 
 - `/tmp` is NOT writable in Termux — all bash tools that use `/tmp` will fail with `EACCES: permission denied`
