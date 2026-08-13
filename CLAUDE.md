@@ -12,11 +12,15 @@ Part of the Robert OS ecosystem — see ~/robert-os-hub/CLAUDE.md for full conte
 
 ---
 
-## Termux / Android Constraints
+## Termux / Android constraints
 
-- `/tmp` is NOT writable in Termux — all bash tools that use `/tmp` will fail with `EACCES: permission denied`
-- This means test scripts cannot be run via Claude Code bash tools
-- **Do NOT attempt to run bash tools** — they will always fail
-- Instead: generate the correct single-line command and ask the user to run it in Termux manually
-- User will paste the output back if needed
-- This is a hard Android limitation, not a configuration issue — do not try to fix it
+- Claude Code runs inside the Ubuntu proot: `/tmp` exists and is writable
+  (tmpfs), cleared on each new proot session -- nothing may be left there
+  between sessions.
+- Native Termux: `/tmp` exists but is NOT writable (owned by `shell`, mode
+  `drwxrwx--x`). The writable temp dir is `$TMPDIR`
+  (`/data/data/com.termux/files/usr/tmp`). Verified 2026-08-13.
+- Bash through Claude Code works. If a script fails, diagnose the actual
+  constraint before modifying the script or blaming the environment.
+- Commands intended for Roberto to run must be single-line and copy-paste
+  ready.
