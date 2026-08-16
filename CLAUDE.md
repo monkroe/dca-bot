@@ -5,6 +5,18 @@ Part of the Robert OS ecosystem — see ~/robert-os-hub/CLAUDE.md for full conte
 
 ---
 
+## Execution mode
+
+Follows `AI-PLAYBOOK.md`'s CHAT-ONLY/REPO-CAPABLE mode split — this repo has no local override.
+
+## Money
+
+Roberto controls his money. Topping up accounts, transfer timing and the fate
+of resting orders are his routine, not project tasks. Never write them as
+open items, deadlines or reminders to him.
+
+---
+
 ## Code constraints
 
 - Stdlib-only Python: no external dependencies unless explicitly approved.
