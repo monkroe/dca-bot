@@ -56,7 +56,6 @@ def sb_request(method, path, body=None, params=None):
         url += "?" + urllib.parse.urlencode(params, doseq=True)
     headers = {
         "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
         "Content-Type": "application/json",
         "Prefer": "return=representation",
     }
@@ -79,7 +78,6 @@ def sb_update(table, match_params, updates):
         url, data=data, method="PATCH",
         headers={
             "apikey": SUPABASE_KEY,
-            "Authorization": f"Bearer {SUPABASE_KEY}",
             "Content-Type": "application/json",
             "Prefer": "return=representation",
         },

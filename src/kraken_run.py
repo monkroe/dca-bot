@@ -152,7 +152,6 @@ def sb_request(method: str, path: str, body=None, params: dict | None = None):
 
     headers = {
         "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
         "Content-Type": "application/json",
         "Prefer": "return=representation",
     }
@@ -184,7 +183,6 @@ def sb_update(table: str, match_params: dict, updates: dict):
         method="PATCH",
         headers={
             "apikey": SUPABASE_KEY,
-            "Authorization": f"Bearer {SUPABASE_KEY}",
             "Content-Type": "application/json",
             "Prefer": "return=representation",
         },

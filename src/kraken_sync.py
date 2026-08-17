@@ -135,7 +135,6 @@ def sb_upsert(table: str, rows: list[dict], on_conflict: str) -> None:
         data=json.dumps(rows).encode(),
         headers={
             "apikey": kr.SUPABASE_KEY,
-            "Authorization": f"Bearer {kr.SUPABASE_KEY}",
             "Content-Type": "application/json",
             "Prefer": "resolution=merge-duplicates,return=minimal",
         },
