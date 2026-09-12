@@ -140,6 +140,10 @@ PENDING_DECISION_STATUSES = (
     "rejected_postonly_dry_run",
 )
 
+# Durable ownership state for an intentional re-peg whose original maker
+# exposure has not yet been authoritatively resolved.
+REPEG_RECOVERY_STATUS = "repeg_recovery_pending"
+
 # ═══════════════════════════════════════════════════════════════
 #  SUPABASE CLIENT (lightweight, no SDK needed)
 # ═══════════════════════════════════════════════════════════════
@@ -1222,7 +1226,8 @@ def finalize_order(cl_ord_id: str, order_id: str, mid: float | None = None, ohlc
                 for name, col in (("H7", "h7"), ("H30", "h30"), ("H90", "h90"))
                 if row0.get(col) is not None
             }
-        if cur_status is not None and cur_status not in ("claimed", "placed", "limit_open"):
+        if cur_status is not None and cur_status not in (
+                "claimed", "placed", "limit_open", REPEG_RECOVERY_STATUS):
             print(f"  finalize skip: {cl_ord_id} already terminal ({cur_status})")
             return
     except Exception as e:
@@ -1324,17 +1329,38 @@ def finalize_order(cl_ord_id: str, order_id: str, mid: float | None = None, ohlc
                 prior_raw = loaded
     except Exception as e:
         print(f"  {ICONS['WARN']} raw merge lookup failed: {e}")
+    persisted_cost = cost
+    persisted_fee = fee
+    persisted_volume = vol_exec
+    persisted_avg = avg_px
+    transition = prior_raw.get("repeg_transition")
+    if isinstance(transition, dict):
+        if not _repeg_apply_generation_fill(transition, order_data, order_id):
+            print("  finalize deferred: re-peg cumulative fill evidence conflicts")
+            return
+        consumption = _repeg_consumption_updates(transition)
+        if consumption is None:
+            print("  finalize deferred: re-peg cumulative fill evidence malformed")
+            return
+        prior_raw["repeg_transition"] = transition
+        persisted_cost = consumption["filled_quote_cost"]
+        persisted_fee = consumption["fee_quote"]
+        persisted_volume = consumption["filled_base_volume"]
+        persisted_avg = consumption["avg_price"]
     merged_raw = {**prior_raw, **(order_data if isinstance(order_data, dict) else {})}
+    if isinstance(transition, dict):
+        merged_raw["repeg_transition"] = transition
 
     sb_update(
         "dca_executions",
         {"cl_ord_id": f"eq.{cl_ord_id}"},
         {
             "status": "filled",
-            "filled_quote_cost": cost,
-            "fee_quote": fee,
-            "filled_base_volume": vol_exec,
-            "avg_price": avg_px,
+            "order_id": order_id,
+            "filled_quote_cost": persisted_cost,
+            "fee_quote": persisted_fee,
+            "filled_base_volume": persisted_volume,
+            "avg_price": persisted_avg,
             "execution_finished_at": finished_at_iso,
             "raw": json.dumps(merged_raw),
             "impact_bps": impact_bps,
@@ -1542,15 +1568,38 @@ def _cancel_confirm_readback(row: dict) -> str | None:
     cost = float(o.get("cost", 0) or 0)
     fee = float(o.get("fee", 0) or 0)
     price = float(o.get("price", 0) or 0)
-    new_status = "canceled_partial" if vol_exec > 0 else "canceled_unfilled"
+    prior_raw = _safe_json_load(row.get("raw")) or {}
+    transition = prior_raw.get("repeg_transition")
+    consumption = None
+    if isinstance(transition, dict):
+        transition["last_provider_observation"] = o
+        transition["last_provider_observed_at"] = _now_utc_iso()
+        if not _repeg_apply_generation_fill(transition, o, oid):
+            return None
+        consumption = _repeg_consumption_updates(transition)
+        if consumption is None:
+            return None
+        prior_raw["repeg_transition"] = transition
+    merged_raw = {**prior_raw, **o}
+    if isinstance(transition, dict):
+        merged_raw["repeg_transition"] = transition
+        cumulative_cost = consumption["filled_quote_cost"]
+        cumulative_volume = consumption["filled_base_volume"]
+        new_status = ("canceled_partial"
+                      if cumulative_volume > 0 or cumulative_cost > 0
+                      else "canceled_unfilled")
+    else:
+        new_status = "canceled_partial" if vol_exec > 0 else "canceled_unfilled"
     print(f"    readback: vol_exec={vol_exec} cost=${cost} fee=${fee} -> {new_status}")
 
     updates = {
         "status": new_status,
         "execution_finished_at": _now_utc_iso(),
-        "raw": json.dumps(o),
+        "raw": json.dumps(merged_raw),
     }
-    if vol_exec > 0:
+    if consumption is not None:
+        updates.update(consumption)
+    elif vol_exec > 0:
         updates.update({
             "filled_quote_cost": cost,
             "fee_quote": fee,
@@ -2212,11 +2261,9 @@ def _maybe_repeg(row: dict, o: dict, settings: dict, user_id: str, window_end) -
     Scope (MVP): re-pegs ONLY a fully-unfilled leg. Any partial fill is left
     to the deadline -> fallback path (partial-aware re-peg is a later phase).
 
-    Crash-safety (claim-first): the current order is canceled and confirmed
-    zero-fill, then the row is parked as `claimed` (order_id NULL) with
-    raw.kraken_cl = the NEXT client id BEFORE AddOrder. So a crash between
-    AddOrder and the DB commit is recovered by reconciliation, which searches
-    raw.kraken_cl and restores limit_open instead of orphaning the order.
+    Crash-safety: durable re-peg ownership and the deterministic replacement
+    request are persisted before CancelOrder. Later maker inspection owns every
+    provider readback and spend transition from that state.
 
     Returns True if a re-peg was performed (caller stops handling this row
     this cycle); False otherwise (caller falls through to normal 'waiting')."""
@@ -2242,6 +2289,15 @@ def _maybe_repeg(row: dict, o: dict, settings: dict, user_id: str, window_end) -
 
     raw = _safe_json_load(row.get("raw")) or {}
     repeg_count = int(raw.get("repeg_count") or 0)
+    prior_transition = raw.get("repeg_transition")
+    if not isinstance(prior_transition, dict):
+        prior_transition = {}
+    cumulative = _repeg_cumulative_consumption(prior_transition)
+    if cumulative is None:
+        log_repeg_probe(row, "not_evaluated", "persisted re-peg fills malformed")
+        return False
+    prior_cost, prior_fee, _prior_volume = cumulative
+    current_provider_cl = raw.get("kraken_cl") or cl
     repeg_max = int(settings.get("repeg_max") or 5)
     min_ticks = int(settings.get("repeg_min_ticks") or 1)
 
@@ -2262,7 +2318,8 @@ def _maybe_repeg(row: dict, o: dict, settings: dict, user_id: str, window_end) -
 
     tick = 10 ** (-pair_info["pair_decimals"])
     total_target = float(row["requested_quote_amount_base"])
-    safe_total = max(total_target - USD_SAFETY_MARGIN, 0.0)
+    remaining = total_target - prior_cost - prior_fee
+    safe_total = max(remaining - USD_SAFETY_MARGIN, 0.0)
     maker_rate = max(float(settings.get("maker_fee_rate") or 0.004), 0.0)
     cost_target = safe_total / (1.0 + maker_rate)
     cap_pct, require_h90 = cap_params(settings)
@@ -2283,40 +2340,10 @@ def _maybe_repeg(row: dict, o: dict, settings: dict, user_id: str, window_end) -
         return False
     new_bid = detail
 
-    # ── Cancel current resting order, confirm it was zero-fill ──
-    try:
-        kraken_private("CancelOrder", {"txid": oid})
-    except KrakenError as e:
-        print(f"    repeg: cancel error (may already be gone): {e}")
-    try:
-        od = kraken_private("QueryOrders", {"txid": oid})
-        oc = od.get(oid) or {}
-    except Exception as e:
-        print(f"    repeg: readback failed ({e}) — leave for next cycle")
-        return False
-    st = oc.get("status", "")
-    if st == "closed" or float(oc.get("vol_exec", 0) or 0) > 0:
-        # Filled (fully or partially) during the cancel race — do NOT re-peg;
-        # the normal inspection path finalizes/handles it next cycle.
-        print(f"    repeg: fill during cancel race (status={st}) — abort")
-        return False
-    if st not in ("canceled", "expired"):
-        print(f"    repeg: cancel not confirmed (status={st}) — leave for next cycle")
-        return False
-
     new_vol = floor_to_decimals(cost_target / new_bid, pair_info["lot_decimals"])
-    new_cl = f"{cl}-r{repeg_count + 1}"
+    next_count = repeg_count + 1
+    new_cl = f"{cl}-r{next_count}"
     new_price_str = f"{new_bid:.{pair_info['pair_decimals']}f}"
-
-    # Claim-first: record intent (kraken_cl + parked as claimed) BEFORE AddOrder.
-    raw["kraken_cl"] = new_cl
-    raw["repeg_count"] = repeg_count + 1
-    raw.setdefault("repeg_history", []).append(
-        {"n": repeg_count + 1, "from": cur_price, "to": new_bid, "at": _now_utc_iso()})
-    sb_update("dca_executions", {"cl_ord_id": f"eq.{cl}"}, {
-        "status": "claimed", "order_id": None, "raw": json.dumps(raw),
-    })
-
     repeg_params = {
         "pair": pair, "type": "buy", "ordertype": "limit",
         "price": new_price_str,
@@ -2324,42 +2351,613 @@ def _maybe_repeg(row: dict, o: dict, settings: dict, user_id: str, window_end) -
         "oflags": "post,fciq",
         "cl_ordid": new_cl,
     }
+    transition_at = _now_utc_iso()
+    deadline = window_end - timedelta(minutes=CRON_CYCLE_MINUTES)
+    transition = {
+        "phase": "cancel_pending",
+        "generation": next_count,
+        "original_order_id": oid,
+        "original_cl_ord_id": cl,
+        "original_provider_cl_ord_id": current_provider_cl,
+        "original_limit_price": cur_price,
+        "replacement_cl_ord_id": new_cl,
+        "replacement_price": new_bid,
+        "replacement_request": repeg_params,
+        "request_fingerprint": hashlib.sha256(
+            json.dumps(repeg_params, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
+        "generation_fills": [
+            dict(item) for item in (prior_transition.get("generation_fills") or [])
+            if isinstance(item, dict)
+        ],
+        "market_snapshot": {
+            "bid": bid, "ask": ask, "mid": ticker.get("mid"),
+            "observed_at": transition_at,
+        },
+        "transition_at": transition_at,
+        "maker_deadline": deadline.isoformat(),
+        "window_end": window_end.isoformat(),
+        "fallback_cutoff": (
+            window_end + timedelta(minutes=I6_GRACE_MINUTES)
+        ).isoformat(),
+        "manual_at": (
+            window_end + timedelta(minutes=LIMIT_TTL_MINUTES)
+        ).isoformat(),
+    }
+    transition["last_provider_observation"] = o
+    transition["last_provider_observed_at"] = transition_at
+    if not _repeg_apply_generation_fill(transition, o, oid):
+        log_repeg_probe(row, "not_evaluated", "current provider fill conflicts")
+        return False
+    entry_consumption = _repeg_consumption_updates(transition)
+    if entry_consumption is None:
+        return False
+    raw["kraken_cl"] = new_cl
+    raw["repeg_count"] = next_count
+    raw.setdefault("repeg_history", []).append(
+        {"n": next_count, "from": cur_price, "to": new_bid,
+         "at": transition_at, "phase": "recovery_armed"})
+    raw["repeg_transition"] = transition
+
+    # The external cancel is forbidden until this compare-and-set proves that
+    # this run still owns the exact resting order it inspected.
     try:
-        result = kraken_private("AddOrder", repeg_params)
-        new_oid = result.get("txid", [None])[0]
-    except KrakenError as e:
-        # Repost failed/rejected: the old leg is already canceled (zero-fill),
-        # so resolve the event straight to a taker fallback for the full budget
-        # (mirrors the initial post-only-reject path).
-        low = str(e).lower()
-        note = "post-only rejected" if "post only" in low else f"AddOrder failed: {e}"
-        print(f"    repeg: repost {note} — routing to fallback")
-        # MERGE, never replace: raw carries repeg_count and the history, and
-        # overwriting it would reset the count so the leg re-pegs forever.
-        raw["last_failure"] = _failure_note(repeg_params, e, leg="repeg")
-        sb_update("dca_executions", {"cl_ord_id": f"eq.{cl}"}, {
-            "status": "rejected_postonly", "order_id": None,
-            "limit_price": new_bid,
+        armed = sb_update("dca_executions", {
+            "cl_ord_id": f"eq.{cl}",
+            "status": "eq.limit_open",
+            "order_id": f"eq.{oid}",
+        }, {
+            "status": REPEG_RECOVERY_STATUS,
+            "raw": json.dumps(raw),
+            **entry_consumption,
+        })
+    except Exception as e:
+        print(f"    repeg: recovery arm failed ({e}) — original order untouched")
+        return False
+    if not isinstance(armed, list) or len(armed) != 1:
+        print("    repeg: recovery arm lost ownership — original order untouched")
+        return False
+
+    # Cancel/readback remains useful telemetry and can reduce latency, but it
+    # is not the correctness mechanism: every outcome leaves the durable row
+    # for the next run's authoritative recovery owner.
+    try:
+        kraken_private("CancelOrder", {"txid": oid})
+        transition["phase"] = "cancel_requested"
+        transition["cancel_requested_at"] = _now_utc_iso()
+    except Exception as e:
+        transition["last_cancel_error"] = str(e)
+        print(f"    repeg: cancel error (recovery remains armed): {e}")
+    oc = None
+    try:
+        od = kraken_private("QueryOrders", {"txid": oid})
+        oc = od.get(oid) if isinstance(od, dict) else None
+        if isinstance(oc, dict):
+            transition["last_provider_observation"] = oc
+            transition["last_provider_observed_at"] = _now_utc_iso()
+    except Exception as e:
+        transition["last_readback_error"] = str(e)
+        print(f"    repeg: readback failed ({e}) — recovery remains armed")
+    raw["repeg_transition"] = transition
+    telemetry_updates = {"raw": json.dumps(raw)}
+    if isinstance(oc, dict) and _repeg_apply_generation_fill(transition, oc, oid):
+        raw["repeg_transition"] = transition
+        telemetry_updates["raw"] = json.dumps(raw)
+        telemetry_updates.update(_repeg_consumption_updates(transition) or {})
+    try:
+        sb_update("dca_executions", {
+            "cl_ord_id": f"eq.{cl}",
+            "status": f"eq.{REPEG_RECOVERY_STATUS}",
+            "order_id": f"eq.{oid}",
+        }, telemetry_updates)
+    except Exception as e:
+        print(f"    repeg: transition telemetry update failed ({e})")
+    return True
+
+
+def _repeg_time(value):
+    """Parse one frozen recovery deadline into a Chicago-aware datetime."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=CHICAGO_TZ)
+        return parsed.astimezone(CHICAGO_TZ)
+    except (TypeError, ValueError):
+        return None
+
+
+def _repeg_number(order: dict, key: str):
+    if key not in order or order.get(key) in (None, ""):
+        return None
+    try:
+        value = float(order[key])
+        return value if value >= 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+
+def _repeg_fill_identity(transition: dict, order: dict, order_id: str | None):
+    """Identify the one provider order represented by a cumulative observation."""
+    generation = int(transition.get("generation") or 0)
+    provider_cl = order.get("cl_ordid") or order.get("cl_ord_id")
+    replacement_cl = transition.get("replacement_cl_ord_id")
+    replacement_oid = transition.get("replacement_order_id")
+    if ((order_id and replacement_oid and order_id == replacement_oid)
+            or (provider_cl and provider_cl == replacement_cl)):
+        return generation, order_id or replacement_oid, replacement_cl
+    return (
+        max(generation - 1, 0),
+        order_id or transition.get("original_order_id"),
+        provider_cl or transition.get("original_provider_cl_ord_id")
+        or transition.get("original_cl_ord_id"),
+    )
+
+
+def _repeg_apply_generation_fill(transition: dict, order: dict,
+                                 order_id: str | None = None) -> bool:
+    """Upsert one generation's provider-cumulative fill evidence."""
+    vol_exec = _repeg_number(order, "vol_exec")
+    if vol_exec is None:
+        return False
+    cost = _repeg_number(order, "cost")
+    fee = _repeg_number(order, "fee")
+    if vol_exec > 0 and (cost is None or fee is None):
+        return False
+    cost = cost or 0.0
+    fee = fee or 0.0
+    generation, provider_oid, provider_cl = _repeg_fill_identity(
+        transition, order, order_id)
+    entries = [
+        dict(item) for item in (transition.get("generation_fills") or [])
+        if isinstance(item, dict)
+    ]
+    prior = next(
+        (item for item in entries if item.get("generation") == generation), None)
+    if prior and (
+            cost < float(prior.get("filled_quote_cost") or 0)
+            or fee < float(prior.get("fee_quote") or 0)
+            or vol_exec < float(prior.get("filled_base_volume") or 0)):
+        return False
+    entry = {
+        "generation": generation,
+        "provider_order_id": provider_oid,
+        "provider_client_id": provider_cl,
+        "filled_quote_cost": cost,
+        "fee_quote": fee,
+        "filled_base_volume": vol_exec,
+        "provider_status": str(order.get("status") or ""),
+        "observed_at": _now_utc_iso(),
+    }
+    if prior:
+        entries[entries.index(prior)] = entry
+    else:
+        entries.append(entry)
+    transition["generation_fills"] = sorted(
+        entries, key=lambda item: int(item.get("generation") or 0))
+    return True
+
+
+def _repeg_cumulative_consumption(transition: dict):
+    """Return the derived event totals; no remaining-budget value is stored."""
+    try:
+        entries = transition.get("generation_fills") or []
+        return (
+            sum(float(item.get("filled_quote_cost") or 0) for item in entries),
+            sum(float(item.get("fee_quote") or 0) for item in entries),
+            sum(float(item.get("filled_base_volume") or 0) for item in entries),
+        )
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _repeg_consumption_updates(transition: dict) -> dict | None:
+    cumulative = _repeg_cumulative_consumption(transition)
+    if cumulative is None:
+        return None
+    cost, fee, volume = cumulative
+    return {
+        "filled_quote_cost": cost,
+        "fee_quote": fee,
+        "filled_base_volume": volume,
+        "avg_price": (cost / volume) if volume > 0 else None,
+    }
+
+
+def _repeg_market_updates(transition: dict) -> dict:
+    """Reuse the decision-time book already frozen in the transition envelope."""
+    market = transition.get("market_snapshot")
+    if not isinstance(market, dict):
+        return {}
+    updates = {
+        key: market[key] for key in ("bid", "ask", "mid")
+        if market.get(key) is not None
+    }
+    if market.get("observed_at"):
+        updates["mid_ts"] = market["observed_at"]
+    return updates
+
+def _repeg_owned_update(row: dict, updates: dict,
+                        expected_raw: dict | None = None) -> bool:
+    """CAS one recovery-row transition and mirror a confirmed write locally."""
+    oid = ((_safe_json_load(row.get("raw")) or {}).get("repeg_transition") or {}).get(
+        "original_order_id") or row.get("order_id")
+    filters = {
+        "cl_ord_id": f"eq.{row['cl_ord_id']}",
+        "status": f"eq.{REPEG_RECOVERY_STATUS}",
+    }
+    if oid:
+        filters["order_id"] = f"eq.{oid}"
+    if expected_raw is not None:
+        filters["raw"] = "eq." + json.dumps(
+            expected_raw, sort_keys=True, separators=(",", ":"))
+    try:
+        changed = sb_update("dca_executions", filters, updates)
+    except Exception as e:
+        print(f"    repeg recovery CAS failed: {e}")
+        return False
+    if not isinstance(changed, list) or len(changed) != 1:
+        print("    repeg recovery CAS lost ownership or returned ambiguously")
+        return False
+    row.update(updates)
+    if "raw" in updates:
+        row["raw"] = _safe_json_load(updates["raw"]) or {}
+    return True
+
+
+
+def _repeg_mark_manual_required(row: dict, note: str) -> bool:
+    """Dead-letter only while status, provider order, and raw phase are owned."""
+    expected_raw = _safe_json_load(row.get("raw")) or {}
+    if not _repeg_owned_update(row, {
+            "status": "manual_required",
+            "reason": note,
+            "execution_finished_at": _now_utc_iso(),
+    }, expected_raw=expected_raw):
+        return False
+    tg_send(msg_fail(
+        "DCA MANUAL REQUIRED",
+        f"{row['trade_date_chicago']} | {row['pair']}\n"
+        f"order_id: {row.get('order_id') or '?'}\n{note}\n"
+        f"Automation stopped for this event. Check the order on Kraken by hand."
+    ))
+    return True
+
+def _repeg_record_observation(row: dict, transition: dict, order: dict,
+                              phase: str | None = None,
+                              provider_order_id: str | None = None) -> bool:
+    raw = _safe_json_load(row.get("raw")) or {}
+    if phase:
+        transition["phase"] = phase
+    if not _repeg_apply_generation_fill(
+            transition, order, provider_order_id or row.get("order_id")):
+        return False
+    transition["last_provider_observation"] = order
+    transition["last_provider_observed_at"] = _now_utc_iso()
+    raw["repeg_transition"] = transition
+    consumption = _repeg_consumption_updates(transition)
+    if consumption is None:
+        return False
+    updates = {"raw": json.dumps(raw), **consumption}
+    return _repeg_owned_update(row, updates)
+
+
+def _repeg_to_fallback(row: dict, transition: dict, settings: dict,
+                       user_id: str, window_end, order: dict) -> None:
+    """Hand a terminal original order to the unchanged fallback policy."""
+    cumulative = _repeg_cumulative_consumption(transition) or (0.0, 0.0, 0.0)
+    cumulative_cost, _cumulative_fee, cumulative_volume = cumulative
+    raw = _safe_json_load(row.get("raw")) or {}
+    transition["phase"] = "original_terminal_fallback"
+    raw["repeg_transition"] = transition
+    updates = {
+        "status": ("canceled_partial" if cumulative_volume > 0 or cumulative_cost > 0
+                   else "canceled_unfilled"),
+        "execution_finished_at": _now_utc_iso(),
+        "raw": json.dumps(raw),
+    }
+    if not _repeg_owned_update(row, updates):
+        return
+    _fallback_decision(row, settings, user_id, window_end,
+                       dry_run=False, scenario=None)
+
+
+def _repeg_replacement_matches(order: dict, client_id: str) -> bool:
+    return isinstance(order, dict) and (
+        order.get("cl_ordid") == client_id or order.get("cl_ord_id") == client_id
+    )
+
+
+def _repeg_find_replacement(client_id: str):
+    """Return (certainty, txid, order) across both Kraken order collections."""
+    try:
+        closed_result = kraken_private("ClosedOrders", {"cl_ordid": client_id})
+        open_result = kraken_private("OpenOrders")
+    except Exception as e:
+        print(f"    repeg replacement lookup failed: {e}")
+        return ("unknown", None, None)
+    if not isinstance(closed_result, dict) or not isinstance(open_result, dict):
+        return ("unknown", None, None)
+    found = []
+    for collection, key in ((closed_result, "closed"), (open_result, "open")):
+        orders = collection.get(key)
+        if orders is None:
+            orders = {}
+        if not isinstance(orders, dict):
+            return ("unknown", None, None)
+        for txid, order in orders.items():
+            if _repeg_replacement_matches(order, client_id):
+                found.append((txid, order))
+    if len(found) == 1:
+        return ("found", found[0][0], found[0][1])
+    if found:
+        print("    repeg replacement identity matched multiple provider orders")
+        return ("unknown", None, None)
+    return ("absent", None, None)
+
+
+def _repeg_find_original(order_id: str, client_id: str):
+    """Best-effort provider reconciliation when QueryOrders has no usable row."""
+    try:
+        open_result = kraken_private("OpenOrders")
+        closed_result = kraken_private("ClosedOrders", {"cl_ordid": client_id})
+    except Exception as e:
+        print(f"    repeg original reconciliation failed: {e}")
+        return None
+    found = []
+    for collection, key in ((open_result, "open"), (closed_result, "closed")):
+        orders = collection.get(key) if isinstance(collection, dict) else None
+        if orders is None:
+            orders = {}
+        if not isinstance(orders, dict):
+            return None
+        for txid, order in orders.items():
+            if txid == order_id or _repeg_replacement_matches(order, client_id):
+                found.append((txid, order))
+    exact = [order for txid, order in found if txid == order_id]
+    if len(exact) == 1:
+        return exact[0]
+    return found[0][1] if len(found) == 1 else None
+
+
+def _repeg_reconcile_ambiguous_submission(row: dict, transition: dict,
+                                          settings: dict, user_id: str,
+                                          now_chicago, window_end, manual_at) -> None:
+    client_id = transition.get("replacement_cl_ord_id")
+    if not client_id:
+        if manual_at and now_chicago > manual_at:
+            _repeg_mark_manual_required(row, "re-peg replacement identity missing at frozen TTL")
+        return
+    certainty, txid, order = _repeg_find_replacement(client_id)
+    if certainty != "found":
+        if manual_at and now_chicago > manual_at:
+            _repeg_mark_manual_required(
+                row, "re-peg replacement submission unresolved at frozen TTL")
+        return
+
+    status = str(order.get("status") or "")
+    vol_exec = _repeg_number(order, "vol_exec")
+    cost = _repeg_number(order, "cost")
+    fee = _repeg_number(order, "fee")
+    if vol_exec is None or (vol_exec > 0 and (cost is None or fee is None)):
+        if manual_at and now_chicago > manual_at:
+            _repeg_mark_manual_required(
+                row, "re-peg replacement fill fields malformed at frozen TTL")
+        return
+    raw = _safe_json_load(row.get("raw")) or {}
+    transition["replacement_order_id"] = txid
+    transition["replacement_provider_observation"] = order
+    transition["replacement_found_at"] = _now_utc_iso()
+    raw["repeg_transition"] = transition
+    if status in ("open", "pending"):
+        transition["phase"] = "replacement_attached"
+        _repeg_owned_update(row, {
+            "status": "limit_open",
+            "order_id": txid,
+            "limit_price": transition.get("replacement_price"),
+            **_repeg_market_updates(transition),
             "raw": json.dumps(raw),
         })
-        fresh = dict(row)
-        fresh["status"] = "rejected_postonly"
-        _fallback_decision(fresh, settings, user_id, window_end,
-                           dry_run=False, scenario=None)
-        return True
+        return
+    if status == "closed" and vol_exec > 0:
+        if _repeg_record_observation(
+                row, transition, order, "replacement_closed", txid):
+            finalize_order(row["cl_ord_id"], txid, mid=row.get("mid"))
+        return
+    if status in ("canceled", "expired"):
+        if _repeg_record_observation(
+                row, transition, order, "replacement_terminal", txid):
+            _repeg_to_fallback(row, transition, settings, user_id, window_end, order)
+        return
+    if manual_at and now_chicago > manual_at:
+        _repeg_mark_manual_required(row, "re-peg replacement provider state unresolved at frozen TTL")
 
-    # Preserve re-peg tracking (repeg_count/kraken_cl/history) in raw; nest the
-    # Kraken result rather than overwriting, or the count would reset next cycle.
-    raw["last_result"] = result
-    sb_update("dca_executions", {"cl_ord_id": f"eq.{cl}"}, {
-        "status": "limit_open", "order_id": new_oid,
-        "limit_price": new_bid,
-        "bid": bid, "ask": ask, "mid": ticker.get("mid"), "mid_ts": _now_utc_iso(),
-        "raw": json.dumps(raw),
+
+def _repeg_submit_replacement(row: dict, transition: dict, order: dict,
+                              settings: dict, user_id: str, window_end) -> None:
+    """Persist submission ambiguity first, then make at most one AddOrder call."""
+    cumulative = _repeg_cumulative_consumption(transition)
+    if cumulative is None:
+        return
+    cumulative_cost, cumulative_fee, _cumulative_volume = cumulative
+    remaining = (float(row["requested_quote_amount_base"])
+                 - cumulative_cost - cumulative_fee)
+    request = dict(transition.get("replacement_request") or {})
+    replacement_price = float(transition.get("replacement_price") or 0)
+    try:
+        pair_info = get_asset_pair_info(row["pair"])
+    except Exception as e:
+        print(f"    repeg replacement pair info failed: {e}")
+        return
+    maker_rate = max(float(settings.get("maker_fee_rate") or 0.004), 0.0)
+    safe_total = max(remaining - USD_SAFETY_MARGIN, 0.0)
+    cost_target = safe_total / (1.0 + maker_rate)
+    volume = (floor_to_decimals(cost_target / replacement_price,
+                                pair_info["lot_decimals"])
+              if replacement_price > 0 else 0.0)
+    if remaining <= 0 or volume <= 0 or volume < pair_info["ordermin"]:
+        _repeg_to_fallback(row, transition, settings, user_id, window_end, order)
+        return
+    request.update({
+        "pair": row["pair"], "type": "buy", "ordertype": "limit",
+        "price": f"{replacement_price:.{pair_info['pair_decimals']}f}",
+        "volume": format_volume(volume, pair_info["lot_decimals"]),
+        "oflags": "post,fciq",
+        "cl_ordid": transition["replacement_cl_ord_id"],
     })
-    print(f"  {ICONS['OK']} repeg #{repeg_count + 1}: {cur_price} -> {new_bid} "
-          f"(txid {new_oid}, vol {new_vol})")
-    return True
+    transition["phase"] = "replacement_submission_pending"
+    transition["replacement_request"] = request
+    transition["request_fingerprint"] = hashlib.sha256(
+        json.dumps(request, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    transition["replacement_submission_armed_at"] = _now_utc_iso()
+    raw = _safe_json_load(row.get("raw")) or {}
+    raw["repeg_transition"] = transition
+    if not _repeg_owned_update(row, {"raw": json.dumps(raw)}):
+        return
+
+    try:
+        result = kraken_private("AddOrder", request)
+    except KrakenError as e:
+        # KrakenError represents a parsed provider rejection. A duplicate is
+        # different: it may identify the very order whose response was lost.
+        transition["last_add_order_error"] = str(e)
+        raw["repeg_transition"] = transition
+        if "duplicate" in str(e).lower():
+            _repeg_owned_update(row, {"raw": json.dumps(raw)})
+            return
+        transition["phase"] = "replacement_rejected"
+        raw["last_failure"] = _failure_note(request, e, leg="repeg")
+        raw["repeg_transition"] = transition
+        if _repeg_owned_update(row, {
+            "status": "rejected_postonly", "raw": json.dumps(raw),
+        }):
+            _fallback_decision(row, settings, user_id, window_end,
+                               dry_run=False, scenario=None)
+        return
+    except Exception as e:
+        # A transport/timeout exception cannot prove whether Kraken accepted
+        # the order. The persisted client identity is now the only safe owner.
+        transition["last_add_order_error"] = str(e)
+        raw["repeg_transition"] = transition
+        _repeg_owned_update(row, {"raw": json.dumps(raw)})
+        return
+
+    txids = result.get("txid") if isinstance(result, dict) else None
+    new_oid = txids[0] if isinstance(txids, list) and txids else None
+    transition["replacement_result"] = result
+    if not new_oid:
+        raw["repeg_transition"] = transition
+        _repeg_owned_update(row, {"raw": json.dumps(raw)})
+        return
+    transition["phase"] = "replacement_attached"
+    transition["replacement_order_id"] = new_oid
+    raw["last_result"] = result
+    raw["repeg_transition"] = transition
+    _repeg_owned_update(row, {
+        "status": "limit_open", "order_id": new_oid,
+        "limit_price": replacement_price, "raw": json.dumps(raw),
+        **_repeg_market_updates(transition),
+    })
+
+
+def _recover_repeg(row: dict, settings: dict, user_id: str, now_chicago) -> None:
+    """Authoritative next-cycle owner for one durable re-peg transition."""
+    raw = _safe_json_load(row.get("raw")) or {}
+    transition = raw.get("repeg_transition")
+    if not isinstance(transition, dict):
+        _repeg_mark_manual_required(row, "re-peg recovery envelope missing")
+        return
+    deadline = _repeg_time(transition.get("maker_deadline"))
+    window_end = _repeg_time(transition.get("window_end"))
+    manual_at = _repeg_time(transition.get("manual_at"))
+    if not deadline or not window_end or not manual_at:
+        _repeg_mark_manual_required(row, "re-peg recovery deadlines malformed")
+        return
+
+    if str(transition.get("phase") or "").startswith("replacement_"):
+        _repeg_reconcile_ambiguous_submission(
+            row, transition, settings, user_id, now_chicago, window_end, manual_at)
+        return
+
+    oid = transition.get("original_order_id")
+    if not oid or oid != row.get("order_id"):
+        if now_chicago > manual_at:
+            _repeg_mark_manual_required(row, "re-peg original order identity unresolved at frozen TTL")
+        return
+    try:
+        result = kraken_private("QueryOrders", {"txid": oid})
+        order = result.get(oid) if isinstance(result, dict) else None
+    except Exception as e:
+        print(f"    repeg recovery QueryOrders failed: {e}")
+        order = None
+    if not isinstance(order, dict) or not str(order.get("status") or ""):
+        provider_cl = (transition.get("original_provider_cl_ord_id")
+                       or transition.get("original_cl_ord_id") or row["cl_ord_id"])
+        order = _repeg_find_original(oid, provider_cl)
+    if not isinstance(order, dict) or not str(order.get("status") or ""):
+        if now_chicago > manual_at:
+            _repeg_mark_manual_required(row, f"re-peg original order {oid} unresolved at frozen TTL")
+        return
+
+    status = str(order.get("status"))
+    vol_exec = _repeg_number(order, "vol_exec")
+    cost = _repeg_number(order, "cost")
+    fee = _repeg_number(order, "fee")
+    if vol_exec is None or (vol_exec > 0 and (cost is None or fee is None)):
+        if now_chicago > manual_at:
+            _repeg_mark_manual_required(row, "re-peg provider fill fields malformed at frozen TTL")
+        return
+
+    if status == "closed":
+        if vol_exec > 0:
+            if _repeg_record_observation(row, transition, order, "original_closed"):
+                finalize_order(row["cl_ord_id"], oid, mid=row.get("mid"))
+        elif now_chicago > manual_at:
+            _repeg_mark_manual_required(row, "re-peg original closed with no authoritative fill at frozen TTL")
+        return
+
+    if status in ("canceled", "expired"):
+        if not _repeg_record_observation(row, transition, order, "original_terminal"):
+            return
+        if now_chicago >= deadline:
+            _repeg_to_fallback(row, transition, settings, user_id, window_end, order)
+        else:
+            _repeg_submit_replacement(row, transition, order,
+                                      settings, user_id, window_end)
+        return
+
+    if status not in ("open", "pending"):
+        if now_chicago > manual_at:
+            _repeg_mark_manual_required(row, f"re-peg provider status {status!r} unresolved at frozen TTL")
+        return
+
+    # Open/pending means exposure is still possible. Preserve any partial fill,
+    # re-issue the idempotent cancel request, and never authorize another spend.
+    if not _repeg_record_observation(row, transition, order, "cancel_pending"):
+        return
+    try:
+        kraken_private("CancelOrder", {"txid": oid})
+        transition["phase"] = "cancel_requested"
+        transition["cancel_requested_at"] = _now_utc_iso()
+    except Exception as e:
+        transition["last_cancel_error"] = str(e)
+    raw = _safe_json_load(row.get("raw")) or {}
+    raw["repeg_transition"] = transition
+    _repeg_owned_update(row, {"raw": json.dumps(raw)})
+    if now_chicago > manual_at:
+        _repeg_mark_manual_required(row, "re-peg cancel remained nonterminal at frozen TTL")
+
+
+def _load_repeg_recovery_rows(user_id: str, select: str):
+    """The single selector for durable re-peg ownership."""
+    return sb_get("dca_executions", {
+        "user_id": f"eq.{user_id}",
+        "status": f"eq.{REPEG_RECOVERY_STATUS}",
+        "select": select,
+    }) or []
 
 
 def run_maker_inspection(settings: dict, user_id: str, now_chicago):
@@ -2367,7 +2965,8 @@ def run_maker_inspection(settings: dict, user_id: str, now_chicago):
     rollback flip to 'market' can never strand open maker legs."""
     sel = ("cl_ord_id,order_id,pair,status,trade_date_chicago,"
            "requested_quote_amount_base,parent_event_id,dca_order_id,raw,"
-           "execution_started_at,limit_price,mid,filled_quote_cost,fee_quote")
+           "execution_started_at,limit_price,mid,filled_quote_cost,fee_quote,"
+           "filled_base_volume,avg_price")
 
     # Pass 1: pending fallback decisions (crash recovery for the gap
     # between the canceled_*/rejected write and the decision record).
@@ -2389,7 +2988,19 @@ def run_maker_inspection(settings: dict, user_id: str, now_chicago):
                            dry_run=bool(raw.get("dry_run")),
                            scenario=raw.get("maker_scenario"))
 
-    # Pass 2: open maker legs
+    # Pass 2: durable re-peg transitions. This is the sole owner; recovery rows
+    # are deliberately excluded from both fallback-pending and limit_open.
+    try:
+        recovery_rows = _load_repeg_recovery_rows(user_id, sel)
+    except Exception as e:
+        print(f"  {ICONS['WARN']} re-peg recovery query failed: {e}")
+        recovery_rows = []
+    recovery_cl_ids = {row.get("cl_ord_id") for row in recovery_rows}
+    for row in recovery_rows:
+        print(f"  Re-peg recovery: {row['cl_ord_id']}")
+        _recover_repeg(row, settings, user_id, now_chicago)
+
+    # Pass 3: open maker legs
     try:
         open_rows = sb_get("dca_executions", {
             "user_id": f"eq.{user_id}",
@@ -2399,9 +3010,13 @@ def run_maker_inspection(settings: dict, user_id: str, now_chicago):
     except Exception as e:
         print(f"  {ICONS['WARN']} limit_open query failed: {e}")
         return
-    if not open_rows and not pending:
+    # One invocation grants each recovery snapshot only one state-machine turn.
+    open_rows = [
+        row for row in open_rows if row.get("cl_ord_id") not in recovery_cl_ids]
+    if not open_rows and not pending and not recovery_rows:
         return
-    print(f"\n{ICONS['RECON']} Maker inspection: {len(open_rows)} open, {len(pending)} pending")
+    print(f"\n{ICONS['RECON']} Maker inspection: {len(open_rows)} open, "
+          f"{len(pending)} pending, {len(recovery_rows)} re-peg recovery")
 
     # A snapshot BEFORE any leg is finalized, once per pair with an open leg.
     #
