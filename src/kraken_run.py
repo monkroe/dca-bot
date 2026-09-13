@@ -35,6 +35,7 @@ Changelog v1.2 (Phase 2 Step 2 — maker-first execution):
 """
 
 import hashlib
+import math
 import uuid
 import hmac
 import base64
@@ -2567,8 +2568,10 @@ def _repeg_consumption_updates(transition: dict) -> dict | None:
 
 
 def _repeg_market_updates(transition: dict) -> dict:
-    """Reuse the decision-time book already frozen in the transition envelope."""
-    market = transition.get("market_snapshot")
+    """Project submit-time telemetry, with decision-time legacy fallback."""
+    market = transition.get("submission_market_snapshot")
+    if not isinstance(market, dict):
+        market = transition.get("market_snapshot")
     if not isinstance(market, dict):
         return {}
     updates = {
@@ -2578,6 +2581,17 @@ def _repeg_market_updates(transition: dict) -> dict:
     if market.get("observed_at"):
         updates["mid_ts"] = market["observed_at"]
     return updates
+
+def _repeg_submitted_limit_price(transition: dict):
+    """Return the price from the exact request persisted before AddOrder."""
+    request = transition.get("replacement_request")
+    if not isinstance(request, dict):
+        return None
+    try:
+        return float(request["price"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
 
 def _repeg_owned_update(row: dict, updates: dict,
                         expected_raw: dict | None = None) -> bool:
@@ -2645,11 +2659,14 @@ def _repeg_record_observation(row: dict, transition: dict, order: dict,
 
 
 def _repeg_to_fallback(row: dict, transition: dict, settings: dict,
-                       user_id: str, window_end, order: dict) -> None:
+                       user_id: str, window_end, order: dict,
+                       pre_submit_failure: dict | None = None) -> None:
     """Hand a terminal original order to the unchanged fallback policy."""
     cumulative = _repeg_cumulative_consumption(transition) or (0.0, 0.0, 0.0)
     cumulative_cost, _cumulative_fee, cumulative_volume = cumulative
     raw = _safe_json_load(row.get("raw")) or {}
+    if pre_submit_failure is not None:
+        transition["pre_submit_failure"] = pre_submit_failure
     transition["phase"] = "original_terminal_fallback"
     raw["repeg_transition"] = transition
     updates = {
@@ -2756,7 +2773,7 @@ def _repeg_reconcile_ambiguous_submission(row: dict, transition: dict,
         _repeg_owned_update(row, {
             "status": "limit_open",
             "order_id": txid,
-            "limit_price": transition.get("replacement_price"),
+            "limit_price": _repeg_submitted_limit_price(transition),
             **_repeg_market_updates(transition),
             "raw": json.dumps(raw),
         })
@@ -2784,39 +2801,96 @@ def _repeg_submit_replacement(row: dict, transition: dict, order: dict,
     cumulative_cost, cumulative_fee, _cumulative_volume = cumulative
     remaining = (float(row["requested_quote_amount_base"])
                  - cumulative_cost - cumulative_fee)
-    request = dict(transition.get("replacement_request") or {})
-    replacement_price = float(transition.get("replacement_price") or 0)
+
+    def fail(reason: str, market_snapshot: dict | None = None) -> None:
+        failure = {"reason": reason}
+        if isinstance(market_snapshot, dict):
+            failure["market_snapshot"] = market_snapshot
+        _repeg_to_fallback(
+            row, transition, settings, user_id, window_end, order,
+            pre_submit_failure=failure,
+        )
+
+    if remaining <= 0:
+        fail("replacement_constraint_failed")
+        return
+
     try:
         pair_info = get_asset_pair_info(row["pair"])
     except Exception as e:
         print(f"    repeg replacement pair info failed: {e}")
+        fail("replacement_constraint_failed")
         return
-    maker_rate = max(float(settings.get("maker_fee_rate") or 0.004), 0.0)
-    safe_total = max(remaining - USD_SAFETY_MARGIN, 0.0)
-    cost_target = safe_total / (1.0 + maker_rate)
-    volume = (floor_to_decimals(cost_target / replacement_price,
-                                pair_info["lot_decimals"])
-              if replacement_price > 0 else 0.0)
-    if remaining <= 0 or volume <= 0 or volume < pair_info["ordermin"]:
-        _repeg_to_fallback(row, transition, settings, user_id, window_end, order)
+
+    try:
+        ticker = get_ticker_snapshot(row["pair"])
+    except Exception as e:
+        print(f"    repeg replacement fresh market read failed: {e}")
+        fail("fresh_market_read_failed")
         return
+
+    observed_at = _now_utc_iso()
+    if not isinstance(ticker, dict):
+        fail("fresh_market_unusable")
+        return
+    submission_market = dict(ticker)
+    submission_market["observed_at"] = observed_at
+    try:
+        replacement_price = float(ticker["bid"])
+        fresh_ask = float(ticker["ask"])
+    except (KeyError, TypeError, ValueError):
+        fail("fresh_market_unusable", submission_market)
+        return
+    if (not math.isfinite(replacement_price)
+            or not math.isfinite(fresh_ask)
+            or replacement_price <= 0 or fresh_ask <= 0):
+        fail("fresh_market_unusable", submission_market)
+        return
+    if replacement_price >= fresh_ask:
+        fail("fresh_market_crossed_or_collapsed", submission_market)
+        return
+
+    try:
+        maker_rate = max(float(settings.get("maker_fee_rate") or 0.004), 0.0)
+        safe_total = max(remaining - USD_SAFETY_MARGIN, 0.0)
+        cost_target = safe_total / (1.0 + maker_rate)
+        volume = floor_to_decimals(
+            cost_target / replacement_price, pair_info["lot_decimals"])
+        ordermin = float(pair_info["ordermin"])
+        pair_decimals = int(pair_info["pair_decimals"])
+        lot_decimals = int(pair_info["lot_decimals"])
+    except (KeyError, TypeError, ValueError, OverflowError) as e:
+        print(f"    repeg replacement constraint evaluation failed: {e}")
+        fail("replacement_constraint_failed", submission_market)
+        return
+    if volume <= 0:
+        fail("replacement_volume_zero", submission_market)
+        return
+    if volume < ordermin:
+        fail("replacement_below_ordermin", submission_market)
+        return
+
+    request = dict(transition.get("replacement_request") or {})
     request.update({
         "pair": row["pair"], "type": "buy", "ordertype": "limit",
-        "price": f"{replacement_price:.{pair_info['pair_decimals']}f}",
-        "volume": format_volume(volume, pair_info["lot_decimals"]),
+        "price": f"{replacement_price:.{pair_decimals}f}",
+        "volume": format_volume(volume, lot_decimals),
         "oflags": "post,fciq",
         "cl_ordid": transition["replacement_cl_ord_id"],
     })
-    transition["phase"] = "replacement_submission_pending"
-    transition["replacement_request"] = request
-    transition["request_fingerprint"] = hashlib.sha256(
+    final_transition = dict(transition)
+    final_transition["phase"] = "replacement_submission_pending"
+    final_transition["replacement_request"] = request
+    final_transition["submission_market_snapshot"] = submission_market
+    final_transition["request_fingerprint"] = hashlib.sha256(
         json.dumps(request, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
-    transition["replacement_submission_armed_at"] = _now_utc_iso()
+    final_transition["replacement_submission_armed_at"] = _now_utc_iso()
     raw = _safe_json_load(row.get("raw")) or {}
-    raw["repeg_transition"] = transition
+    raw["repeg_transition"] = final_transition
     if not _repeg_owned_update(row, {"raw": json.dumps(raw)}):
         return
+    transition = final_transition
 
     try:
         result = kraken_private("AddOrder", request)
@@ -2858,7 +2932,8 @@ def _repeg_submit_replacement(row: dict, transition: dict, order: dict,
     raw["repeg_transition"] = transition
     _repeg_owned_update(row, {
         "status": "limit_open", "order_id": new_oid,
-        "limit_price": replacement_price, "raw": json.dumps(raw),
+        "limit_price": _repeg_submitted_limit_price(transition),
+        "raw": json.dumps(raw),
         **_repeg_market_updates(transition),
     })
 

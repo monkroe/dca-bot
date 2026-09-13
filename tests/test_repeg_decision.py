@@ -440,11 +440,16 @@ def _recovery_row(phase="cancel_requested"):
     }
 
 
+_DEFAULT_TICKER = object()
+
+
 def _run_recovery_cycle(observation=None, *, row=None, now=None,
                         query_error=None, add_order_error=None,
                         replacement_open=None, replacement_closed=None,
                         include_transitioned_open=False,
-                        advance_before_manual=False):
+                        advance_before_manual=False,
+                        ticker_snapshot=_DEFAULT_TICKER, ticker_error=None,
+                        pair_info=None, fail_submission_envelope=False):
     """Run the run_maker_inspection recovery owner against an in-memory row."""
     db_row = dict(row or _recovery_row())
     db_row["raw"] = kr._safe_json_load(db_row.get("raw")) or {}
@@ -455,6 +460,7 @@ def _run_recovery_cycle(observation=None, *, row=None, now=None,
     finalize_calls = []
     events = []
     ticker_calls = []
+    pair_info_calls = []
 
     def matches(filters):
         for key in ("cl_ord_id", "status", "order_id"):
@@ -495,6 +501,13 @@ def _run_recovery_cycle(observation=None, *, row=None, now=None,
             advanced_raw = kr._safe_json_load(db_row.get("raw")) or {}
             advanced_raw["repeg_transition"]["phase"] = "replacement_attached"
             db_row["raw"] = advanced_raw
+        changed_raw = kr._safe_json_load(changed.get("raw")) or {}
+        changed_transition = changed_raw.get("repeg_transition") or {}
+        if (fail_submission_envelope
+                and changed_transition.get("phase")
+                == "replacement_submission_pending"
+                and set(changed) == {"raw"}):
+            return []
         if table != "dca_executions" or not matches(filters):
             return []
         db_row.update(changed)
@@ -525,17 +538,31 @@ def _run_recovery_cycle(observation=None, *, row=None, now=None,
             return {"closed": replacement_closed or {}}
         raise AssertionError(f"unexpected Kraken endpoint: {endpoint}")
 
+    def fake_ticker(pair):
+        ticker_calls.append(pair)
+        if ticker_error:
+            raise ticker_error
+        if ticker_snapshot is _DEFAULT_TICKER:
+            return {"bid": 0.03418, "ask": 0.03422, "mid": 0.03420}
+        return ticker_snapshot
+
+    def fake_pair_info(pair):
+        pair_info_calls.append(pair)
+        if isinstance(pair_info, Exception):
+            raise pair_info
+        return pair_info or {
+            "pair_decimals": 5, "lot_decimals": 5, "ordermin": 200.0,
+        }
+
     replacements = {
         "sb_get": fake_get,
         "sb_update": fake_update,
         "kraken_private": fake_kraken,
         "save_mid_snapshot": lambda *_args, **_kwargs: None,
-        "get_ticker_snapshot": lambda pair: ticker_calls.append(pair),
+        "get_ticker_snapshot": fake_ticker,
         "_fallback_decision": lambda *args, **kwargs: fallback_calls.append((args, kwargs)),
         "finalize_order": lambda *args, **kwargs: finalize_calls.append((args, kwargs)),
-        "get_asset_pair_info": lambda _pair: {
-            "pair_decimals": 5, "lot_decimals": 5, "ordermin": 200.0,
-        },
+        "get_asset_pair_info": fake_pair_info,
         "tg_send": lambda *_args, **_kwargs: None,
     }
     originals = {name: getattr(kr, name) for name in replacements}
@@ -555,7 +582,7 @@ def _run_recovery_cycle(observation=None, *, row=None, now=None,
         "row": db_row, "calls": calls, "updates": updates,
         "selector_filters": selector_filters, "fallback_calls": fallback_calls,
         "finalize_calls": finalize_calls, "events": events,
-        "ticker_calls": ticker_calls,
+        "ticker_calls": ticker_calls, "pair_info_calls": pair_info_calls,
     }
 
 
@@ -985,19 +1012,21 @@ def t_recovery_ttl_equality_matches_existing_maker_boundary(r):
     r.check("exact TTL equality does not fallback", trace["fallback_calls"], [])
 
 
-def t_replacement_restores_available_market_telemetry_without_new_call(r):
+def t_replacement_projects_submit_time_market_telemetry(r):
+    fresh = {"bid": 0.03419, "ask": 0.03423, "mid": 0.03421}
     trace = _run_recovery_cycle({
         "status": "canceled", "vol_exec": "0.00000000",
         "cost": "0.00000", "fee": "0.00000", "price": "0.00000",
-    })
+    }, ticker_snapshot=fresh)
 
-    r.check("replacement restores bid", trace["row"].get("bid"), 0.03418)
-    r.check("replacement restores ask", trace["row"].get("ask"), 0.03422)
-    r.check("replacement restores mid", trace["row"].get("mid"), 0.03420)
-    r.check("replacement restores snapshot timestamp",
-            trace["row"].get("mid_ts"), "2026-09-11T11:58:10+00:00")
-    r.check("recovery adds no telemetry-only ticker call",
-            trace["ticker_calls"], [])
+    transition = trace["row"]["raw"]["repeg_transition"]
+    submit_market = transition["submission_market_snapshot"]
+    r.check("replacement projects submit bid", trace["row"].get("bid"), fresh["bid"])
+    r.check("replacement projects submit ask", trace["row"].get("ask"), fresh["ask"])
+    r.check("replacement projects submit mid", trace["row"].get("mid"), fresh["mid"])
+    r.check("replacement projects submit timestamp",
+            trace["row"].get("mid_ts"), submit_market["observed_at"])
+    r.check("recovery obtains one submit-time ticker", trace["ticker_calls"], ["KASUSD"])
 
 TESTS = [
     ("happy path", t_happy_path),
@@ -1027,8 +1056,8 @@ TESTS = [
      t_stale_recovery_cannot_dead_letter_advanced_row),
     ("recovery TTL equality matches maker TTL",
      t_recovery_ttl_equality_matches_existing_maker_boundary),
-    ("replacement restores available telemetry",
-     t_replacement_restores_available_market_telemetry_without_new_call),
+    ("replacement projects submit-time telemetry",
+     t_replacement_projects_submit_time_market_telemetry),
     ("cap missing reference", t_cap_missing_reference),
     ("H90 guard on the re-peg path", t_cap_h90_guard_reaches_repeg),
     ("below ordermin", t_below_ordermin),
