@@ -4,6 +4,23 @@ Conventions: dates are **Chicago** time (the bot's trading timezone); a "vakaras
 
 History before 2026-07-18 (Phase 1 -- Kraken + Strike execution, notifications, reconciliation, impact/all-in bps telemetry) is in `git log`; this changelog starts at Phase 2.
 
+## 2026-09-13 (Sunday – Chicago)
+
+### feat(dca): fresh-price revalidation before replacement AddOrder – ADR-0010 (`66b9bdb`)
+- Implemented by Codex; this entry is Claude Code's canonical closeout documentation of that work, not a firsthand implementation report.
+- A replacement re-peg generation now revalidates against a fresh Kraken market read immediately before the replacement `AddOrder`, instead of submitting on the price frozen at decision time.
+- BUY replacement price authority is the fresh bid read at submit time.
+- Replacement volume is recalculated from the remaining event quote budget, using the existing maker-fee-aware sizing, against that fresh price.
+- Decision-time `market_snapshot` and `replacement_price` remain historical evidence; submit-time market evidence (`submission_market_snapshot`) is persisted separately.
+- The exact submission envelope (request, fingerprint, arm timestamp) is made durable in one guarded write before `AddOrder`. Once armed, the post-arm request is immutable through submission.
+- A safe pre-submit failure (fresh read failure, unusable or crossed book, zero or below-`ordermin` volume, other constraint failure) routes through the existing atomic fallback transition rather than submitting the stale frozen price.
+- Exhausted remaining budget is rejected before any `AssetPairs` or `Ticker` network I/O.
+- Both the direct submission-success path and the ambiguous-submission reconciliation path attach submit-time telemetry, falling back to legacy decision-time telemetry only when submit-time evidence is absent.
+- NOT part of this change: terminal-replacement retry, a new valuation/reserve execution policy, a new cap, or generation 2 after a terminal replacement (ADR-0010 boundaries).
+- Built on the crash-safe re-peg recovery foundation shipped 2026-09-12 (`09acc58`), which `66b9bdb` is a direct child of.
+- Verification (Codex implementation verification evidence / execution record; independently re-run by Claude Code on 2026-09-13 against `origin/main` at this commit, tree clean): fresh-price focused suite 25 branches, 73/73 assertions; existing re-peg suite 39 branches, 134/134 assertions; full repository suite 13 modules, 162 branches, 483/483 assertions; schema check 57 write payloads/filters, every column exists.
+- Design: `robert-os-hub/docs/05-roadmap/dca-repeg-fresh-price-revalidation.md`. Decision: `robert-os-hub/docs/06-adr/0010-dca-repeg-fresh-price-revalidation.md`.
+
 ## 2026-08-16 (Sunday -- Chicago)
 
 ### fix(supabase): production outage from a revoked legacy service_role key -- credential handling changed, not just rotated
