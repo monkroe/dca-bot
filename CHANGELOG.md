@@ -6,6 +6,16 @@ History before 2026-07-18 (Phase 1 -- Kraken + Strike execution, notifications, 
 
 ## 2026-09-13 (Sunday – Chicago)
 
+### feat(dca): report weekly summary at economic-event grain (`5cec172`)
+- Shipped in `5cec172`: Weekly Summary now reports one user-facing outcome per real DCA economic event, grouping lifecycle rows by `parent_event_id` instead of counting each row independently.
+- A canceled maker leg followed by a successful fallback under the same parent is one successful economic event, not one skip plus one fill.
+- Dry-run evidence is excluded before parent grouping. Ambiguous or unresolved evidence fails closed, so Weekly Summary does not emit financial totals built from a guess.
+- A blocked report sends a concise diagnostic with the blocker category and the affected dates carried by the source evidence; it remains a diagnostic, not a partial financial report.
+- Blocked diagnostics use send-first, marker-after-confirmed-delivery ordering. A failed Telegram delivery therefore leaves no `weekly_summary_blocked` marker to suppress a later retry.
+- A `weekly_summary_blocked` marker and a normal `weekly_summary` marker may legitimately coexist for the same period when evidence was blocked and later resolved.
+- Verification evidence: focused Weekly Summary coverage passed 35 tests, including the production-derived 2026-09-06 through 2026-09-12 lifecycle shape and its parent-grain outcomes. This is reporting-grain coverage, not re-peg coverage.
+- NOT changed by Step 1: the weekly date window, ISO week boundary, Sunday send timing, DCA execution behavior, or maker/fallback/re-peg behavior. Weekly boundary and send-timing work remain Step 2.
+
 ### feat(dca): fresh-price revalidation before replacement AddOrder – ADR-0010 (`66b9bdb`)
 - Implemented by Codex; this entry is Claude Code's canonical closeout documentation of that work, not a firsthand implementation report.
 - A replacement re-peg generation now revalidates against a fresh Kraken market read immediately before the replacement `AddOrder`, instead of submitting on the price frozen at decision time.
