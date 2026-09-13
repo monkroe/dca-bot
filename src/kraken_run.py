@@ -50,6 +50,7 @@ import urllib.error
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from ohlc import build_daily_metrics
+from weekly_summary import weekly_summary_evidence
 
 VERSION = "1.8.2"
 
@@ -3885,10 +3886,58 @@ def run_reconciliation(user_id: str):
 #  WEEKLY SUMMARY
 # ═══════════════════════════════════════════════════════════════
 
-def send_weekly_summary(user_id: str):
-    """Send Telegram weekly summary (idempotent, Sunday only)."""
-    now_chicago = datetime.now(CHICAGO_TZ)
+def _weekly_tg_send(text: str):
+    """Reporting-only delivery confirmation; execution's tg_send is unchanged."""
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        raise RuntimeError("Weekly Telegram is not configured")
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    data = json.dumps({
+        "chat_id": TG_CHAT_ID, "text": _tg_html(text), "parse_mode": "HTML",
+    }).encode()
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=10) as response:
+        result = json.loads(response.read().decode())
+    if result.get("ok") is not True:
+        raise RuntimeError("Weekly Telegram delivery was not confirmed")
 
+
+def _weekly_blocked(week_key: str, blockers: dict):
+    """Deliver the diagnostic, then mark it sent for later idempotency."""
+    detail = "; ".join(
+        f"{reason}: {evidence['count']}"
+        + (f" ({', '.join(evidence['dates'])})" if evidence["dates"] else "")
+        for reason, evidence in blockers.items()
+    )
+    print(f"Weekly summary {week_key} blocked — {detail}")
+    if sb_get("dca_notifications", {
+        "notification_type": "eq.weekly_summary_blocked",
+        "period_key": f"eq.{week_key}",
+    }):
+        return
+    _weekly_tg_send(f"DCA Weekly Summary {week_key} not sent | {detail}")
+    inserted = sb_insert("dca_notifications", {
+        "notification_type": "weekly_summary_blocked",
+        "period_key": week_key,
+        "payload": json.dumps({"blockers": blockers}),
+    })
+    if not inserted:
+        raise RuntimeError("Blocked notification marker was not confirmed")
+
+
+def send_weekly_summary(user_id: str):
+    """Sunday-only reporting must never fail the normal execution cycle."""
+    try:
+        _send_weekly_summary(user_id, datetime.now(CHICAGO_TZ))
+    except Exception as exc:
+        # Avoid exception text: urllib errors can include credential-bearing URLs.
+        print(f"Weekly summary reporting failed ({type(exc).__name__})")
+
+
+def _send_weekly_summary(user_id: str, now_chicago: datetime):
+    """Internal test seam: tests supply a fixed aware America/Chicago clock.
+
+    Production still reads its clock once through send_weekly_summary().
+    """
     if now_chicago.weekday() != 6:
         print("Not Sunday — skipping weekly summary")
         return
@@ -3908,7 +3957,11 @@ def send_weekly_summary(user_id: str):
     rows = sb_get("dca_executions", {
         "user_id": f"eq.{user_id}",
         "trade_date_chicago": f"gte.{week_start}",
-        "select": "pair,status,filled_quote_cost,fee_quote,filled_base_volume,avg_price,mid,trade_date_chicago",
+        "select": (
+            "pair,status,parent_event_id,cl_ord_id,raw,reason,order_id,"
+            "execution_finished_at,filled_quote_cost,fee_quote,"
+            "filled_base_volume,avg_price,mid,trade_date_chicago"
+        ),
         "order": "trade_date_chicago.asc",
     })
 
@@ -3916,40 +3969,13 @@ def send_weekly_summary(user_id: str):
         print("No executions this week")
         return
 
-    pairs = {}
-    for r in rows:
-        p = r["pair"]
-        if p not in pairs:
-            pairs[p] = {
-                "filled": 0, "skipped": 0, "failed": 0,
-                "total_cost": 0, "total_fee": 0, "total_vol": 0,
-                "slippages": [],
-            }
-
-        s = pairs[p]
-        status = (r.get("status") or "").lower()
-
-        # NOTE: exact-match on fill statuses. The old `"filled" in status`
-        # substring test would wrongly count canceled_unfilled as a fill.
-        # canceled_partial carries real money, so it aggregates as a fill;
-        # unfilled/rejected maker legs are non-events (their fallback leg
-        # carries the day's outcome).
-        if status in ("filled", "filled_dry_run", "canceled_partial", "canceled_partial_dry_run"):
-            s["filled"] += 1
-            s["total_cost"] += float(r.get("filled_quote_cost") or 0)
-            s["total_fee"] += float(r.get("fee_quote") or 0)
-            s["total_vol"] += float(r.get("filled_base_volume") or 0)
-            mid = float(r.get("mid") or 0)
-            avg = float(r.get("avg_price") or 0)
-            if mid > 0 and avg > 0:
-                s["slippages"].append((avg - mid) / mid * 100)
-        elif "skipped" in status or status in (
-            "canceled_unfilled", "canceled_unfilled_dry_run",
-            "rejected_postonly", "rejected_postonly_dry_run",
-        ):
-            s["skipped"] += 1
-        elif "failed" in status or "crashed" in status or status == "manual_required":
-            s["failed"] += 1
+    pairs, blockers = weekly_summary_evidence(rows)
+    if blockers:
+        _weekly_blocked(week_key, blockers)
+        return
+    if not pairs:
+        print("No real economic events this week")
+        return
 
     lines = [
         f"{ICONS['CHART']} {B_ON}DCA Weekly Summary{B_OFF}",
@@ -3977,7 +4003,7 @@ def send_weekly_summary(user_id: str):
         lines.append("")
 
     msg = "\n".join(lines)
-    tg_send(msg)
+    _weekly_tg_send(msg)
 
     try:
         sb_insert("dca_notifications", {
@@ -3985,8 +4011,8 @@ def send_weekly_summary(user_id: str):
             "period_key": week_key,
             "payload": json.dumps({"pairs": list(pairs.keys())}),
         })
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"Weekly summary marker write failed ({type(exc).__name__})")
 
     print(f"{ICONS['OK']} Weekly summary sent for {week_key}")
 
