@@ -1,0 +1,174 @@
+name: Kraken OHLC Preservation
+
+# Gate: do not dispatch this workflow until an external, read-only evidence
+# review has proved the exact UNIQUE authority
+# (pair, interval_minutes, ts). The collector intentionally performs no
+# Postgres-catalog query and no DDL through the Supabase Data API.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Preservation mode"
+        required: true
+        default: dry-run
+        type: choice
+        options:
+          - dry-run
+          - catch-up-apply
+          - catch-up-resume
+          - incremental-apply
+          - incremental-resume
+          - head-rebuild
+      confirmation:
+        description: "Exact apply/resume/rebuild confirmation; empty for dry-run"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: kraken-ohlc-preserve
+  cancel-in-progress: false
+
+env:
+  DAILY_TARGET_MIN_TS: "2024-11-19T00:00:00Z"
+  CATCHUP_SOURCE_ALLOWLIST: "kraken_ohlc_backfill,kraken_ohlc_catchup"
+  INCREMENTAL_SOURCE_ALLOWLIST: "kraken_ohlc_backfill,kraken_ohlc_catchup,kraken_ohlc_incremental"
+
+  # Candidate genesis artifacts are not authority. Roberto's separate
+  # acceptance and a later reviewed constant commit must initialize every
+  # value below together before incremental mode can run.
+  GENESIS_IDENTITY: "UNINITIALIZED"
+  GENESIS_ARTIFACT_ID: "UNINITIALIZED"
+  GENESIS_ARTIFACT_NAME: "UNINITIALIZED"
+  GENESIS_ARTIFACT_DIGEST: "UNINITIALIZED"
+  GENESIS_RUN_ID: "UNINITIALIZED"
+  GENESIS_RUN_ATTEMPT: "UNINITIALIZED"
+  GENESIS_1440_MIN_TS: "UNINITIALIZED"
+  GENESIS_1440_THROUGH_TS: "UNINITIALIZED"
+  GENESIS_1440_COUNT: "UNINITIALIZED"
+  GENESIS_1440_CUMULATIVE_SHA256: "UNINITIALIZED"
+  GENESIS_240_MIN_TS: "UNINITIALIZED"
+  GENESIS_240_THROUGH_TS: "UNINITIALIZED"
+  GENESIS_240_COUNT: "UNINITIALIZED"
+  GENESIS_240_CUMULATIVE_SHA256: "UNINITIALIZED"
+
+jobs:
+  preserve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      STATE_DIR: ${{ runner.temp }}/ohlc-preserve
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Preflight both intervals
+        id: preflight
+        env:
+          PRESERVE_MODE: ${{ inputs.mode }}
+          PRESERVE_CONFIRMATION: ${{ inputs.confirmation }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python src/ohlc_preserve.py prepare --state-dir "$STATE_DIR"
+
+      - name: Upload pre-write manifest
+        id: manifest_upload
+        if: steps.preflight.outputs.needs_prewrite == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.preflight.outputs.manifest_name }}
+          path: ${{ steps.preflight.outputs.manifest_path }}
+          if-no-files-found: error
+          retention-days: 90
+          overwrite: false
+
+      - name: Verify pre-write artifact metadata
+        if: steps.preflight.outputs.needs_prewrite == 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ steps.manifest_upload.outputs.artifact-id }}
+          ARTIFACT_NAME: ${{ steps.preflight.outputs.manifest_name }}
+          ARTIFACT_DIGEST: ${{ steps.manifest_upload.outputs.artifact-digest }}
+        run: |
+          python src/ohlc_preserve.py verify-artifact \
+            --artifact-id "$ARTIFACT_ID" \
+            --artifact-name "$ARTIFACT_NAME" \
+            --artifact-digest "$ARTIFACT_DIGEST"
+
+      - name: Apply daily then four-hour rows
+        id: apply
+        if: steps.preflight.outputs.needs_prewrite == 'true'
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          STATE_PATH: ${{ steps.preflight.outputs.state_path }}
+          ARTIFACT_ID: ${{ steps.manifest_upload.outputs.artifact-id }}
+          ARTIFACT_NAME: ${{ steps.preflight.outputs.manifest_name }}
+          ARTIFACT_DIGEST: ${{ steps.manifest_upload.outputs.artifact-digest }}
+        run: |
+          python src/ohlc_preserve.py apply \
+            --state-dir "$STATE_DIR" \
+            --state-path "$STATE_PATH" \
+            --artifact-id "$ARTIFACT_ID" \
+            --artifact-name "$ARTIFACT_NAME" \
+            --artifact-digest "$ARTIFACT_DIGEST"
+
+      - name: Upload apply anchor candidate
+        id: apply_anchor_upload
+        if: steps.apply.outputs.anchor_ready == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.apply.outputs.anchor_name }}
+          path: ${{ steps.apply.outputs.anchor_path }}
+          if-no-files-found: error
+          retention-days: 90
+          overwrite: false
+
+      - name: Verify apply anchor artifact metadata
+        if: steps.apply.outputs.anchor_ready == 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ steps.apply_anchor_upload.outputs.artifact-id }}
+          ARTIFACT_NAME: ${{ steps.apply.outputs.anchor_name }}
+          ARTIFACT_DIGEST: ${{ steps.apply_anchor_upload.outputs.artifact-digest }}
+        run: |
+          python src/ohlc_preserve.py verify-artifact \
+            --artifact-id "$ARTIFACT_ID" \
+            --artifact-name "$ARTIFACT_NAME" \
+            --artifact-digest "$ARTIFACT_DIGEST"
+
+      - name: Upload read-only rebuilt head
+        id: rebuilt_head_upload
+        if: steps.preflight.outputs.anchor_ready == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.preflight.outputs.anchor_name }}
+          path: ${{ steps.preflight.outputs.anchor_path }}
+          if-no-files-found: error
+          retention-days: 90
+          overwrite: false
+
+      - name: Verify rebuilt head artifact metadata
+        if: steps.preflight.outputs.anchor_ready == 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ steps.rebuilt_head_upload.outputs.artifact-id }}
+          ARTIFACT_NAME: ${{ steps.preflight.outputs.anchor_name }}
+          ARTIFACT_DIGEST: ${{ steps.rebuilt_head_upload.outputs.artifact-digest }}
+        run: |
+          python src/ohlc_preserve.py verify-artifact \
+            --artifact-id "$ARTIFACT_ID" \
+            --artifact-name "$ARTIFACT_NAME" \
+            --artifact-digest "$ARTIFACT_DIGEST"

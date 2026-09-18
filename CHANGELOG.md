@@ -4,6 +4,11 @@ Conventions: dates are **Chicago** time (the bot's trading timezone); a "vakaras
 
 History before 2026-07-18 (Phase 1 -- Kraken + Strike execution, notifications, reconciliation, impact/all-in bps telemetry) is in `git log`; this changelog starts at Phase 2.
 
+## 2026-09-17 (Thursday -- Chicago)
+
+### feat(ohlc): isolated Kraken preservation collector
+- Implemented the isolated KASUSD daily/4h OHLC preservation collector with offline contract coverage and a `workflow_dispatch`-only workflow. No production dry-run or DB write was performed and no schedule was enabled; the implementation awaits diff review and separate later gates.
+
 ## 2026-09-13 (Sunday – Chicago)
 
 ### feat(dca): report weekly summary at economic-event grain (`5cec172`)
