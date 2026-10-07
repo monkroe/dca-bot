@@ -23,7 +23,7 @@ PARAMS = {
     "price": "0.027770",
     "volume": "360.00000000",
     "oflags": "post,fciq",
-    "cl_ordid": "dca-KASUSD-2026-07-30-0700",
+    "cl_ord_id": "dca-KASUSD-2026-07-30-0700",
     "nonce": "1753876543210",
 }
 ERR = kr.KrakenError(["EOrder:Insufficient funds"])
@@ -34,7 +34,7 @@ def t_request_is_kept(r):
     r.check("volume kept", raw["request"]["volume"], "360.00000000")
     r.check("price kept", raw["request"]["price"], "0.027770")
     r.check("pair kept", raw["request"]["pair"], "KASUSD")
-    r.check("client id kept", raw["request"]["cl_ordid"], "dca-KASUSD-2026-07-30-0700")
+    r.check("client id kept", raw["request"]["cl_ord_id"], "dca-KASUSD-2026-07-30-0700")
     r.check_true("error kept", "Insufficient funds" in raw["error"])
     r.check_true("timestamped", raw["at"].startswith("20"))
 

@@ -4,6 +4,20 @@ Conventions: dates are **Chicago** time (the bot's trading timezone); a "vakaras
 
 History before 2026-07-18 (Phase 1 -- Kraken + Strike execution, notifications, reconciliation, impact/all-in bps telemetry) is in `git log`; this changelog starts at Phase 2.
 
+## 2026-10-06 (vakaras – Chicago; UTC jau 10-07)
+
+### fix(dca): Kraken provider client-order identity and crash-safe recovery – ROB-21
+- Deploy is gated by ROB-21: fresh DB gate (D2), read-only live check of the shipped lookup (D3), first-order round-trip (R1b).
+- Every Kraken request and lookup filter now uses the canonical `cl_ord_id` field. The legacy `cl_ordid` spelling no longer exists in the source, and legacy response keys are no longer accepted as evidence.
+- Orders carry a deterministic short provider id: `dca1-` plus 13 characters of a versioned hash over attempt type, internal id and generation, 18 characters in all. The internal `dca_executions.cl_ord_id` is unchanged. The provider id is persisted in `raw.kraken_cl` before every AddOrder (maker, market, fallback, a ROB-18 takeover with its own new id, and each re-peg generation), and every later raw write merges and keeps it.
+- Recovery uses one open+closed lookup: OpenOrders first, then ClosedOrders bounded from the execution start with an explicit margin and followed by cursor to exhaustion, with every returned order validated. FOUND needs exactly one validated txid. Anything ambiguous (endpoint errors, malformed or repeated cursor, a foreign or missing id, several txids) is UNKNOWN and never authorises another spend. A confirmed absence is not permission to resubmit, and the ROB-18 retry policy is unchanged.
+- A Kraken duplicate rejection is treated as evidence that the id exists: it is recovered when found, and otherwise the execution stays non-terminal with an alert instead of being written as `failed_kraken`.
+- Stale reconciliation covers maker, market and fallback claims for open as well as closed orders and uses only the persisted provider id. A row without a valid persisted id goes to `manual_required` instead of being guessed from the internal id.
+- Re-peg: replacement generations get their own provider id on the same execution row, and fill generation is identified from the persisted txid and transition rather than from a response field.
+- Corrected a latent re-peg dead-letter bug: the guarded move to `manual_required` compared a decoded object with the `raw` column, which production stores as JSONB holding a JSON string, so it could never match and would silently skip both the state change and the alert. Ownership is now status, provider order and internal id on the update, with the re-peg phase and generation validated on decoded values from a fresh read. If ownership cannot be confirmed or the update does not apply, `manual_required` is not written and a distinct "escalation not persisted" alert is sent. While the row stays in recovery that alert can repeat each cycle.
+- Added a pure deploy-gate classifier with no I/O: an explicit status and re-peg phase vocabulary enumerated from the source, parent-event evidence for maker decision states, strict raw decoding, and a block on `failed_kraken` rows that carry a duplicate-rejection signature.
+- Tests: new ROB-21 suites (identity vectors, lookup contract, execution paths, re-peg identity, dead-letter handling on production-shaped string `raw`, classifier) and updated re-peg fixtures. The OHLC isolation digest pin of `src/kraken_run.py` was re-pinned.
+
 ## 2026-09-17 (Thursday -- Chicago)
 
 ### feat(ohlc): isolated Kraken preservation collector

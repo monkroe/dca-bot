@@ -13,8 +13,19 @@ condition would fire. A reordering that "looks equivalent" would let a leg
 re-peg past its limit.
 
 KAS numbers throughout: tick 0.00001, lot_decimals 8.
+
+ROB-21: the re-peg fixtures carry v1 provider ids (generation N of the
+maker_limit execution) instead of the legacy `<cl_ord_id>-rN` ids, and the
+provider field is the canonical `cl_ord_id`.
 """
 from _harness import kr, Runner
+
+CL = "dca-KASUSD-2026-09-11-704"
+
+
+def _pid(generation):
+    """Provider id of generation N of the fixture maker_limit execution."""
+    return kr.provider_client_id("maker_limit", CL, generation)
 
 RP = kr._repeg_decision
 
@@ -159,7 +170,7 @@ def _run_cancel_open_readback_race(arm_succeeds=True, *, source_row=None,
                                    cancel_readback=None):
     """Run the confirmed race and return its observable call/state trace."""
     oid = "O756Z5-SM7WB-5IAX7D"
-    cl = "dca-KASUSD-2026-09-11-704"
+    cl = CL
     calls = []
     state_updates = []
     fallback_calls = []
@@ -229,7 +240,7 @@ def _run_cancel_open_readback_race(arm_succeeds=True, *, source_row=None,
         "execution_started_at": "2026-09-11T11:53:15+00:00",
         "limit_price": 0.03413,
         "requested_quote_amount_base": 10.0,
-        "raw": '{"repeg_count": 0}',
+        "raw": kr.json.dumps({"repeg_count": 0, "kraken_cl": _pid(0)}),
     }
     oid = source["order_id"]
     cl = source["cl_ord_id"]
@@ -316,8 +327,7 @@ def t_cancel_open_readback_requires_observable_continuation(r):
         if not targets_original_execution(update_call):
             return False
         raw = kr._safe_json_load(update_call[2].get("raw")) or {}
-        next_cl = raw.get("kraken_cl")
-        return isinstance(next_cl, str) and next_cl.startswith(f"{cl}-r")
+        return raw.get("kraken_cl") == _pid(1)
 
     def explicitly_persists_recovery(update_call):
         if not targets_original_execution(update_call):
@@ -329,8 +339,7 @@ def t_cancel_open_readback_requires_observable_continuation(r):
     # Generic writes, raw snapshots, telemetry, timestamps, and unrelated rows
     # do not satisfy either branch.
     replacement_initiated = (
-        any(str(params.get("cl_ordid") or "").startswith(f"{cl}-r")
-            for params in add_order_calls)
+        any(params.get("cl_ord_id") == _pid(1) for params in add_order_calls)
         or any(persisted_replacement_identity(call)
                for call in trace["state_updates"])
     )
@@ -369,7 +378,15 @@ def t_repeg_recovery_is_armed_before_cancel(r):
     raw = kr._safe_json_load(updates.get("raw")) or {}
     transition = raw.get("repeg_transition") or {}
     r.check("replacement identity is deterministic",
-            transition.get("replacement_cl_ord_id"), f"{cl}-r1")
+            transition.get("replacement_cl_ord_id"), _pid(1))
+    r.check("previous generation provider identity is retained",
+            transition.get("original_provider_cl_ord_id"), _pid(0))
+    r.check("internal execution identity is unchanged",
+            transition.get("original_cl_ord_id"), cl)
+    r.check("replacement provider id is persisted before cancel",
+            raw.get("kraken_cl"), _pid(1))
+    r.check("replacement request uses canonical field",
+            (transition.get("replacement_request") or {}).get("cl_ord_id"), _pid(1))
     r.check("original provider identity is retained",
             transition.get("original_order_id"), oid)
     r.check("original maker price is retained",
@@ -387,7 +404,7 @@ def t_repeg_cancel_requires_successful_durable_claim(r):
 
 
 def _recovery_row(phase="cancel_requested"):
-    cl = "dca-KASUSD-2026-09-11-704"
+    cl = CL
     oid = "O756Z5-SM7WB-5IAX7D"
     window_end = kr.datetime(2026, 9, 11, 7, 9, tzinfo=kr.CHICAGO_TZ)
     transition = {
@@ -395,8 +412,8 @@ def _recovery_row(phase="cancel_requested"):
         "generation": 1,
         "original_order_id": oid,
         "original_cl_ord_id": cl,
-        "original_provider_cl_ord_id": cl,
-        "replacement_cl_ord_id": f"{cl}-r1",
+        "original_provider_cl_ord_id": _pid(0),
+        "replacement_cl_ord_id": _pid(1),
         "replacement_price": 0.03418,
         "generation_fills": [],
         "market_snapshot": {
@@ -406,7 +423,7 @@ def _recovery_row(phase="cancel_requested"):
         "replacement_request": {
             "pair": "KASUSD", "type": "buy", "ordertype": "limit",
             "price": "0.03418", "volume": "291.23027",
-            "oflags": "post,fciq", "cl_ordid": f"{cl}-r1",
+            "oflags": "post,fciq", "cl_ord_id": _pid(1),
         },
         "request_fingerprint": "test-fingerprint",
         "transition_at": "2026-09-11T11:58:10+00:00",
@@ -430,7 +447,7 @@ def _recovery_row(phase="cancel_requested"):
         "requested_quote_amount_base": 10.0,
         "parent_event_id": "0ef48173-95a2-45ba-a406-38d7652a32c6",
         "dca_order_id": 1,
-        "raw": {"kraken_cl": f"{cl}-r1", "repeg_count": 1,
+        "raw": {"kraken_cl": _pid(1), "repeg_count": 1,
                 "repeg_transition": transition},
         "execution_started_at": "2026-09-11T11:53:15+00:00",
         "limit_price": 0.03413,
@@ -449,10 +466,24 @@ def _run_recovery_cycle(observation=None, *, row=None, now=None,
                         include_transitioned_open=False,
                         advance_before_manual=False,
                         ticker_snapshot=_DEFAULT_TICKER, ticker_error=None,
-                        pair_info=None, fail_submission_envelope=False):
-    """Run the run_maker_inspection recovery owner against an in-memory row."""
+                        pair_info=None, fail_submission_envelope=False,
+                        string_raw=False, reread_hook=None, manual_cas_miss=False):
+    """Run the run_maker_inspection recovery owner against an in-memory row.
+
+    string_raw=True models PRODUCTION storage: `raw` is a JSON STRING (JSONB
+    holding a string), reads return that string, and a `raw=eq.<json object>`
+    filter can never match it. Decoded raw is only ever used for logic. The
+    default stays False so the pre-existing tests keep their decoded-dict store;
+    the ROB-21 tests opt in through test_rob21_repeg._cycle.
+
+    reread_hook(db_row) runs when the ownership re-read is served (simulates a
+    concurrent owner changing the row between snapshot and update).
+    manual_cas_miss=True makes the guarded manual_required update match no row
+    without changing anything (ownership lost, row stays in recovery)."""
     db_row = dict(row or _recovery_row())
     db_row["raw"] = kr._safe_json_load(db_row.get("raw")) or {}
+    if string_raw:
+        db_row["raw"] = kr.json.dumps(db_row["raw"])
     calls = []
     updates = []
     selector_filters = []
@@ -461,6 +492,7 @@ def _run_recovery_cycle(observation=None, *, row=None, now=None,
     events = []
     ticker_calls = []
     pair_info_calls = []
+    tg_calls = []
 
     def matches(filters):
         for key in ("cl_ord_id", "status", "order_id"):
@@ -470,6 +502,9 @@ def _run_recovery_cycle(observation=None, *, row=None, now=None,
                     return False
         raw_filter = filters.get("raw")
         if isinstance(raw_filter, str) and raw_filter.startswith("eq."):
+            if isinstance(db_row.get("raw"), str):
+                # A jsonb STRING never equals a jsonb OBJECT filter value.
+                return False
             expected = kr._safe_json_load(raw_filter[3:])
             if expected != (kr._safe_json_load(db_row.get("raw")) or {}):
                 return False
@@ -480,6 +515,8 @@ def _run_recovery_cycle(observation=None, *, row=None, now=None,
         if table != "dca_executions":
             return []
         status = params.get("status")
+        if reread_hook and params.get("select") == "status,order_id,raw":
+            reread_hook(db_row)
         if status == f"eq.{kr.REPEG_RECOVERY_STATUS}":
             selector_filters.append(params)
             return [dict(db_row)] if db_row.get("status") == kr.REPEG_RECOVERY_STATUS else []
@@ -496,11 +533,13 @@ def _run_recovery_cycle(observation=None, *, row=None, now=None,
     def fake_update(table, filters, changed):
         updates.append((table, dict(filters), dict(changed)))
         events.append(("db", changed.get("status") or "raw"))
+        if manual_cas_miss and changed.get("status") == "manual_required":
+            return []
         if advance_before_manual and changed.get("status") == "manual_required":
             db_row.update({"status": "limit_open", "order_id": "O-ADVANCED"})
             advanced_raw = kr._safe_json_load(db_row.get("raw")) or {}
             advanced_raw["repeg_transition"]["phase"] = "replacement_attached"
-            db_row["raw"] = advanced_raw
+            db_row["raw"] = kr.json.dumps(advanced_raw) if string_raw else advanced_raw
         changed_raw = kr._safe_json_load(changed.get("raw")) or {}
         changed_transition = changed_raw.get("repeg_transition") or {}
         if (fail_submission_envelope
@@ -511,7 +550,7 @@ def _run_recovery_cycle(observation=None, *, row=None, now=None,
         if table != "dca_executions" or not matches(filters):
             return []
         db_row.update(changed)
-        if "raw" in changed:
+        if "raw" in changed and not string_raw:
             db_row["raw"] = kr._safe_json_load(changed["raw"]) or {}
         return [dict(db_row)]
 
@@ -563,7 +602,7 @@ def _run_recovery_cycle(observation=None, *, row=None, now=None,
         "_fallback_decision": lambda *args, **kwargs: fallback_calls.append((args, kwargs)),
         "finalize_order": lambda *args, **kwargs: finalize_calls.append((args, kwargs)),
         "get_asset_pair_info": fake_pair_info,
-        "tg_send": lambda *_args, **_kwargs: None,
+        "tg_send": lambda text, *_args, **_kwargs: tg_calls.append(text),
     }
     originals = {name: getattr(kr, name) for name in replacements}
     for name, replacement in replacements.items():
@@ -578,11 +617,17 @@ def _run_recovery_cycle(observation=None, *, row=None, now=None,
     finally:
         for name, original in originals.items():
             setattr(kr, name, original)
+    stored_raw_is_string = isinstance(db_row.get("raw"), str)
+    if stored_raw_is_string:
+        # Tests read the decoded view; the store itself stayed a string.
+        db_row = {**db_row, "raw": kr._safe_json_load(db_row["raw"]) or {}}
     return {
+        "stored_raw_is_string": stored_raw_is_string,
         "row": db_row, "calls": calls, "updates": updates,
         "selector_filters": selector_filters, "fallback_calls": fallback_calls,
         "finalize_calls": finalize_calls, "events": events,
         "ticker_calls": ticker_calls, "pair_info_calls": pair_info_calls,
+        "tg_calls": tg_calls,
     }
 
 
@@ -622,8 +667,10 @@ def t_recovery_terminal_zero_fill_replaces_before_deadline(r):
         adds = [p for endpoint, p in trace["calls"] if endpoint == "AddOrder"]
         r.check(f"{status} starts one replacement", len(adds), 1)
         r.check(f"{status} replacement uses persisted identity",
-                adds[0].get("cl_ordid"),
+                adds[0].get("cl_ord_id"),
                 _recovery_row()["raw"]["repeg_transition"]["replacement_cl_ord_id"])
+        r.check(f"{status} replacement sends no legacy client-id field",
+                [k for k in adds[0] if k.startswith("cl_") and k != "cl_ord_id"], [])
         r.check(f"{status} replacement becomes owned limit",
                 trace["row"]["status"], "limit_open")
 
@@ -739,7 +786,7 @@ def t_ambiguous_replacement_found_is_attached_or_finalized(r):
     pending = _recovery_row("replacement_submission_pending")
     next_cl = pending["raw"]["repeg_transition"]["replacement_cl_ord_id"]
     open_order = {
-        "status": "open", "vol_exec": "0.00000000", "cl_ordid": next_cl,
+        "status": "open", "vol_exec": "0.00000000", "cl_ord_id": next_cl,
     }
     attached = _run_recovery_cycle(
         row=pending,
@@ -753,7 +800,7 @@ def t_ambiguous_replacement_found_is_attached_or_finalized(r):
     closed_order = {
         "status": "closed", "vol_exec": "291.00000000",
         "cost": "9.92000", "fee": "0.07900", "price": "0.03418",
-        "cl_ordid": next_cl,
+        "cl_ord_id": next_cl,
     }
     finalized = _run_recovery_cycle(
         row=_recovery_row("replacement_submission_pending"),
@@ -793,7 +840,7 @@ def t_original_partial_then_replacement_terminal_is_cumulative(r):
     row = _recovery_row("replacement_submission_pending")
     transition = row["raw"]["repeg_transition"]
     transition["generation_fills"] = [
-        _generation_fill(0, row["order_id"], row["cl_ord_id"],
+        _generation_fill(0, row["order_id"], _pid(0),
                          2.0, 0.008, 58.5)]
     row["filled_quote_cost"] = 2.0
     row["fee_quote"] = 0.008
@@ -801,7 +848,7 @@ def t_original_partial_then_replacement_terminal_is_cumulative(r):
     replacement = {
         "status": "closed", "vol_exec": "87.77000000",
         "cost": "3.00000", "fee": "0.01200", "price": "0.03418",
-        "cl_ordid": next_cl,
+        "cl_ord_id": next_cl,
     }
 
     trace = _run_recovery_cycle(
@@ -830,17 +877,17 @@ def _generation_two_recovery(prior_cost=1.0, prior_fee=0.004):
     transition.update({
         "generation": 2,
         "original_order_id": "O-REPEG-R1",
-        "original_provider_cl_ord_id": f"{cl}-r1",
-        "replacement_cl_ord_id": f"{cl}-r2",
+        "original_provider_cl_ord_id": _pid(1),
+        "replacement_cl_ord_id": _pid(2),
         "replacement_price": 0.03419,
     })
     transition["replacement_request"] = {
         **transition["replacement_request"],
         "price": "0.03419",
-        "cl_ordid": f"{cl}-r2",
+        "cl_ord_id": _pid(2),
     }
     transition["generation_fills"] = [
-        _generation_fill(0, "O-ORIGINAL", cl,
+        _generation_fill(0, "O-ORIGINAL", _pid(0),
                          prior_cost, prior_fee, 29.0)]
     row.update({
         "order_id": "O-REPEG-R1",
@@ -848,7 +895,7 @@ def _generation_two_recovery(prior_cost=1.0, prior_fee=0.004):
         "filled_quote_cost": prior_cost,
         "fee_quote": prior_fee,
     })
-    row["raw"]["kraken_cl"] = f"{cl}-r2"
+    row["raw"]["kraken_cl"] = _pid(2)
     row["raw"]["repeg_count"] = 2
     return row
 
@@ -858,7 +905,6 @@ def t_generation_one_partial_to_generation_two_honors_persisted_budget(r):
     trace = _run_recovery_cycle({
         "status": "canceled", "vol_exec": "29.24830000",
         "cost": "1.00000", "fee": "0.00400", "price": "0.03418",
-        "cl_ordid": f"{row['cl_ord_id']}-r1",
     }, row=row)
     persisted = kr.json.loads(kr.json.dumps(trace["row"]))
     fills, cost, fee, remaining = _persisted_event_consumption(persisted)
@@ -870,7 +916,7 @@ def t_generation_one_partial_to_generation_two_honors_persisted_budget(r):
     r.check("process-restored cumulative fee", round(fee, 6), 0.008)
     r.check("process-restored remaining quote", round(remaining, 6), 7.992)
     r.check("generation 2 uses its durable identity",
-            adds[0]["cl_ordid"], f"{row['cl_ord_id']}-r2")
+            adds[0]["cl_ord_id"], _pid(2))
     reserved = float(adds[0]["volume"]) * float(adds[0]["price"]) * 1.004
     r.check_true("cumulative cost and fees bound next spend",
                  cost + fee + reserved <= row["requested_quote_amount_base"])
@@ -881,7 +927,6 @@ def t_earlier_generation_fill_cannot_be_forgotten_and_overspent(r):
     trace = _run_recovery_cycle({
         "status": "canceled", "vol_exec": "29.24830000",
         "cost": "1.00000", "fee": "0.00400", "price": "0.03418",
-        "cl_ordid": f"{row['cl_ord_id']}-r1",
     }, row=row)
     _fills, cost, fee, remaining = _persisted_event_consumption(trace["row"])
 
@@ -920,7 +965,7 @@ def t_cancel_readback_merges_and_preserves_recovery_envelope(r):
     transition = raw["repeg_transition"]
     transition["replacement_order_id"] = "O-REPEG-R1"
     transition["generation_fills"] = [
-        _generation_fill(0, "O-ORIGINAL", row["cl_ord_id"],
+        _generation_fill(0, "O-ORIGINAL", _pid(0),
                          1.0, 0.004, 29.0)]
     writes = []
 
@@ -931,7 +976,6 @@ def t_cancel_readback_merges_and_preserves_recovery_envelope(r):
             return {"O-REPEG-R1": {
                 "status": "canceled", "vol_exec": "0.00000000",
                 "cost": "0.00000", "fee": "0.00000", "price": "0.00000",
-                "cl_ordid": f"{row['cl_ord_id']}-r1",
             }}
         raise AssertionError(endpoint)
 
@@ -956,7 +1000,9 @@ def t_cancel_readback_merges_and_preserves_recovery_envelope(r):
     r.check("recovery transition survives cancel readback",
             kept.get("request_fingerprint"), "test-fingerprint")
     r.check("replacement identity survives cancel readback",
-            kept.get("replacement_cl_ord_id"), f"{row['cl_ord_id']}-r1")
+            kept.get("replacement_cl_ord_id"), _pid(1))
+    r.check("provider id survives cancel readback merge",
+            persisted.get("kraken_cl"), _pid(1))
     r.check_true("frozen deadlines survive cancel readback",
                  kept.get("maker_deadline") and kept.get("manual_at"))
     r.check("cumulative evidence survives cancel readback",
@@ -972,8 +1018,12 @@ def t_generation_two_unknown_lookup_uses_current_provider_identity(r):
     closed = [params for endpoint, params in trace["calls"]
               if endpoint == "ClosedOrders"]
 
+    opened = [params for endpoint, params in trace["calls"]
+              if endpoint == "OpenOrders"]
     r.check("generation 2 fallback lookup uses generation 1 provider client",
-            closed[0].get("cl_ordid"), f"{row['cl_ord_id']}-r1")
+            closed[0].get("cl_ord_id"), _pid(1))
+    r.check("open-order lookup uses the same canonical filter",
+            opened[0].get("cl_ord_id"), _pid(1))
     r.check("stable DB identity remains unchanged",
             trace["row"]["cl_ord_id"], row["cl_ord_id"])
     r.check("unknown generation 1 creates no new spend",
@@ -996,8 +1046,17 @@ def t_stale_recovery_cannot_dead_letter_advanced_row(r):
     r.check("manual transition carried recovery ownership CAS",
             manual_attempts[0].get("status"),
             f"eq.{kr.REPEG_RECOVERY_STATUS}")
-    r.check_true("manual transition protects the recovery phase",
-                 "raw" in manual_attempts[0])
+    # ROB-21 follow-up: a raw-object filter can never match the production
+    # column (JSONB holding a JSON string), so the old assertion that the filter
+    # carried `raw` pinned a dead guard. Ownership is status + provider order +
+    # internal id on the update, and the phase is validated on decoded values.
+    r.check("manual transition filters on provider order",
+            manual_attempts[0].get("order_id"), "eq.O756Z5-SM7WB-5IAX7D")
+    r.check("manual transition filters on the internal id",
+            manual_attempts[0].get("cl_ord_id"), f"eq.{_recovery_row()['cl_ord_id']}")
+    r.check("manual transition has NO raw-equality filter", "raw" in manual_attempts[0], False)
+    r.check("ownership loss is alerted distinctly, not as manual_required",
+            [("NOT PERSISTED" in t) for t in trace["tg_calls"]], [True])
 
 
 def t_recovery_ttl_equality_matches_existing_maker_boundary(r):

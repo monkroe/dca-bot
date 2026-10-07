@@ -48,6 +48,7 @@ import urllib.parse
 import urllib.request
 import urllib.error
 from datetime import datetime, timedelta, timezone
+from typing import NamedTuple
 from zoneinfo import ZoneInfo
 from ohlc import build_daily_metrics
 from weekly_summary import weekly_summary_evidence
@@ -808,6 +809,227 @@ def kraken_public(endpoint: str, params: dict | None = None) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════
+#  PROVIDER CLIENT-ORDER IDENTITY (ROB-21)
+# ═══════════════════════════════════════════════════════════════
+#
+# `dca_executions.cl_ord_id` is OUR identity and is long (it carries pair and
+# date). Kraken accepts at most 18 ASCII characters of free-text `cl_ord_id`, so
+# what we SEND is a derived, fixed-length provider id. It is persisted in
+# `raw.kraken_cl` BEFORE every AddOrder, and every later lookup uses the
+# persisted value -- never a re-derivation and never the internal id.
+#
+#   v1|<attempt_type>|<dca_executions.cl_ord_id>|<generation>
+#     -> UTF-8 -> SHA-256 -> Base32 (RFC 4648) -> strip '=' -> lowercase
+#     -> first 13 characters -> prefix 'dca1-'        (18 characters in all)
+#
+# A re-peg is NOT an attempt type: it is generation >= 1 of the maker_limit
+# execution, and the internal cl_ord_id stays put while the generation moves.
+PROVIDER_ATTEMPT_TYPES = ("maker_limit", "market", "maker_fallback")
+PROVIDER_ID_PREFIX = "dca1-"
+_PROVIDER_ID_RE = re.compile(r"dca1-[a-z2-7]{13}")
+
+
+def provider_client_id(attempt_type, cl_ord_id, generation=0) -> str | None:
+    """PURE. The provider id for one (attempt_type, cl_ord_id, generation), or
+    None when no identity may be derived (NULL/unknown attempt type, a
+    generation the attempt type does not allow, or no internal id)."""
+    if attempt_type not in PROVIDER_ATTEMPT_TYPES:
+        return None
+    if not isinstance(cl_ord_id, str) or not cl_ord_id:
+        return None
+    # bool is an int subclass; True must not pass for generation 1.
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+        return None
+    if generation >= 1 and attempt_type != "maker_limit":
+        return None
+    material = f"v1|{attempt_type}|{cl_ord_id}|{generation}"
+    digest = base64.b32encode(hashlib.sha256(material.encode("utf-8")).digest())
+    return PROVIDER_ID_PREFIX + digest.decode("ascii").rstrip("=").lower()[:13]
+
+
+def valid_provider_id(value) -> bool:
+    """PURE. True only for a well-formed v1 provider id. fullmatch, not `$`,
+    so a trailing newline cannot pass."""
+    return isinstance(value, str) and _PROVIDER_ID_RE.fullmatch(value) is not None
+
+
+def _provider_id_from_raw(raw) -> str | None:
+    """PURE. The persisted provider id of a row, or None when absent/invalid.
+    There is deliberately no fallback to the internal cl_ord_id: a row whose
+    provider identity is missing is handled manually, not guessed."""
+    if not isinstance(raw, dict):
+        return None
+    value = raw.get("kraken_cl")
+    return value if valid_provider_id(value) else None
+
+
+def _rows_carry_provider(rows, provider_id: str) -> bool:
+    """PURE. Did a write's RETURNED representation persist this provider id?"""
+    if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+        return False
+    return _provider_id_from_raw(_safe_json_load(rows[0].get("raw"))) == provider_id
+
+
+def _is_duplicate_error(error) -> bool:
+    """A Kraken duplicate rejection: positive evidence the id was already used."""
+    return "duplicate" in str(error).lower()
+
+
+# ── Unified provider lookup ────────────────────────────────────
+#
+# ClosedOrders start margin. `start` is derived from the row's
+# execution_started_at, and the order is submitted AFTER that instant, so the
+# margin only has to absorb (a) the claim-to-AddOrder latency inside one run --
+# a handful of sequential Kraken/Supabase calls, each bounded by a 30 s
+# timeout, so well under 5 minutes -- and (b) clock skew between this runner and
+# Kraken. 30 minutes is six cron cycles (CRON_CYCLE_MINUTES = 5) and twice the
+# 15 minute stale-claim threshold. The margin is deliberately wide: the filter
+# is an exact id, so a wider window costs a few more rows, while a window that is
+# too narrow would make ABSENT unsound.
+LOOKUP_START_MARGIN = timedelta(minutes=30)
+# Forward skew on `end`: a runner clock behind Kraken's must not exclude an
+# order that has just closed.
+LOOKUP_END_MARGIN = timedelta(minutes=5)
+# Fail-closed page cap. Cursor exhaustion is the completeness proof; reaching
+# the cap without exhaustion is UNKNOWN.
+LOOKUP_MAX_PAGES = 20
+
+
+class ProviderLookup(NamedTuple):
+    state: str          # "FOUND" | "ABSENT" | "UNKNOWN"
+    txid: str | None
+    order: dict | None
+    detail: str
+
+
+def _lookup_unknown(detail: str) -> ProviderLookup:
+    print(f"    provider lookup UNKNOWN: {detail}")
+    return ProviderLookup("UNKNOWN", None, None, detail)
+
+
+def _lookup_started_at(value):
+    """PURE. A tz-aware UTC datetime from an ISO string/datetime, or None."""
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def _lookup_collect(orders, provider_id: str, found: dict) -> str | None:
+    """Validate EVERY returned order independently and merge by txid.
+
+    Returns an error detail, or None when the collection was valid. A returned
+    order whose canonical `cl_ord_id` is not the requested id is an error, never
+    a skip: skipping is exactly how a silently ignored filter would slip a
+    foreign order past the check."""
+    if not isinstance(orders, dict):
+        return "orders collection is not an object"
+    for txid, order in orders.items():
+        if not isinstance(txid, str) or not txid:
+            return "malformed txid"
+        if not isinstance(order, dict):
+            return f"order {txid} is not an object"
+        if order.get("cl_ord_id") != provider_id:
+            return f"order {txid} returned a foreign or missing cl_ord_id"
+        # The same order can race open -> closed between the two reads; the
+        # later (closed) observation overwrites, and the txid dedupes it.
+        found[txid] = order
+    return None
+
+
+def kraken_lookup_client_order(provider_id, started_at, now=None) -> ProviderLookup:
+    """THE lookup used by maker, market, fallback and re-peg ambiguity paths.
+
+    FOUND   exactly one unique, validated txid.
+    ABSENT  OpenOrders read validly AND bounded ClosedOrders paginated to
+            cursor exhaustion AND zero matching txids.
+    UNKNOWN anything else. UNKNOWN never authorizes another spend, and neither
+            does ABSENT: no resubmission follows from this function.
+
+    Only a well-formed v1 provider id ever reaches Kraken as a filter; a missing,
+    legacy or malformed id is UNKNOWN without a call.
+    """
+    if not valid_provider_id(provider_id):
+        return _lookup_unknown("provider id missing or not a v1 provider id")
+    start = _lookup_started_at(started_at)
+    if start is None:
+        return _lookup_unknown("execution_started_at missing or unparseable")
+
+    found: dict = {}
+
+    # OpenOrders FIRST. An order that closes between the two reads is then seen
+    # by the ClosedOrders read that follows; the reverse order could miss it in
+    # both and report a false ABSENT.
+    try:
+        open_result = kraken_private("OpenOrders", {"cl_ord_id": provider_id})
+    except Exception as e:
+        return _lookup_unknown(f"OpenOrders failed: {e}")
+    if not isinstance(open_result, dict) or not isinstance(open_result.get("open"), dict):
+        return _lookup_unknown("OpenOrders payload malformed")
+    problem = _lookup_collect(open_result["open"], provider_id, found)
+    if problem:
+        return _lookup_unknown(f"OpenOrders: {problem}")
+
+    # `end` is taken AFTER the open read, with a forward skew margin.
+    end = (_lookup_started_at(now) if now is not None
+           else datetime.now(timezone.utc)) + LOOKUP_END_MARGIN
+    base_params = {
+        "cl_ord_id": provider_id,
+        "start": str(int((start - LOOKUP_START_MARGIN).timestamp())),
+        "end": str(int(end.timestamp())),
+        # Filter on closetm only: the order may have opened before `start`.
+        "closetime": "close",
+        "with_cursor": "true",
+    }
+    seen_cursors: set = set()
+    cursor = None
+    for _page in range(LOOKUP_MAX_PAGES):
+        params = dict(base_params)
+        if cursor is not None:
+            params["cursor"] = cursor
+        try:
+            closed_result = kraken_private("ClosedOrders", params)
+        except Exception as e:
+            return _lookup_unknown(f"ClosedOrders failed: {e}")
+        if not isinstance(closed_result, dict) or not isinstance(closed_result.get("closed"), dict):
+            return _lookup_unknown("ClosedOrders payload malformed")
+        problem = _lookup_collect(closed_result["closed"], provider_id, found)
+        if problem:
+            return _lookup_unknown(f"ClosedOrders: {problem}")
+        # `count` is 0 in cursor mode and proves nothing. Exhaustion is the
+        # absence of `cursor.next`.
+        page_cursor = closed_result.get("cursor")
+        if page_cursor is None:
+            break
+        if not isinstance(page_cursor, dict):
+            return _lookup_unknown("ClosedOrders cursor malformed")
+        next_cursor = page_cursor.get("next")
+        if next_cursor is None:
+            break
+        if not isinstance(next_cursor, str) or not next_cursor:
+            return _lookup_unknown("ClosedOrders cursor.next malformed")
+        if next_cursor in seen_cursors:
+            return _lookup_unknown("ClosedOrders cursor repeated")
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+    else:
+        return _lookup_unknown("ClosedOrders pagination incomplete (page cap reached)")
+
+    if not found:
+        return ProviderLookup("ABSENT", None, None, "no matching order, pagination complete")
+    if len(found) > 1:
+        return _lookup_unknown(f"multiple distinct txids: {sorted(found)}")
+    txid, order = next(iter(found.items()))
+    return ProviderLookup("FOUND", txid, order, "exactly one validated txid")
+
+
+# ═══════════════════════════════════════════════════════════════
 #  PREFLIGHT CHECKS
 # ═══════════════════════════════════════════════════════════════
 
@@ -1352,6 +1574,9 @@ def finalize_order(cl_ord_id: str, order_id: str, mid: float | None = None, ohlc
     merged_raw = {**prior_raw, **(order_data if isinstance(order_data, dict) else {})}
     if isinstance(transition, dict):
         merged_raw["repeg_transition"] = transition
+    if "kraken_cl" in prior_raw:
+        # The persisted provider id is never displaced by a provider response.
+        merged_raw["kraken_cl"] = prior_raw["kraken_cl"]
 
     sb_update(
         "dca_executions",
@@ -1517,17 +1742,56 @@ def _mark_manual_required(row: dict, note: str):
     ))
 
 
-def _find_open_kraken_order(cl_ord_id: str) -> str | None:
-    """Find a RESTING order by cl_ord_id. ClosedOrders can't see these —
-    without this, a crash between limit AddOrder and the DB update would
-    orphan an open order and reconciliation would wrongly mark it failed."""
+def _merged_raw_json(cl_ord_id: str, extra: dict, provider_id: str | None = None) -> str:
+    """`raw` for a row, MERGED with what is persisted and never replacing it.
+
+    The provider id is forced LAST, so neither `extra` nor a provider response
+    can displace it. If the persisted raw cannot be read, `extra` plus the
+    provider id the caller holds is still written, which keeps the id."""
+    current: dict = {}
     try:
-        oo = kraken_private("OpenOrders")
-        for txid, order in (oo.get("open") or {}).items():
-            if order.get("cl_ordid") == cl_ord_id:
-                return txid
+        rows = sb_get("dca_executions", {"cl_ord_id": f"eq.{cl_ord_id}", "select": "raw"})
+        loaded = _safe_json_load(rows[0].get("raw")) if rows else None
+        if isinstance(loaded, dict):
+            current = loaded
     except Exception as e:
-        print(f"    OpenOrders search failed: {e}")
+        print(f"  {ICONS['WARN']} raw merge lookup failed: {e}")
+    merged = {**current, **extra}
+    pid = provider_id or _provider_id_from_raw(current)
+    if pid:
+        merged["kraken_cl"] = pid
+    return json.dumps(merged)
+
+
+def _resolve_duplicate_submission(cl_ord_id: str, provider_id: str, started_at,
+                                  error, pair: str, trade_date: str) -> str | None:
+    """A duplicate rejection proves the provider id was used.
+
+    FOUND  -> the txid, for the caller to attach.
+    ABSENT / UNKNOWN -> None. The submission state is recorded as UNKNOWN in
+    `raw`, the row stays NON-terminal (claimed), and the human is alerted once.
+    Nothing here writes failed_kraken and nothing here submits again: a lookup
+    miss after a duplicate rejection is the evidence that something is wrong,
+    not that the order is absent."""
+    lookup = kraken_lookup_client_order(provider_id, started_at)
+    if lookup.state == "FOUND":
+        print(f"  duplicate rejection resolved: {provider_id} is {lookup.txid}")
+        return lookup.txid
+    note = f"duplicate rejection, lookup {lookup.state}: {lookup.detail}"
+    print(f"  {ICONS['WARN']} {note} -- submission state UNKNOWN, row stays claimed")
+    sb_update("dca_executions", {"cl_ord_id": f"eq.{cl_ord_id}"}, {
+        "raw": _merged_raw_json(cl_ord_id, {
+            "submission_state": "UNKNOWN",
+            "submission_state_reason": note,
+            "duplicate_error": str(error),
+            "submission_state_at": _now_utc_iso(),
+        }, provider_id),
+    })
+    tg_send(msg_fail(
+        "DCA SUBMISSION UNKNOWN",
+        f"{trade_date} | {pair}\n{note}\n"
+        f"Execution left non-terminal; no resubmission. Check the order on Kraken by hand."
+    ))
     return None
 
 
@@ -1583,6 +1847,8 @@ def _cancel_confirm_readback(row: dict) -> str | None:
             return None
         prior_raw["repeg_transition"] = transition
     merged_raw = {**prior_raw, **o}
+    if "kraken_cl" in prior_raw:
+        merged_raw["kraken_cl"] = prior_raw["kraken_cl"]
     if isinstance(transition, dict):
         merged_raw["repeg_transition"] = transition
         cumulative_cost = consumption["filled_quote_cost"]
@@ -1722,8 +1988,17 @@ def _fallback_decision(row: dict, settings: dict, user_id: str, window_end, dry_
             "estimated_cost": round(est_cost, 6),
             "estimated_fee": round(est_fee, 6),
         })
+    else:
+        # Claim-first for the provider identity: persisted in the claim row.
+        fb_pid = provider_client_id("maker_fallback", fb_cl, 0)
+        if fb_pid is None:
+            raise RuntimeError(f"no provider id derivable for {fb_cl}")
+        fb_row["raw"] = json.dumps({"kraken_cl": fb_pid})
     try:
-        sb_insert("dca_executions", fb_row)
+        fb_claimed = sb_insert("dca_executions", fb_row)
+        if not dry_run and not _rows_carry_provider(fb_claimed, fb_pid):
+            raise RuntimeError(
+                f"provider id for {fb_cl} not confirmed persisted -- no AddOrder")
         print(f"    fallback claimed: {fb_cl} (B_rem=${b_rem:.4f}, vol={vol})")
     except urllib.error.HTTPError as e:
         if e.code == 409:
@@ -1771,24 +2046,31 @@ def _fallback_decision(row: dict, settings: dict, user_id: str, window_end, dry_
             "ordertype": "market",
             "volume": format_volume(vol, pair_info["lot_decimals"]),
             "oflags": "fciq",
-            "cl_ordid": fb_cl,
+            "cl_ord_id": fb_pid,
         }
         result = kraken_private("AddOrder", fb_params)
         order_id = result.get("txid", [None])[0]
-        update_fb({"status": "placed", "order_id": order_id, "raw": json.dumps(result)})
+        update_fb({"status": "placed", "order_id": order_id,
+                   "raw": json.dumps({**result, "kraken_cl": fb_pid})})
         print(f"    {ICONS['OK']} fallback placed: {order_id}")
     except KrakenError as e:
-        if "duplicate" in str(e).lower():
-            found = try_find_kraken_order(fb_cl)
+        if _is_duplicate_error(e):
+            # The id was already used. FOUND -> attach and finalize. ABSENT or
+            # UNKNOWN -> the leg stays claimed with an UNKNOWN submission state
+            # (alerted once by the resolver). NEVER failed_kraken on a miss.
+            found = _resolve_duplicate_submission(
+                fb_cl, fb_pid, fb_row["execution_started_at"], e, pair, trade_date)
+            mark("fallback_created")
             if found:
+                update_fb({"status": "placed", "order_id": found,
+                           "raw": _merged_raw_json(fb_cl, {"duplicate_recovered": True}, fb_pid)})
                 finalize_order(fb_cl, found, mid=ticker.get("mid"), label="FALLBACK FILLED")
-                mark("fallback_created")
-                return
+            return
         update_fb({
             "status": "failed_kraken",
             "reason": f"fallback AddOrder failed: {e}",
             "execution_finished_at": _now_utc_iso(),
-            "raw": _failure_raw(fb_params, e, leg="fallback"),
+            "raw": _failure_raw(fb_params, e, leg="fallback", kraken_cl=fb_pid),
         })
         mark("fallback_failed_kraken")
         tg_send(msg_exec_fail(trade_date, pair, "Could not place the fallback order.", e))
@@ -2299,7 +2581,14 @@ def _maybe_repeg(row: dict, o: dict, settings: dict, user_id: str, window_end) -
         log_repeg_probe(row, "not_evaluated", "persisted re-peg fills malformed")
         return False
     prior_cost, prior_fee, _prior_volume = cumulative
-    current_provider_cl = raw.get("kraken_cl") or cl
+    # The provider identity of the order that is resting NOW is the persisted
+    # raw.kraken_cl. No fallback to the internal cl_ord_id: without a valid
+    # persisted id the leg is simply not re-pegged (it keeps resting and the
+    # deadline path cancels it by order_id).
+    current_provider_cl = _provider_id_from_raw(raw)
+    if current_provider_cl is None:
+        log_repeg_probe(row, "not_evaluated", "no valid persisted provider id")
+        return False
     repeg_max = int(settings.get("repeg_max") or 5)
     min_ticks = int(settings.get("repeg_min_ticks") or 1)
 
@@ -2344,14 +2633,19 @@ def _maybe_repeg(row: dict, o: dict, settings: dict, user_id: str, window_end) -
 
     new_vol = floor_to_decimals(cost_target / new_bid, pair_info["lot_decimals"])
     next_count = repeg_count + 1
-    new_cl = f"{cl}-r{next_count}"
+    # Re-peg is generation >= 1 of the SAME maker_limit execution: the internal
+    # cl_ord_id stays put and only the generation moves.
+    new_cl = provider_client_id("maker_limit", cl, next_count)
+    if new_cl is None:
+        log_repeg_probe(row, "not_evaluated", "no provider id derivable for replacement")
+        return False
     new_price_str = f"{new_bid:.{pair_info['pair_decimals']}f}"
     repeg_params = {
         "pair": pair, "type": "buy", "ordertype": "limit",
         "price": new_price_str,
         "volume": format_volume(new_vol, pair_info["lot_decimals"]),
         "oflags": "post,fciq",
-        "cl_ordid": new_cl,
+        "cl_ord_id": new_cl,
     }
     transition_at = _now_utc_iso()
     deadline = window_end - timedelta(minutes=CRON_CYCLE_MINUTES)
@@ -2419,6 +2713,11 @@ def _maybe_repeg(row: dict, o: dict, settings: dict, user_id: str, window_end) -
     if not isinstance(armed, list) or len(armed) != 1:
         print("    repeg: recovery arm lost ownership — original order untouched")
         return False
+    if not _rows_carry_provider(armed, new_cl):
+        # Fail closed: the replacement id is not confirmed durable, so no
+        # cancel is issued and recovery (not this run) owns the row.
+        print("    repeg: replacement provider id not confirmed persisted — no cancel")
+        return False
 
     # Cancel/readback remains useful telemetry and can reduce latency, but it
     # is not the correctness mechanism: every outcome leaves the durable row
@@ -2482,20 +2781,25 @@ def _repeg_number(order: dict, key: str):
 
 
 def _repeg_fill_identity(transition: dict, order: dict, order_id: str | None):
-    """Identify the one provider order represented by a cumulative observation."""
+    """Identify the one provider order a cumulative observation represents.
+
+    By PERSISTED txid + transition state only. The response's client id is
+    deliberately not consulted: once the txid is known it is the identity, and
+    inferring the generation from a response field would make a missing or
+    foreign field silently change which generation is charged. Returns None
+    when the txid matches neither generation (the caller fails closed)."""
+    if not order_id:
+        return None
     generation = int(transition.get("generation") or 0)
-    provider_cl = order.get("cl_ordid") or order.get("cl_ord_id")
-    replacement_cl = transition.get("replacement_cl_ord_id")
-    replacement_oid = transition.get("replacement_order_id")
-    if ((order_id and replacement_oid and order_id == replacement_oid)
-            or (provider_cl and provider_cl == replacement_cl)):
-        return generation, order_id or replacement_oid, replacement_cl
-    return (
-        max(generation - 1, 0),
-        order_id or transition.get("original_order_id"),
-        provider_cl or transition.get("original_provider_cl_ord_id")
-        or transition.get("original_cl_ord_id"),
-    )
+    if order_id == transition.get("replacement_order_id"):
+        return generation, order_id, transition.get("replacement_cl_ord_id")
+    if order_id == transition.get("original_order_id"):
+        return (
+            max(generation - 1, 0),
+            order_id,
+            transition.get("original_provider_cl_ord_id"),
+        )
+    return None
 
 
 def _repeg_apply_generation_fill(transition: dict, order: dict,
@@ -2510,8 +2814,10 @@ def _repeg_apply_generation_fill(transition: dict, order: dict,
         return False
     cost = cost or 0.0
     fee = fee or 0.0
-    generation, provider_oid, provider_cl = _repeg_fill_identity(
-        transition, order, order_id)
+    identity = _repeg_fill_identity(transition, order, order_id)
+    if identity is None:
+        return False
+    generation, provider_oid, provider_cl = identity
     entries = [
         dict(item) for item in (transition.get("generation_fills") or [])
         if isinstance(item, dict)
@@ -2594,9 +2900,13 @@ def _repeg_submitted_limit_price(transition: dict):
         return None
 
 
-def _repeg_owned_update(row: dict, updates: dict,
-                        expected_raw: dict | None = None) -> bool:
-    """CAS one recovery-row transition and mirror a confirmed write locally."""
+def _repeg_owned_update(row: dict, updates: dict) -> bool:
+    """CAS one recovery-row transition and mirror a confirmed write locally.
+
+    The ownership predicate is status + provider order id + internal id. There is
+    deliberately NO `raw` filter: in production `raw` is JSONB holding a JSON
+    STRING, so `raw=eq.<json object>` can never match and would silently turn
+    every guarded write into a no-op."""
     oid = ((_safe_json_load(row.get("raw")) or {}).get("repeg_transition") or {}).get(
         "original_order_id") or row.get("order_id")
     filters = {
@@ -2605,9 +2915,6 @@ def _repeg_owned_update(row: dict, updates: dict,
     }
     if oid:
         filters["order_id"] = f"eq.{oid}"
-    if expected_raw is not None:
-        filters["raw"] = "eq." + json.dumps(
-            expected_raw, sort_keys=True, separators=(",", ":"))
     try:
         changed = sb_update("dca_executions", filters, updates)
     except Exception as e:
@@ -2623,22 +2930,91 @@ def _repeg_owned_update(row: dict, updates: dict,
 
 
 
+def _repeg_ownership_confirmed(row: dict) -> tuple[bool, str]:
+    """Re-read the row and confirm this run still owns the recovery transition.
+
+    Compared on DECODED values only: the stored `raw` is decoded exactly as the
+    production column is stored (a JSON string inside jsonb) and never compared
+    as text or as an object against the column. Confirms the row is still in
+    recovery, still holds the same provider order, and the re-peg phase and
+    generation are unchanged from what this run is acting on. Anything
+    unreadable or ambiguous is NOT ownership (fail closed). The status and
+    order filters on the update that follows remain the atomic part; this check
+    only restores the phase protection the dead raw-equality filter was meant
+    to give."""
+    try:
+        fresh_rows = sb_get("dca_executions", {
+            "cl_ord_id": f"eq.{row['cl_ord_id']}",
+            "select": "status,order_id,raw",
+        })
+    except Exception as e:
+        return False, f"ownership re-read failed: {e}"
+    if (not isinstance(fresh_rows, list) or len(fresh_rows) != 1
+            or not isinstance(fresh_rows[0], dict)):
+        return False, "ownership re-read returned no single row"
+    fresh = fresh_rows[0]
+    if fresh.get("status") != REPEG_RECOVERY_STATUS:
+        return False, f"status is now {fresh.get('status')!r}"
+    ok, fresh_raw = decode_execution_raw(fresh.get("raw"))
+    if not ok:
+        return False, "current raw is not decodable"
+    fresh_raw = fresh_raw or {}          # SQL NULL raw is an empty record, not an error
+    mine_raw = _safe_json_load(row.get("raw")) or {}
+    mine = mine_raw.get("repeg_transition")
+    now = fresh_raw.get("repeg_transition")
+    expected_oid = (mine.get("original_order_id") if isinstance(mine, dict) else None) \
+        or row.get("order_id")
+    if expected_oid and fresh.get("order_id") != expected_oid:
+        return False, "provider order changed"
+    if isinstance(mine, dict) and isinstance(now, dict):
+        for key in ("phase", "generation"):
+            if mine.get(key) != now.get(key):
+                return False, f"re-peg {key} changed ({mine.get(key)!r} -> {now.get(key)!r})"
+    elif isinstance(mine, dict) or isinstance(now, dict):
+        return False, "re-peg transition appeared or disappeared"
+    elif mine != now:
+        return False, "re-peg transition changed"
+    # Neither side has a usable transition (the "envelope missing" dead-letter):
+    # the unchanged absence is exactly the state being escalated.
+    return True, ""
+
+
 def _repeg_mark_manual_required(row: dict, note: str) -> bool:
-    """Dead-letter only while status, provider order, and raw phase are owned."""
-    expected_raw = _safe_json_load(row.get("raw")) or {}
-    if not _repeg_owned_update(row, {
-            "status": "manual_required",
-            "reason": note,
-            "execution_finished_at": _now_utc_iso(),
-    }, expected_raw=expected_raw):
-        return False
+    """Dead-letter only while status, provider order, and re-peg phase are owned.
+
+    Success persists manual_required and sends the normal alert. If ownership is
+    not confirmed or the guarded update does not apply, manual_required is NOT
+    written and a DISTINCT alert says so: the escalation did not happen, nothing
+    was spent, and a human must look. The recovery loop re-evaluates the row on
+    its next cycle, so while the row stays in recovery this alert can repeat
+    until the window ends. That repetition is accepted; no suppression state is
+    kept anywhere, and none could depend on the update that just missed."""
+    confirmed, why = _repeg_ownership_confirmed(row)
+    persisted = confirmed and _repeg_owned_update(row, {
+        "status": "manual_required",
+        "reason": note,
+        "execution_finished_at": _now_utc_iso(),
+    })
+    if persisted:
+        tg_send(msg_fail(
+            "DCA MANUAL REQUIRED",
+            f"{row['trade_date_chicago']} | {row['pair']}\n"
+            f"order_id: {row.get('order_id') or '?'}\n{note}\n"
+            f"Automation stopped for this event. Check the order on Kraken by hand."
+        ))
+        return True
+    detail = why or "the guarded update did not apply"
+    print(f"    repeg manual escalation NOT persisted: {detail}")
     tg_send(msg_fail(
-        "DCA MANUAL REQUIRED",
+        "DCA MANUAL ESCALATION NOT PERSISTED",
         f"{row['trade_date_chicago']} | {row['pair']}\n"
-        f"order_id: {row.get('order_id') or '?'}\n{note}\n"
-        f"Automation stopped for this event. Check the order on Kraken by hand."
+        f"order_id: {row.get('order_id') or '?'}\n"
+        f"Could not record manual_required because ownership/CAS no longer matched ({detail}).\n"
+        f"Intended note: {note}\n"
+        f"No order was placed. Check the order on Kraken by hand."
     ))
-    return True
+    return False
+
 
 def _repeg_record_observation(row: dict, transition: dict, order: dict,
                               phase: str | None = None,
@@ -2682,62 +3058,26 @@ def _repeg_to_fallback(row: dict, transition: dict, settings: dict,
                        dry_run=False, scenario=None)
 
 
-def _repeg_replacement_matches(order: dict, client_id: str) -> bool:
-    return isinstance(order, dict) and (
-        order.get("cl_ordid") == client_id or order.get("cl_ord_id") == client_id
-    )
+def _repeg_find_replacement(client_id, started_at):
+    """Return (certainty, txid, order) via the unified open+closed lookup.
+
+    Certainty is 'found', 'absent' or 'unknown'. Neither 'absent' nor 'unknown'
+    authorises a resubmission: callers only wait for the frozen TTL."""
+    lookup = kraken_lookup_client_order(client_id, started_at)
+    if lookup.state == "FOUND":
+        return ("found", lookup.txid, lookup.order)
+    if lookup.state == "ABSENT":
+        return ("absent", None, None)
+    return ("unknown", None, None)
 
 
-def _repeg_find_replacement(client_id: str):
-    """Return (certainty, txid, order) across both Kraken order collections."""
-    try:
-        closed_result = kraken_private("ClosedOrders", {"cl_ordid": client_id})
-        open_result = kraken_private("OpenOrders")
-    except Exception as e:
-        print(f"    repeg replacement lookup failed: {e}")
-        return ("unknown", None, None)
-    if not isinstance(closed_result, dict) or not isinstance(open_result, dict):
-        return ("unknown", None, None)
-    found = []
-    for collection, key in ((closed_result, "closed"), (open_result, "open")):
-        orders = collection.get(key)
-        if orders is None:
-            orders = {}
-        if not isinstance(orders, dict):
-            return ("unknown", None, None)
-        for txid, order in orders.items():
-            if _repeg_replacement_matches(order, client_id):
-                found.append((txid, order))
-    if len(found) == 1:
-        return ("found", found[0][0], found[0][1])
-    if found:
-        print("    repeg replacement identity matched multiple provider orders")
-        return ("unknown", None, None)
-    return ("absent", None, None)
-
-
-def _repeg_find_original(order_id: str, client_id: str):
-    """Best-effort provider reconciliation when QueryOrders has no usable row."""
-    try:
-        open_result = kraken_private("OpenOrders")
-        closed_result = kraken_private("ClosedOrders", {"cl_ordid": client_id})
-    except Exception as e:
-        print(f"    repeg original reconciliation failed: {e}")
-        return None
-    found = []
-    for collection, key in ((open_result, "open"), (closed_result, "closed")):
-        orders = collection.get(key) if isinstance(collection, dict) else None
-        if orders is None:
-            orders = {}
-        if not isinstance(orders, dict):
-            return None
-        for txid, order in orders.items():
-            if txid == order_id or _repeg_replacement_matches(order, client_id):
-                found.append((txid, order))
-    exact = [order for txid, order in found if txid == order_id]
-    if len(exact) == 1:
-        return exact[0]
-    return found[0][1] if len(found) == 1 else None
+def _repeg_find_original(order_id: str, client_id, started_at):
+    """Best-effort provider reconciliation when QueryOrders has no usable row.
+    The unified lookup must find exactly the txid we already own."""
+    lookup = kraken_lookup_client_order(client_id, started_at)
+    if lookup.state == "FOUND" and lookup.txid == order_id:
+        return lookup.order
+    return None
 
 
 def _repeg_reconcile_ambiguous_submission(row: dict, transition: dict,
@@ -2748,7 +3088,8 @@ def _repeg_reconcile_ambiguous_submission(row: dict, transition: dict,
         if manual_at and now_chicago > manual_at:
             _repeg_mark_manual_required(row, "re-peg replacement identity missing at frozen TTL")
         return
-    certainty, txid, order = _repeg_find_replacement(client_id)
+    certainty, txid, order = _repeg_find_replacement(
+        client_id, row.get("execution_started_at"))
     if certainty != "found":
         if manual_at and now_chicago > manual_at:
             _repeg_mark_manual_required(
@@ -2871,14 +3212,25 @@ def _repeg_submit_replacement(row: dict, transition: dict, order: dict,
         fail("replacement_below_ordermin", submission_market)
         return
 
-    request = dict(transition.get("replacement_request") or {})
-    request.update({
+    # The id about to be sent must be the generation provider id that was
+    # persisted in raw.kraken_cl when the transition was armed. Anything else
+    # (legacy id, missing, or a mismatch) fails closed: manual, no AddOrder.
+    replacement_pid = transition.get("replacement_cl_ord_id")
+    persisted_pid = _provider_id_from_raw(_safe_json_load(row.get("raw")))
+    if not valid_provider_id(replacement_pid) or persisted_pid != replacement_pid:
+        _repeg_mark_manual_required(
+            row, "re-peg replacement provider id invalid or not persisted -- no AddOrder")
+        return
+    # Built fresh from the seven fields a replacement carries. The persisted
+    # replacement_request is NOT copied: one persisted before ROB-21 may carry
+    # the legacy client-id field name, and it must never go out.
+    request = {
         "pair": row["pair"], "type": "buy", "ordertype": "limit",
         "price": f"{replacement_price:.{pair_decimals}f}",
         "volume": format_volume(volume, lot_decimals),
         "oflags": "post,fciq",
-        "cl_ordid": transition["replacement_cl_ord_id"],
-    })
+        "cl_ord_id": replacement_pid,
+    }
     final_transition = dict(transition)
     final_transition["phase"] = "replacement_submission_pending"
     final_transition["replacement_request"] = request
@@ -2900,8 +3252,26 @@ def _repeg_submit_replacement(row: dict, transition: dict, order: dict,
         # different: it may identify the very order whose response was lost.
         transition["last_add_order_error"] = str(e)
         raw["repeg_transition"] = transition
-        if "duplicate" in str(e).lower():
+        if _is_duplicate_error(e):
+            # Positive evidence the id was used. The row stays in its
+            # non-terminal submission-pending phase; look the id up right away
+            # and attach it if it can be proven, otherwise alert once and let
+            # recovery wait for the frozen TTL. Never rejected, never resubmit.
             _repeg_owned_update(row, {"raw": json.dumps(raw)})
+            certainty, _txid, _found = _repeg_find_replacement(
+                replacement_pid, row.get("execution_started_at"))
+            if certainty == "found":
+                _repeg_reconcile_ambiguous_submission(
+                    row, transition, settings, user_id,
+                    datetime.now(CHICAGO_TZ), window_end,
+                    _repeg_time(transition.get("manual_at")))
+            else:
+                tg_send(msg_fail(
+                    "DCA SUBMISSION UNKNOWN",
+                    f"{row['trade_date_chicago']} | {row['pair']}\n"
+                    f"Re-peg replacement duplicate rejection, lookup {certainty}.\n"
+                    f"Execution left non-terminal; no resubmission. Check the order on Kraken by hand."
+                ))
             return
         transition["phase"] = "replacement_rejected"
         raw["last_failure"] = _failure_note(request, e, leg="repeg")
@@ -2970,9 +3340,11 @@ def _recover_repeg(row: dict, settings: dict, user_id: str, now_chicago) -> None
         print(f"    repeg recovery QueryOrders failed: {e}")
         order = None
     if not isinstance(order, dict) or not str(order.get("status") or ""):
-        provider_cl = (transition.get("original_provider_cl_ord_id")
-                       or transition.get("original_cl_ord_id") or row["cl_ord_id"])
-        order = _repeg_find_original(oid, provider_cl)
+        # Only the provider id persisted for the previous generation. There is
+        # no fallback to the internal cl_ord_id; an invalid id makes the lookup
+        # UNKNOWN and the row waits for the frozen TTL.
+        provider_cl = transition.get("original_provider_cl_ord_id")
+        order = _repeg_find_original(oid, provider_cl, row.get("execution_started_at"))
     if not isinstance(order, dict) or not str(order.get("status") or ""):
         if now_chicago > manual_at:
             _repeg_mark_manual_required(row, f"re-peg original order {oid} unresolved at frozen TTL")
@@ -3242,13 +3614,25 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
     # rejection is on the allowlist and the window is still open; see
     # _retry_decision.
     retry_takeover = False
+    # One instant for this execution identity: the takeover rotation and the
+    # claim row below both record it, and the provider lookup later bounds
+    # ClosedOrders from it.
+    exec_started_at = datetime.now(timezone.utc).isoformat()
+    # The provider id sent to Kraken for THIS (attempt_type, cl_ord_id, 0).
+    # None in dry runs: nothing is submitted, so no provider identity exists.
+    provider_id = None
+    # What a takeover records about the attempt it replaces: a NAMESPACED
+    # summary only. The previous identity's raw is not copied into the new
+    # one, so counters and fills (repeg_count, generation_fills) can never cross
+    # execution identities and move the budget.
+    takeover_evidence: dict = {}
     if maker and not dry_run and not force:
         try:
             prev = sb_get("dca_executions", {
                 "dca_order_id": f"eq.{order.get('id')}",
                 "trade_date_chicago": f"eq.{today_chicago}",
                 "attempt_type": "eq.maker_limit",
-                "select": "id,status,cl_ord_id,reason,parent_event_id",
+                "select": "id,status,cl_ord_id,reason,parent_event_id,raw",
             })
         except Exception as e:
             prev = []
@@ -3266,12 +3650,32 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
             print(f"  Retry check: {'YES' if ok else 'no'} ({why})")
             if ok:
                 cl_ord_id = f"{base_cl}-r{rcount + 1}"
-                sb_update("dca_executions", {"id": f"eq.{prow['id']}"}, {
+                # A takeover is a NEW execution identity (the cl_ord_id
+                # rotates), so it gets a NEW provider id. It is persisted in
+                # the SAME update that rotates the id: there is no instant at
+                # which the row carries the new cl_ord_id next to the previous
+                # attempt's provider id, so reconciliation can never look up
+                # the old one.
+                provider_id = provider_client_id("maker_limit", cl_ord_id, 0)
+                if provider_id is None:
+                    raise RuntimeError(f"no provider id derivable for {cl_ord_id}")
+                prior_raw = _safe_json_load(prow.get("raw"))
+                prior_raw = prior_raw if isinstance(prior_raw, dict) else {}
+                takeover_evidence = {"previous_attempt": {
+                    "cl_ord_id": prow.get("cl_ord_id"),
+                    "error": prior_raw.get("error"),
+                    "at": prior_raw.get("at"),
+                }}
+                rotated = sb_update("dca_executions", {"id": f"eq.{prow['id']}"}, {
                     "cl_ord_id": cl_ord_id,
                     "status": "claimed",
                     "reason": None,
-                    "execution_started_at": datetime.now(timezone.utc).isoformat(),
+                    "execution_started_at": exec_started_at,
+                    "raw": json.dumps({"kraken_cl": provider_id, **takeover_evidence}),
                 })
+                if not _rows_carry_provider(rotated, provider_id):
+                    raise RuntimeError(
+                        f"provider id for {cl_ord_id} not confirmed persisted -- no AddOrder")
                 event_id = prow.get("parent_event_id") or str(uuid.uuid4())
                 retry_takeover = True
                 print(f"  {ICONS['OK']} Retrying refused leg as {cl_ord_id}")
@@ -3286,17 +3690,41 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
         "cl_ord_id": cl_ord_id,
         "status": "claimed",
         "requested_quote_amount_base": total_target,
-        "execution_started_at": datetime.now(timezone.utc).isoformat(),
+        "execution_started_at": exec_started_at,
         "parent_event_id": event_id,
         "attempt_type": "maker_limit" if maker else "market",
     }
     if maker:
         # Strategy-unit link: feeds the per-event unique index (I2).
         claim_row["dca_order_id"] = order.get("id")
+    if not dry_run and not retry_takeover:
+        # Claim-first for the provider identity too: the id is persisted in the
+        # claim row itself, so a crash after this point can always be
+        # reconciled by an id that was durably recorded BEFORE AddOrder.
+        provider_id = provider_client_id(claim_row["attempt_type"], cl_ord_id, 0)
+        if provider_id is None:
+            raise RuntimeError(f"no provider id derivable for {cl_ord_id}")
+        claim_row["raw"] = json.dumps({"kraken_cl": provider_id})
+
+    # What THIS run has persisted in `raw` so far (claim row, takeover). Every
+    # later write merges onto it instead of replacing it, so nothing recorded
+    # earlier is lost and the provider id is set LAST: no provider response key
+    # can displace it. Dry runs have no provider identity and write unchanged.
+    raw_state: dict = {} if provider_id is None else {"kraken_cl": provider_id, **takeover_evidence}
+
+    def raw_json(extra: dict) -> str:
+        if provider_id is None:
+            return json.dumps(extra)
+        raw_state.update(extra)
+        raw_state["kraken_cl"] = provider_id
+        return json.dumps(raw_state)
 
     try:
         if not retry_takeover:
-            sb_insert("dca_executions", claim_row)
+            claimed_rows = sb_insert("dca_executions", claim_row)
+            if provider_id is not None and not _rows_carry_provider(claimed_rows, provider_id):
+                raise RuntimeError(
+                    f"provider id for {cl_ord_id} not confirmed persisted -- no AddOrder")
             print(f"  {ICONS['OK']} Claimed")
     except urllib.error.HTTPError as e:
         if e.code == 409:
@@ -3344,7 +3772,7 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
                     "status": "skipped_insufficient_funds",
                     "reason": reason,
                     "execution_finished_at": datetime.now(timezone.utc).isoformat(),
-                    "raw": json.dumps({
+                    "raw": raw_json({
                         "spendable_usd": usd_balance,
                         "held_usd": usd_held,
                         "balance_source": bal_source,
@@ -3606,7 +4034,7 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
             "price": price_str,
             "volume": format_volume(base_volume, pair_info["lot_decimals"]),
             "oflags": "post,fciq",
-            "cl_ordid": cl_ord_id,
+            "cl_ord_id": provider_id,
         }
         try:
             result = kraken_private("AddOrder", limit_params)
@@ -3622,7 +4050,7 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
                 # balance check is live" could only be shown from an Actions log
                 # that rotates. Additive: the re-peg machinery reads its own
                 # keys out of this same `raw` and is unaffected.
-                "raw": json.dumps({**result, "preflight": {
+                "raw": raw_json({**result, "preflight": {
                     "spendable_usd": usd_balance,
                     "held_usd": usd_held,
                     "balance_source": bal_source,
@@ -3632,6 +4060,21 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
             # phase owns it from now on (DP-2: cron cadence is the timer).
             return {"pair": pair, "status": "limit_open", "order_id": order_id}
         except KrakenError as e:
+            if _is_duplicate_error(e):
+                # The id was already used. Attach it if it can be proven;
+                # otherwise the submission state is UNKNOWN and the row stays
+                # claimed. Never failed_kraken, never a second AddOrder.
+                txid = _resolve_duplicate_submission(
+                    cl_ord_id, provider_id, exec_started_at, e, pair, today_chicago)
+                if txid:
+                    update_execution({
+                        "status": "limit_open",
+                        "order_id": txid,
+                        "limit_price": limit_price,
+                        "raw": _merged_raw_json(cl_ord_id, {"duplicate_recovered": True}, provider_id),
+                    })
+                    return {"pair": pair, "status": "limit_open", "order_id": txid}
+                return {"pair": pair, "status": "claimed", "submission_state": "UNKNOWN"}
             if "post only" in str(e).lower():
                 # Would cross the spread -> rejected, NO position exists.
                 print(f"  {ICONS['SKIP']} Post-only rejected -> direct fallback")
@@ -3639,8 +4082,9 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
                     "status": "rejected_postonly",
                     "limit_price": limit_price,
                     "execution_finished_at": datetime.now(timezone.utc).isoformat(),
-                    "raw": _failure_raw(limit_params, e, spendable_usd=usd_balance,
-                                        held_usd=usd_held, balance_source=bal_source),
+                    "raw": raw_json(_failure_note(
+                        limit_params, e, spendable_usd=usd_balance,
+                        held_usd=usd_held, balance_source=bal_source)),
                 })
                 _fallback_decision(_pending_row(), settings, user_id, window_end,
                                    dry_run=False, scenario=None)
@@ -3651,9 +4095,10 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
                 "status": "failed_kraken",
                 "reason": reason,
                 "execution_finished_at": datetime.now(timezone.utc).isoformat(),
-                "raw": _failure_raw(limit_params, e, spendable_usd=usd_balance,
-                                    held_usd=usd_held, balance_source=bal_source,
-                                    open_orders=_open_orders_digest()),
+                "raw": raw_json(_failure_note(
+                    limit_params, e, spendable_usd=usd_balance,
+                    held_usd=usd_held, balance_source=bal_source,
+                    open_orders=_open_orders_digest())),
             })
             tg_send(msg_exec_fail(today_chicago, pair, "Could not place the order.", e))
             return {"pair": pair, "status": "failed_kraken"}
@@ -3702,17 +4147,29 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
             "ordertype": "market",
             "volume": vol_str,
             "oflags": "fciq",
-            "cl_ordid": cl_ord_id,
+            "cl_ord_id": provider_id,
         }
 
-        result = kraken_private("AddOrder", order_params)
-        order_id = result.get("txid", [None])[0]
-        print(f"  {ICONS['OK']} Order placed: {order_id}")
+        try:
+            result = kraken_private("AddOrder", order_params)
+            order_id = result.get("txid", [None])[0]
+            print(f"  {ICONS['OK']} Order placed: {order_id}")
+        except KrakenError as e:
+            if not _is_duplicate_error(e):
+                raise
+            # The id was already used: attach it if provable, otherwise leave
+            # the row claimed with an UNKNOWN submission state. Never
+            # failed_kraken, never a second AddOrder with this id.
+            order_id = _resolve_duplicate_submission(
+                cl_ord_id, provider_id, exec_started_at, e, pair, today_chicago)
+            if not order_id:
+                return {"pair": pair, "status": "claimed", "submission_state": "UNKNOWN"}
+            result = {"duplicate_recovered": True}
 
         update_execution({
             "status": "placed",
             "order_id": order_id,
-            "raw": json.dumps(result),
+            "raw": raw_json(result),
         })
 
     except KrakenError as e:
@@ -3722,9 +4179,10 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
             "status": "failed_kraken",
             "reason": reason,
             "execution_finished_at": datetime.now(timezone.utc).isoformat(),
-            "raw": _failure_raw(order_params, e, spendable_usd=usd_balance,
-                                held_usd=usd_held, balance_source=bal_source,
-                                open_orders=_open_orders_digest()),
+            "raw": raw_json(_failure_note(
+                order_params, e, spendable_usd=usd_balance,
+                held_usd=usd_held, balance_source=bal_source,
+                open_orders=_open_orders_digest())),
         })
         tg_send(msg_exec_fail(today_chicago, pair, "Could not place the order.", e))
         return {"pair": pair, "status": "failed_kraken"}
@@ -3758,17 +4216,43 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
 #  RECONCILIATION
 # ═══════════════════════════════════════════════════════════════
 
-def try_find_kraken_order(cl_ord_id: str) -> str | None:
-    """Try to find a Kraken order by cl_ord_id."""
-    try:
-        closed = kraken_private("ClosedOrders", {"cl_ordid": cl_ord_id})
-        orders = closed.get("closed", {})
-        for txid, order in orders.items():
-            if order.get("cl_ordid") == cl_ord_id:
-                return txid
-    except Exception as e:
-        print(f"    ClosedOrders search failed: {e}")
-    return None
+def _recon_manual(row: dict, note: str) -> None:
+    """Manual-safe handling for a stale claim whose state cannot be proven.
+    Changes status once, so the alert is sent once and not on every cycle."""
+    print(f"    {note} -- manual required")
+    _mark_manual_required(row, note)
+
+
+def _recon_attach_found(row: dict, lookup: ProviderLookup) -> None:
+    """A stale claimed row whose provider order was FOUND: hand it back to the
+    machinery that owns that order's lifecycle. Market and fallback orders are
+    recovered when OPEN as well as when closed."""
+    cl_id = row["cl_ord_id"]
+    txid = lookup.txid
+    status = str((lookup.order or {}).get("status") or "")
+    attempt = row.get("attempt_type")
+    if status == "closed":
+        print(f"    Found closed on Kraken ({txid}) -- finalizing")
+        finalize_order(cl_id, txid)
+        return
+    if attempt == "maker_limit":
+        # A resting (or just-canceled) limit: the maker state machine owns it
+        # again, including the cancel/readback path for canceled/expired.
+        print(f"    Found on Kraken ({txid}, {status or '?'}) -- restoring limit_open")
+        sb_update("dca_executions", {"cl_ord_id": f"eq.{cl_id}"}, {
+            "status": "limit_open",
+            "order_id": txid,
+        })
+        return
+    if attempt in ("market", "maker_fallback") and status in ("open", "pending"):
+        # `placed` + order_id is the state the rest of reconciliation finalizes.
+        print(f"    Found open on Kraken ({txid}) -- restoring placed")
+        sb_update("dca_executions", {"cl_ord_id": f"eq.{cl_id}"}, {
+            "status": "placed",
+            "order_id": txid,
+        })
+        return
+    _recon_manual(row, f"stale claim found on Kraken as {txid} with status {status or '?'}")
 
 
 def run_reconciliation(user_id: str):
@@ -3781,7 +4265,7 @@ def run_reconciliation(user_id: str):
         "user_id": f"eq.{user_id}",
         "status": "in.(claimed,placed)",
         "execution_started_at": f"lt.{cutoff}",
-        "select": "cl_ord_id,order_id,pair,status,trade_date_chicago,attempt_type,raw",
+        "select": "cl_ord_id,order_id,pair,status,trade_date_chicago,attempt_type,raw,execution_started_at",
     })
 
     if not stale:
@@ -3812,50 +4296,36 @@ def run_reconciliation(user_id: str):
                     f"{row['trade_date_chicago']} | {row['pair']}\nSimulated crash recovered without re-buy"
                 ))
                 continue
-            # A re-peg parks the row as `claimed` with raw.kraken_cl = the
-            # client id of the re-posted order (differs from the row key). Search
-            # by that id so a crash mid-repeg recovers the resting order instead
-            # of orphaning it (double-buy guard).
-            search_cl = raw.get("kraken_cl") or cl_id
-            found = try_find_kraken_order(search_cl)
-            if found:
-                print("    Found in Kraken! Finalizing...")
-                finalize_order(cl_id, found)
-            elif row.get("attempt_type") == "maker_limit":
-                # A resting limit is INVISIBLE to ClosedOrders. If AddOrder
-                # succeeded but the DB update crashed, the order is open on
-                # Kraken — restore the row to limit_open so the state
-                # machine owns it again instead of orphaning the order.
-                open_tx = _find_open_kraken_order(search_cl)
-                if open_tx:
-                    print(f"    Found RESTING on Kraken ({open_tx}) — restoring limit_open")
-                    sb_update("dca_executions", {"cl_ord_id": f"eq.{cl_id}"}, {
-                        "status": "limit_open",
-                        "order_id": open_tx,
-                    })
-                elif (recheck := try_find_kraken_order(search_cl)):
-                    # Race: filled between the ClosedOrders miss and the
-                    # OpenOrders miss. Without this re-check the fill would
-                    # be marked failed with real money spent.
-                    print(f"    Closed during race window ({recheck}) — finalizing")
-                    finalize_order(cl_id, recheck)
-                else:
-                    print("    Not found in Kraken (closed or open) — marking failed")
-                    sb_update(
-                        "dca_executions",
-                        {"cl_ord_id": f"eq.{cl_id}"},
-                        {
-                            "status": "failed_reconciliation",
-                            "reason": "Claimed but no Kraken order found after timeout",
-                            "execution_finished_at": datetime.now(timezone.utc).isoformat(),
-                        },
-                    )
-                    tg_send(msg_recon(
-                        "DCA RECONCILIATION",
-                        f"{row['trade_date_chicago']} | {row['pair']}\nClaimed but never placed, marked failed"
-                    ))
-            else:
-                print("    Not found in Kraken — marking failed")
+
+            # Provider identity: the PERSISTED raw.kraken_cl, nothing else. There
+            # is no fallback to the long internal cl_ord_id, and no id is derived
+            # here: a legacy row was submitted without one, and synthesising it
+            # would "find" an order that never carried it. Missing or invalid
+            # identity is manual-safe.
+            provider_id = _provider_id_from_raw(raw)
+            if provider_id is None:
+                _recon_manual(row, "stale claim has no valid persisted provider id (raw.kraken_cl)")
+                continue
+            # A claimed row is always generation 0 (a re-peg parks as
+            # repeg_recovery_pending). After a ROB-18 takeover the persisted id
+            # must be the one for the NEW cl_ord_id, never the previous attempt's.
+            if provider_id != provider_client_id(row.get("attempt_type"), cl_id, 0):
+                _recon_manual(row, "persisted provider id does not belong to this execution identity")
+                continue
+
+            lookup = kraken_lookup_client_order(provider_id, row.get("execution_started_at"))
+            if lookup.state == "FOUND":
+                _recon_attach_found(row, lookup)
+            elif lookup.state == "ABSENT":
+                if raw.get("submission_state") == "UNKNOWN":
+                    # A duplicate rejection proved the id was used, so a clean
+                    # miss is a contradiction, never "claimed but never placed".
+                    _recon_manual(row, "duplicate rejection recorded but no order found on Kraken")
+                    continue
+                # ABSENT is evidence of nothing to recover; it does NOT authorise
+                # a resubmission. Only failed_kraken rows can be retried (ROB-18),
+                # and this status is not one of them.
+                print("    Not found in Kraken (open + closed, complete) -- marking failed")
                 sb_update(
                     "dca_executions",
                     {"cl_ord_id": f"eq.{cl_id}"},
@@ -3869,6 +4339,12 @@ def run_reconciliation(user_id: str):
                     "DCA RECONCILIATION",
                     f"{row['trade_date_chicago']} | {row['pair']}\nClaimed but never placed, marked failed"
                 ))
+            else:
+                # UNKNOWN is not ABSENT. Retry next cycle; escalate exactly once
+                # when the same frozen TTL the maker path uses has passed.
+                started = _lookup_started_at(row.get("execution_started_at"))
+                if started and datetime.now(timezone.utc) > started + timedelta(minutes=LIMIT_TTL_MINUTES):
+                    _recon_manual(row, f"provider lookup unresolved at TTL: {lookup.detail}")
 
         elif row["status"] == "placed" and order_id:
             try:
@@ -3880,6 +4356,196 @@ def run_reconciliation(user_id: str):
                     "DCA RECONCILIATION",
                     f"{row['trade_date_chicago']} | {row['pair']}\nPlaced but can't finalize: {e}"
                 ))
+
+
+# ═══════════════════════════════════════════════════════════════
+#  DEPLOY CLASSIFICATION (ROB-21) -- PURE, no I/O
+# ═══════════════════════════════════════════════════════════════
+#
+# Decides, from row data the CALLER supplies, whether a deploy would strand an
+# execution that the previous code owns. It reads nothing, writes nothing and
+# calls no service; running a production gate is a separate, human-run step.
+#
+# The vocabulary below is ENUMERATED from this module's own writes (every
+# `dca_executions.status` literal, every `transition["phase"]` assignment and
+# every `mark(...)` fallback outcome), and tests/test_rob21_deploy_classifier.py
+# re-derives it from the source text so it cannot drift silently. A status or
+# phase outside it is STOP, never a guess.
+DEPLOY_SAFE_TERMINAL_STATUSES = (
+    "filled", "filled_dry_run", "failed_kraken",
+    "skipped_above_cap", "skipped_insufficient_funds",
+    "skipped_min_order", "skipped_target_too_small",
+)
+# Execution still owned by a state machine: a deploy mid-flight would hand it
+# to code that did not start it.
+DEPLOY_IN_FLIGHT_STATUSES = ("claimed", "placed", "limit_open", REPEG_RECOVERY_STATUS)
+# Not automatically safe: a human has to close these out. failed_reconciliation
+# is here because older reconciliation concluded "not found" from a lookup that
+# could not prove it.
+DEPLOY_HUMAN_STATUSES = ("manual_required", "failed_reconciliation")
+# The maker leg's own status never proves the EVENT terminal; the parent event's
+# fallback outcome does.
+DEPLOY_DECISION_STATUSES = PENDING_DECISION_STATUSES
+DEPLOY_KNOWN_STATUSES = (
+    DEPLOY_SAFE_TERMINAL_STATUSES + DEPLOY_IN_FLIGHT_STATUSES
+    + DEPLOY_HUMAN_STATUSES + DEPLOY_DECISION_STATUSES
+)
+
+# Re-peg phases. In-flight phases are STOP whatever the row status says; a
+# settled phase is accepted only beside a status that phase can really end in.
+DEPLOY_PHASES_IN_FLIGHT = (
+    "recovery_armed", "cancel_pending", "cancel_requested",
+    "replacement_submission_pending", "original_terminal",
+)
+DEPLOY_PHASES_SETTLED = {
+    "original_closed": ("filled",),
+    "replacement_closed": ("filled",),
+    "replacement_attached": ("filled",) + DEPLOY_DECISION_STATUSES,
+    "replacement_rejected": DEPLOY_DECISION_STATUSES,
+    "replacement_terminal": DEPLOY_DECISION_STATUSES,
+    "original_terminal_fallback": DEPLOY_DECISION_STATUSES,
+}
+DEPLOY_KNOWN_PHASES = DEPLOY_PHASES_IN_FLIGHT + tuple(DEPLOY_PHASES_SETTLED)
+
+# Maker `reason` outcomes recorded by _fallback_decision, split by whether an
+# order exists that the event still depends on.
+DEPLOY_NO_FALLBACK_ORDER_REASONS = (
+    "fallback_blocked_i6", "fallback_none_budget",
+    "fallback_skipped_above_cap", "fallback_below_ordermin",
+)
+DEPLOY_FALLBACK_SETTLED_STATUSES = {
+    "fallback_created": ("filled", "filled_dry_run"),
+    "fallback_failed_kraken": ("failed_kraken",),
+}
+
+
+def decode_execution_raw(raw):
+    """PURE. Decode `dca_executions.raw` like SQL `(raw #>> '{}')::jsonb`.
+
+    Returns (ok, value). SQL NULL / None is (True, None): absent, not an error.
+    A str is parsed exactly once and must be a JSON object. An already-decoded
+    dict is used as it is. Anything else, or text that does not parse to an
+    object, is (False, None) and the gate must fail. Deliberately stricter than
+    `_safe_json_load`, which swallows errors."""
+    if raw is None:
+        return True, None
+    if isinstance(raw, dict):
+        return True, raw
+    if isinstance(raw, str):
+        try:
+            value = json.loads(raw)
+        except (TypeError, ValueError):
+            return False, None
+        return (True, value) if isinstance(value, dict) else (False, None)
+    return False, None
+
+
+def _deploy_duplicate_evidence(row: dict, raw) -> bool:
+    """PURE. Does a failed_kraken row carry a duplicate-rejection signature?
+
+    Before ROB-21 a duplicate rejection whose lookup missed was written as
+    failed_kraken (the fallback path did, and the maker/market paths had no
+    duplicate branch at all). A duplicate proves the client id was used, so such
+    a row can sit beside a live, untracked order and is not a safe terminal."""
+    if _is_duplicate_error(row.get("reason") or ""):
+        return True
+    if isinstance(raw, dict):
+        failure = raw.get("last_failure")
+        for candidate in (raw.get("error"), failure.get("error") if isinstance(failure, dict) else None):
+            if candidate and _is_duplicate_error(candidate):
+                return True
+    return False
+
+
+def _deploy_verdict(row, verdict: str, reason: str) -> dict:
+    return {
+        "cl_ord_id": row.get("cl_ord_id"),
+        "status": row.get("status"),
+        "verdict": verdict,
+        "reason": reason,
+    }
+
+
+def _classify_deploy_row(row: dict, rows: list) -> dict:
+    stop = lambda reason: _deploy_verdict(row, "STOP", reason)  # noqa: E731
+    status = row.get("status")
+    if not isinstance(status, str) or status not in DEPLOY_KNOWN_STATUSES:
+        return stop(f"unknown status {status!r}")
+
+    ok, raw = decode_execution_raw(row.get("raw"))
+    if not ok:
+        return stop("raw is malformed or not decodable")
+    phase = None
+    if raw is not None and "repeg_transition" in raw:
+        transition = raw["repeg_transition"]
+        if not isinstance(transition, dict):
+            return stop("repeg_transition is malformed")
+        phase = transition.get("phase")
+        if not isinstance(phase, str) or phase not in DEPLOY_KNOWN_PHASES:
+            return stop(f"unknown re-peg phase {phase!r}")
+        if phase in DEPLOY_PHASES_IN_FLIGHT:
+            return stop(f"re-peg phase {phase} is in flight")
+
+    if status in DEPLOY_IN_FLIGHT_STATUSES:
+        return stop(f"status {status} is in flight")
+    if status in DEPLOY_HUMAN_STATUSES:
+        return stop(f"status {status} needs human closeout")
+
+    if phase is not None and status not in DEPLOY_PHASES_SETTLED[phase]:
+        return stop(f"status {status} is inconsistent with re-peg phase {phase}")
+
+    if status == "failed_kraken" and _deploy_duplicate_evidence(row, raw):
+        return stop("failed_kraken carries a duplicate-rejection signature; an order may exist")
+    if status in DEPLOY_SAFE_TERMINAL_STATUSES:
+        return _deploy_verdict(row, "SAFE", "terminal status")
+
+    # Maker decision status: the leg ended, the EVENT may not have.
+    if row.get("attempt_type") != "maker_limit":
+        return stop(f"decision status {status} on a non-maker row")
+    reason = row.get("reason")
+    if not reason:
+        return stop("fallback decision still pending (reason is empty)")
+    if reason in DEPLOY_NO_FALLBACK_ORDER_REASONS:
+        return _deploy_verdict(row, "SAFE", f"event resolved without a fallback order ({reason})")
+    if reason in DEPLOY_FALLBACK_SETTLED_STATUSES:
+        event_id = row.get("parent_event_id")
+        if not event_id:
+            return stop("no parent_event_id to prove the fallback sibling")
+        siblings = [
+            other for other in rows
+            if other is not row
+            and other.get("parent_event_id") == event_id
+            and other.get("attempt_type") == "maker_fallback"
+        ]
+        if len(siblings) != 1:
+            return stop(f"expected exactly one fallback sibling, found {len(siblings)}")
+        sibling_status = siblings[0].get("status")
+        if sibling_status not in DEPLOY_FALLBACK_SETTLED_STATUSES[reason]:
+            return stop(f"fallback sibling status {sibling_status!r} does not settle {reason}")
+        # The sibling must itself be a safe terminal (e.g. not a failed_kraken
+        # that is really an unresolved duplicate).
+        if _classify_deploy_row(siblings[0], rows)["verdict"] != "SAFE":
+            return stop(f"fallback sibling {sibling_status} is not itself a safe terminal")
+        return _deploy_verdict(row, "SAFE", f"{reason} proven by fallback sibling {sibling_status}")
+    return stop(f"unknown fallback outcome {reason!r}")
+
+
+def classify_deploy_rows(rows) -> dict:
+    """PURE. Classify supplied `dca_executions` rows for a deploy gate.
+
+    Returns {"safe": bool, "verdicts": [...], "blockers": [...]}. `safe` is True
+    only when EVERY row is SAFE; an empty list is safe. Parent-event evidence is
+    taken from the supplied rows only, so a caller that omits a sibling gets
+    STOP, not an assumption."""
+    rows = list(rows or [])
+    verdicts = [
+        _classify_deploy_row(row, rows) if isinstance(row, dict)
+        else {"cl_ord_id": None, "status": None, "verdict": "STOP",
+              "reason": "row is not an object"}
+        for row in rows
+    ]
+    blockers = [v for v in verdicts if v["verdict"] != "SAFE"]
+    return {"safe": not blockers, "verdicts": verdicts, "blockers": blockers}
 
 
 # ═══════════════════════════════════════════════════════════════

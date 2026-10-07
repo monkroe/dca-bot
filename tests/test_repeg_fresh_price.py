@@ -289,7 +289,7 @@ def t_ambiguous_attachment_uses_submission_telemetry(r):
         row=row,
         replacement_open={"O-FOUND": {
             "status": "open", "vol_exec": "0.00000000",
-            "cl_ordid": provider_cl,
+            "cl_ord_id": provider_cl,
         }},
         ticker_snapshot={"bid": 0.05000, "ask": 0.06000, "mid": 0.05500},
     )
@@ -308,7 +308,7 @@ def t_legacy_attachment_uses_decision_telemetry(r):
         row=row,
         replacement_open={"O-LEGACY": {
             "status": "open", "vol_exec": "0.00000000",
-            "cl_ordid": provider_cl,
+            "cl_ord_id": provider_cl,
         }},
     )
     decision = transition["market_snapshot"]
@@ -328,7 +328,7 @@ def t_attachment_limit_price_comes_from_exact_request(r):
         row=row,
         replacement_open={"O-LIMIT": {
             "status": "open", "vol_exec": "0.00000000",
-            "cl_ordid": provider_cl,
+            "cl_ord_id": provider_cl,
         }},
     )
     r.check("direct limit price matches exact request",
@@ -356,7 +356,7 @@ def t_deterministic_client_identity_is_unchanged(r):
     r.check("transition client identity is unchanged",
             _transition(trace)["replacement_cl_ord_id"], original_identity)
     r.check("submitted client identity is unchanged",
-            _adds(trace)[0]["cl_ordid"], original_identity)
+            _adds(trace)[0]["cl_ord_id"], original_identity)
 
 
 def t_ambiguous_response_is_not_blindly_resubmitted(r):
@@ -400,7 +400,7 @@ def t_post_arm_recovery_cannot_reprice_request(r):
         row=row,
         replacement_open={"O-POST-ARM": {
             "status": "open", "vol_exec": "0.00000000",
-            "cl_ordid": provider_cl,
+            "cl_ord_id": provider_cl,
         }},
         ticker_snapshot={"bid": 0.05000, "ask": 0.06000, "mid": 0.05500},
     )
