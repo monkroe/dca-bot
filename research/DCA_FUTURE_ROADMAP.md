@@ -90,6 +90,7 @@ Tolimesnius įrašus papildyti čia, ne ADR ar handoff. Viena eilutė ar trumpas
 | 2026-09-28 | DCA-R00 | OWNER DECISION | Sukurti atskirą gyvą DCA research roadmap, neapkraunant ADR / HANDOFF / CONTEXT / BOOT / SHUTDOWN. | Research dokumentas atskiras nuo produkcinio kodo. |
 | 2026-09-28 | DCA-R01 | SUPPLIED | Užfiksuotas 07:02:03 CDT KAS pirkimas ir H7/H30/H90 rodikliai. | Kandidatas vėlesnei cap analizei, ne strategijos FAIL. |
 | 2026-09-28 | DCA-R01 | VERIFIED CODE | Repo yra du cap režimai ir esami cap tyrimo skriptai. | Prieš naują diagnostiką naudoti turimus šaltinius. Live DB parametrai nepatikrinti. |
+| 2026-11-03 | DCA-R02 | PROPOSED CHANGE | Specifikacija ir backtest dizainas: [`DCA_R02_BACKTEST_SPEC.md`](DCA_R02_BACKTEST_SPEC.md). Trys variantai (paprastas DCA, dabartinis cap, H30 bonus) ir lygios išlaidos kontrolė, vienodas kapitalas, mokesčiai ir horizontas; tik užbaigtos UTC dienos; parametrai fiksuojami prieš atskirą testavimo laikotarpį. H90 − 10 % – tik klasifikacija. GT auditas 2026-11-03: dabartinė logika PASS, R02 RECOMMENDED, R03/R04 NOT APPROVED. | Roberto patvirtina specifikaciją ir duomenų šaltinį; tik tada įrankis atskiru PR. R03/R04 – tik atviri klausimai (§9). |
 
 ### Naujo įrašo šablonas
 
