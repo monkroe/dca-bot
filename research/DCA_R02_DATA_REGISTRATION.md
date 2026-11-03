@@ -3,7 +3,8 @@
 **Registracijos būsena: NEUŽBAIGTA (tik duomenų dalis).**
 Registration status: INCOMPLETE (data part only). This document fixes the input
 data and the data window. The other pre-registration parameters are listed in
-section 8. Several are still TBD and must be fixed before P2 is run.
+section 8. Several are still TBD and must be fixed before P2 is run, and one
+is PENDING P1: it can only be recorded from the P1 run.
 
 **Status:** PROPOSED v1, for GT review. A documentation record only. It
 authorizes no validator or backtest code, no database change, no bonus size
@@ -131,8 +132,16 @@ value, and nothing from the API file enters an R02 run (section 6).
 ## 5. Fixed data window
 
 - **The R02 data window ends 2026-09-30 (inclusive), the last day of the
-  archive.** The last daily candle used is 2026-09-30. The last 4-hour candle
-  used is the one starting 2026-09-30 20:00 UTC.
+  archive.**
+  - The last daily candle available in the source file is 2026-09-30.
+  - The last 4-hour candle available in the source file is the one starting
+    2026-09-30 20:00 UTC.
+- **Available is not the same as used.** Both of those candles close only at
+  2026-10-01 00:00 UTC. Under spec §4 a candle is used only once it has closed,
+  so no decision instant before 2026-10-01 00:00 UTC can use either of them.
+  The last candle actually used is therefore determined by the registered
+  decision times (the order schedule and the P2 end, both TBD in section 8)
+  under the no-lookahead rule. It is not fixed by this section.
 - **Newer data are not part of R02.** That includes October 2026 onward, even
   though the API file holds daily candles to 2026-11-02. Adding newer data
   requires a **new version of this registration**, and the change rule of spec
@@ -176,6 +185,8 @@ The list follows spec §6 and the sections it refers to.
 - **Fixed here** means this document fixes it.
 - **TBD** means the specification requires the value but does not give it. No
   value is proposed here.
+- **PENDING P1** means the value is an output of the P1 run. It is recorded
+  after P1 and before P2, and is never set by hand.
 
 | Item | Status | Value or source |
 |---|---|---|
@@ -190,12 +201,14 @@ The list follows spec §6 and the sections it refers to.
 | Minimum of 180 scored days for each of P1 and P2 | Fixed | spec §6 |
 | **P1 start and end** | **TBD** | Required by spec §6. Constraint: spec §4 and §6 (warm-up and length) |
 | **P2 start and end** | **TBD** | Required by spec §6. Must follow P1 and end no later than 2026-09-30 (section 5) |
+| **P1 result record (`b*`)** | **PENDING P1** | Required by spec §6, step 6. To be recorded before P2 is run: the `b*` selected by the P1 algorithm, its score, every P1 grid result, and the commit of the registration version in force for that P1 run. `b*` is chosen only by the P1 algorithm of spec §6, never by hand |
 | `b` grid | Fixed | 0.5 U, 1 U, 2 U (spec §6) |
 | P2 rule form and the `b*` selection procedure, including ties to the smaller `b` and `NO CANDIDATE` | Fixed | Form 1 (spec §6) |
 | `KAS(B) = 0` handling | **Fixed here** | Fails closed (section 7) |
 | `d` grid | **TBD** (confirm) | spec §6 says "proposed: 0 %, 2.5 %, 5 %, 10 %"; a proposal, not yet fixed |
 | Cap parameters | Fixed as documented | spec §2, §3: `cap_mode='ohlc_h7'`, `cap_pct=0.20`, `cap_require_above_h90=true`, recorded from `STATUS.md` (SELECT of 2026-07-26), not re-read |
 | Funding scenarios F1 and F2 | Fixed | spec §5: one lump; equal weekly deposits |
+| **F2 funding timing** | **TBD** | spec §5 defines F2 as equal weekly deposits but does not give: the date and time of the first deposit, the weekday of the weekly deposit, or the handling of an incomplete last week |
 | **Headroom factor `K`** | **TBD** | spec §5 requires `K ≥ 1`; no value given |
 | Cost model formula | Fixed | spec §5: decision price × (1 + fee rate + impact allowance) |
 | **Fee rates** | **TBD** | spec §5 fixes the rule (production maker fee rate, with the taker rate for a sensitivity run). The numeric rates are not in the specification |
@@ -212,7 +225,8 @@ The list follows spec §6 and the sections it refers to.
 | Price classes | Fixed | spec §7, including H90 × 0.90 |
 
 **The registration is complete only when every TBD row has a value fixed by
-Roberto,** committed as a new version of this document, before P2 is run.
+Roberto,** committed as a new version of this document, **and the PENDING P1
+row has been recorded** from the P1 run, before P2 is run.
 
 **Not authorized by this document:** validator or backtest code, any database
 change, a bonus size, and R03 or R04 work. Each needs Roberto's separate word.
