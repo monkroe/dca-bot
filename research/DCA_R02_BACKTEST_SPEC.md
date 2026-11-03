@@ -1,6 +1,6 @@
-# DCA-R02: regime signal evaluation — specification and backtest design
+# DCA-R02: regime signal evaluation — specification and backtest design (v2)
 
-**Status:** PROPOSED. A research specification, not an implementation
+**Status:** PROPOSED v2. A research specification, not an implementation
 authorization. It changes no production code, no `dca_settings` or
 `dca_orders` value and no live order. The backtest script it describes is
 written only after Roberto accepts this document, and runs read-only.
@@ -12,11 +12,32 @@ concrete candidate, an H30 dip bonus. Variable sizing as a production rule
 (DCA-R03) and budget, reserve and carryover (DCA-R04) are **not approved**.
 Their open questions are listed in section 9 and are not designed here.
 **Reviews:** GT audit 2026-11-03: the current logic PASS, R02 research
-RECOMMENDED, R03/R04 NOT APPROVED.
+RECOMMENDED, R03/R04 NOT APPROVED. GT review of `21b22b2`: REQUEST CHANGES,
+answered by this version.
 
 No monetary amounts appear in this document. Every amount is expressed in the
-base unit `U` (one order's `base_quote_amount`). The bonus size is not set
-here.
+base unit `U` (one order's `base_quote_amount`). The bonus grid below is a
+research grid for the backtest, not a bonus size for production.
+
+**Changes from v1 (GT review of `21b22b2`):**
+
+1. No backward fill from a later price. A period without an earlier price is
+   not scored (section 4).
+2. 4-hour candles are keyed by their start. A candle is used only once it has
+   closed, and a missing candle has a pre-decided rule (section 4).
+3. A′ is a retrospective control. Its spend must equal C's, and the spec says
+   what happens if it does not (section 3).
+4. One P2 rule covers the whole `b` grid (0.5 U, 1 U, 2 U). No selection
+   after P2 (section 6).
+5. `unfunded_after_bonus` is measured by a control replay without the bonus
+   (section 7).
+6. Stuck orders: the historical rate is a context metric only and is never
+   applied to the simulation (section 7).
+7. New secondary metric: end value (section 7).
+8. Q5: one bonus per pair per Chicago day, protected against a repeated event,
+   fallback and re-peg (section 9).
+9. Data: Kraken historical OHLCVT files for 240 and 1440 minutes, validated
+   before P1 and P2 (section 4).
 
 ## 1. Question and hypothesis
 
@@ -27,12 +48,12 @@ missed?
 
 **Hypothesis H-R02 (written before any test run).** Over the test period
 (section 6), variant C accumulates more KAS than both variant B and the
-equal-spend control A′, at the same capital, fees and horizon. It must do so
-without a worse minimum USD reserve than B beyond the bound fixed in
-section 7, and without more missed base buys than B. It must also hold for
-most of the pre-registered `d` grid, not only at its best point.
+retrospective equal-spend control A′, at the same capital, fees and horizon.
+It must do so without a worse minimum USD reserve than B beyond the bound
+fixed in section 6, and without more missed base buys than B. It must also
+hold for most of the pre-registered `d` grid, not only at its best point.
 
-The null result ("no advantage") and `INSUFFICIENT EVIDENCE` are acceptable
+The null result (`NO ADVANTAGE`) and `INSUFFICIENT EVIDENCE` are acceptable
 outcomes. The roadmap (§4) forbids reporting only the most profitable
 example.
 
@@ -51,19 +72,26 @@ example.
   balance-message paths: the low-balance warning (`kraken_sync.py`) and the
   remaining-balance line after a fill (`_remaining_after_buy_line`). Both add
   it to the daily burn.
-- **Finding (GT):** an optional bonus is therefore counted as a mandatory
-  daily expense in both messages. This is an R04 question (section 9).
-- **Technical debt (GT):** `execute_pair()` takes a `daily_burn` argument and
+- **Finding (GT).** An optional bonus is counted as a mandatory daily expense
+  in both messages. This is an R04 question (section 9).
+- **Technical debt (GT).** `execute_pair()` takes a `daily_burn` argument and
   does not use it.
 - **H30 and H90 in production** come from `build_daily_metrics()`, whose last
   daily candle is the current, incomplete UTC day. The backtest does not copy
   this (section 4). Whether the live signal should change to completed days is
   an R03 question.
+- **Finding (this review).** `ffill_gaps()` in `src/ohlc.py` seeds the first
+  day of a series from the latest close in the 14 days before it. If there is
+  none, it falls back to the **earliest close in the input**, which can be
+  later than the day it fills. With production's 220-day fetch this path is
+  practically never taken, so it changes no live decision today. It is
+  recorded here, not changed. The backtest does not use this seeding
+  (section 4).
 
 ## 3. Variants
 
-All three variants use the same capital, funding schedule, fee model, decision
-times and horizon (section 5).
+All variants use the same capital, funding schedule, fee model, decision times
+and horizon (section 5).
 
 | Variant | Rule |
 |---|---|
@@ -75,54 +103,99 @@ Rules for C:
 
 - The cap veto comes first, as in the v2.3 hierarchy. A vetoed event buys
   nothing, bonus included.
+- **At most one bonus per pair per Chicago day.** It goes to the first eligible
+  event of that day. Later events that day buy at most `1 U`, matching the
+  production requirement in Q5 (section 9).
 - The base buy is always funded before the bonus. If the cash cannot cover
   `1 U + b U`, the bonus is dropped and the event buys `1 U`. If it cannot
   cover `1 U`, the event is an unfunded base buy (section 7).
-- **H90 − 10 % is classification and telemetry only.** Every event is
-  labelled by price class (section 7), and results are reported per class. The
-  class never changes a size or a veto.
+- **H90 − 10 % is classification and telemetry only.** Every event is labelled
+  by price class (section 7), and results are reported per class. The class
+  never changes a size or a veto.
 
-**Control A′ (equal spend).** Plain DCA whose per-event size is C's total spend
-divided by the number of events. This answers whether C's *timing* helped,
-rather than C simply spending more. A′ is sized after the fact, so it is a
-comparison control, not a tradable policy, and is reported as such.
+**A′: retrospective equal-spend control.** A′ is plain DCA whose per-event size
+is C's actual total USD spend (fees included) divided by the number of
+scheduled events. It answers whether C's *timing* helped, rather than C simply
+spending more.
 
-The bonus multiple `b` is a ratio of `U`. Its grid is chosen by Roberto and
-frozen in the pre-registration block (section 6) before the test period is
-run. This document does not set it.
+- It is computed after C has run, from C's result, so it uses hindsight. It is
+  a comparison control, never a tradable policy, and every report marks it
+  `RETROSPECTIVE`.
+- **The spend-equality check.** A′'s actual spend must equal C's within a
+  relative tolerance of 1e-9 (floating point only; the backtest uses
+  continuous volume, with no lot rounding). This is checked for every scenario,
+  above all F2, where weekly funding can leave A′ unable to fund an event that
+  C funded earlier.
+- **If the check fails** for a scenario, A′ is marked `INVALID` there. The
+  comparison with A′ is then not made, and H-R02 cannot be supported in that
+  scenario; it fails closed. A′ is never rescaled or re-sized to force
+  equality, and the shortfall and its dates are reported.
 
 ## 4. Data and time semantics (no lookahead)
 
-- **Decision instant.** Each production order's target time in Chicago,
-  converted to UTC per date (DST included), once per day per order. The
-  backtest takes the order schedule as an input parameter; it does not read
-  `dca_orders`.
-- **Decision price.** The close of the last *completed* 4-hour Kraken candle
-  that ends at or before the decision instant. The live bot uses the mid at
-  that moment, which the backtest cannot see; this proxy is known at the time
-  and never later.
-- **Signal inputs.** H7, H30 and H90 are SMAs of Kraken daily closes of
-  completed UTC days only, strictly before the UTC date of the decision
-  instant. The incomplete current day is never used (GT). Gaps are
-  forward-filled as in `ohlc.py` (`ffill_gaps`), and every filled day is
-  counted in the output.
-- **Pair.** `KASUSD`, the pair the DCA bot trades.
-- **Source.** Committed Kraken daily (1440) and 4-hour (240) candles.
-  Candidate sources, in order of preference:
-  1. a snapshot of `dca_ohlc_history`, the fail-closed preserved candles. This
-     needs a read-only export with Roberto's word;
-  2. Kraken's published historical OHLCVT files, the same origin
-     `ohlc_preserve.py` uses;
-  3. the public OHLC endpoint, which serves only the most recent 720 candles
-     per interval: about 120 days of 4-hour candles. This is likely too short
-     for section 6.
+**Source (decided).** Kraken's historical OHLCVT files for `KASUSD`, at 240
+and 1440 minutes, the same origin `ohlc_preserve.py` uses. The files are
+obtained outside the scored run and pinned by SHA-256; nothing is fetched
+during a scored run. `KASUSD` is the pair the DCA bot trades.
 
-  The chosen input file is pinned by SHA-256 in the output. Nothing is fetched
-  during a scored run.
-- **Warm-up.** At least 90 completed days before the first scored event, so
-  that H90 exists on day one.
-- **Lookahead test (required).** Changing any candle after a decision instant
-  must leave every decision at or before that instant unchanged.
+**Data validation (before any P1 or P2 run).** A read-only report is
+committed with the pre-registration block. It covers, for each file:
+
+- the SHA-256 of the file;
+- the first and last candle;
+- the number of candles against the number expected for that range;
+- every missing timestamp, the longest run of consecutive missing candles,
+  and their dates;
+- duplicate timestamps, which are a hard failure;
+- timestamps not on the interval grid, which are a hard failure;
+- out-of-order rows, which are a hard failure;
+- as information only: for each UTC day, the 1440 close against the close of
+  the last 240 candle of that day.
+
+A hard failure, or a missing-candle rate above the pre-registered limit,
+gives `INSUFFICIENT EVIDENCE` for any period it touches.
+
+**Candle timestamps.** In Kraken's OHLCVT files the timestamp is the candle's
+**start**. A candle covers `[start, start + interval)` and is complete only
+from `start + interval` on.
+
+**Decision instant.** Each production order's target time in Chicago,
+converted to UTC per date (DST included), once per day per order. The order
+schedule is an input parameter; the backtest does not read `dca_orders`.
+
+**Decision price.**
+
+- The close of the 4-hour candle whose `start + 4 h` is the latest at or
+  before the decision instant. That is the candle that closed most recently,
+  and it is used only if `start + 4 h ≤ decision instant`.
+- **Missing candle, pre-decided.** If the candle that should have closed in
+  the 4 hours before the decision instant is absent, the event has no price.
+  It is scored as `no_price` for **every** variant: no buy, no bonus, no
+  veto. No older candle and no daily close is substituted. `no_price` events
+  are counted per period. If they exceed the pre-registered limit, the result
+  is `INSUFFICIENT EVIDENCE`.
+- **Test.** A candle with `start + 4 h > decision instant` never supplies a
+  price. Changing that candle's close changes no decision.
+
+**Signal inputs.**
+
+- H7, H30 and H90 are SMAs of 1440-minute closes of completed UTC days only,
+  that is, days with `start + 24 h ≤ decision instant`. The incomplete current
+  day is never used.
+- **Gaps** are forward-filled from the latest earlier close only. Each fill is
+  counted and reported. A run of consecutive filled days longer than the
+  pre-registered limit makes the affected events `no_signal`, scored for every
+  variant like `no_price`.
+- **No backward fill.** A day is never filled from a later close. Days before
+  the first real close in the file have no value. An SMA whose window reaches
+  a day with no value does not exist, and an event whose H7, H30 or H90 does
+  not exist is not scored. In particular, a period can start only once 90
+  completed days with real or forward-filled values precede it.
+- The backtest implements this fill itself. It does not call production
+  `ffill_gaps()`, because of the seeding finding in section 2.
+
+**Lookahead test (required).** Changing any candle that is not complete at a
+decision instant leaves every decision at or before that instant unchanged.
 
 ## 5. Equal capital, fees and horizon
 
@@ -140,92 +213,129 @@ run. This document does not set it.
 - **Fees and execution.**
   - One all-in cost model for every variant: decision price × (1 + fee rate +
     impact allowance).
-  - The fee rate defaults to the production maker fee rate. A sensitivity run
+  - The fee rate defaults to the production maker fee rate; a sensitivity run
     uses the taker fee rate.
   - The impact allowance is a fixed number of basis points, frozen in
     section 6.
   - The bonus leg pays the same rate as the base leg.
-  - No maker fill is simulated (section 7).
-- **End of horizon.** Leftover USD is reported at face value and never
-  converted to KAS for the primary metric.
+  - No maker fill, resting order or cancellation is simulated (section 7).
+- **End of horizon.** Leftover USD is reported at face value. It never enters
+  the primary metric. It enters only the secondary end value (section 7).
 
-## 6. Pre-registration and periods
+## 6. Pre-registration, periods and the P2 rule
 
 - History is split chronologically into a **calibration period P1** and a
   separate **test period P2** that follows it. Each has its own warm-up
   (section 4), taken from the days just before it, so P2's warm-up may overlap
   the end of P1.
-- **Before P2 is run,** a pre-registration block is committed (its commit hash
-  is the record). It fixes:
+- **Before P2 is run,** a pre-registration block is committed; its commit hash
+  is the record. It fixes:
   - the `d` grid (proposed: 0 %, 2.5 %, 5 %, 10 %);
-  - the `b` grid (Roberto's choice);
+  - the `b` grid: 0.5 U, 1 U, 2 U;
+  - the P2 rule form (below) and, for form 1, the P1 selection criterion;
   - the cap parameters;
   - `K`, the funding scenarios, the fee rates and the impact allowance;
   - the order schedule;
   - the P1 and P2 boundaries;
-  - the input file hash;
-  - the decision rule in section 7 and its reserve bound.
+  - the file hashes and the data-validation report;
+  - the limits for missing candles, `no_price`, `no_signal` and the longest
+    forward-fill run;
+  - the reserve bound and the decision rule in section 7.
 - P1 may be run any number of times to debug the tool and to look at
   behaviour. P2 is run once with the frozen block. A change after P2 has been
   seen makes a new pre-registration and a new, later test period; the old P2
   result is kept and marked `SUPERSEDED`.
 - If the available history cannot give P1 and P2 at least 180 scored days
-  each after warm-up, the result is `INSUFFICIENT EVIDENCE`, and no claim is
+  each after warm-up, the result is `INSUFFICIENT EVIDENCE` and no claim is
   made.
 
-## 7. Metrics
+**The P2 rule covers the whole `b` grid. Exactly one of these two forms is
+chosen in the pre-registration:**
+
+- **Form 1: one candidate selected on P1.**
+  - On P1, a single `b*` is chosen from the grid by the pre-registered
+    criterion. Proposed criterion: the most KAS accumulated, among the `b`
+    values that meet the reserve bound and have no more unfunded base buys
+    than B on P1, in both funding scenarios.
+  - `b*` is committed before P2. On P2 only `b*` is judged, by the decision
+    rule in section 7.
+  - The other `b` values are reported on P2 as description only, and none of
+    them can support H-R02.
+- **Form 2: one strict rule for all.** H-R02 is supported only if **every**
+  `b` in the grid meets the decision rule in section 7 on P2.
+
+Under either form, choosing a `b` or a `d` after seeing P2 is not allowed, and
+every grid point's P2 result is reported.
+
+## 7. Metrics and decision rule
 
 Each metric is reported for each variant, `d`, `b` and funding scenario, in
 P1 and P2 separately.
 
 | Metric | Definition |
 |---|---|
-| **KAS accumulated** | Sum of filled KAS (primary). |
+| **KAS accumulated** | Sum of filled KAS. **Primary.** |
+| **End value** (secondary) | KAS accumulated × the last decision price of the period, plus USD left. It depends on one end price, so it is reported next to the primary metric and never decides alone. |
 | **Average all-in cost per KAS** | USD spent including the cost model, divided by KAS. |
 | **USD spent / USD left** | Totals at the end of the horizon. |
-| **Worst USD reserve** | The minimum cash balance over the horizon, in `U` and in days of base buys. Also the date it occurred. |
-| **Missed base buys** | Count and dates, split by reason: `cap_veto` (by design, B and C), `unfunded` (cash below `1 U`). A missed base buy caused by an earlier bonus is reported separately as `unfunded_after_bonus`. |
-| **Stuck orders** | In the simulation: events that could not be funded in full (base or bonus dropped). The exchange-side part (resting, unfilled or `manual_required` maker legs) cannot be simulated from candles. It is reported from production telemetry (`dca_executions` statuses, read with Roberto's word) as an observed rate applied equally to every variant, and marked as such. |
+| **Worst USD reserve** | The minimum cash balance over the horizon, in `U` and in days of base buys, with its date. |
+| **Missed base buys** | Count and dates, by reason: `cap_veto` (by design, B and C), `unfunded`, `unfunded_after_bonus`, and the data reasons `no_price` and `no_signal` (equal for all variants). |
 | **Sensitivity to `d`** | All of the above for every grid point. An advantage that exists at one `d` only is reported as not robust. |
 | **Bonus activity** | The number of bonus events, the longest run of consecutive bonus days, and the share of bonus spend per price class. |
 | **Per class** | Each metric split by price class: `below_H90_minus_10` (price < H90 × 0.90), `below_H30_d` (price < H30 × (1 − d), and not the first class), `at_or_above_H30_d`, and `cap_vetoed`. |
+| **Stuck orders (context only)** | The historical rate of exchange-side problems in production (resting, unfilled, `manual_required` maker legs; from `dca_executions` statuses, read only with Roberto's word). Shown as context next to the results. **It is never applied to the simulation** and never changes a simulated buy, cost or metric. |
 
-**Decision rule (frozen in section 6).** H-R02 is supported only when every
-one of these holds on P2, under both funding scenarios, for at least three of
-the four `d` grid points:
+**`unfunded_after_bonus`, by control replay.**
 
-- C accumulates more KAS than B **and** more than A′;
-- C's worst reserve is not lower than B's by more than the bound frozen in
-  section 6;
-- C has no more `unfunded` and `unfunded_after_bonus` base buys than B.
+- For each C run, the same path is replayed with the bonus set to zero, with
+  everything else identical: funding, prices, cap, decision instants. By
+  construction this replay is B, and a test asserts the identity.
+- A base buy that is unfunded in C but funded in the replay is
+  `unfunded_after_bonus`.
+- A base buy unfunded in both is `unfunded`.
 
-Anything less is `NO ADVANTAGE`. Missing or inadequate data gives
-`INSUFFICIENT EVIDENCE`. No result authorizes a live change: DCA-R03 and
-DCA-R04 still need their own approval.
+**Decision rule (frozen in section 6).** For a judged `b` (form 1: `b*`;
+form 2: each `b`), the rule holds only when every one of these holds on P2,
+under both funding scenarios, for at least three of the four `d` grid points:
+
+- C accumulates more KAS than B **and** more than A′, with A′ `VALID` in that
+  scenario;
+- C's worst reserve is not lower than B's by more than the reserve bound;
+- C has no more `unfunded` plus `unfunded_after_bonus` base buys than B.
+
+H-R02 is supported only if the chosen form's condition is met. Anything less
+is `NO ADVANTAGE`. Missing or inadequate data gives `INSUFFICIENT EVIDENCE`.
+No result authorizes a live change: DCA-R03 and DCA-R04 still need their own
+approval.
 
 ## 8. The backtest tool (design only)
 
-- **Location and form.** `tools/r02_backtest.py`. Stdlib-only Python,
-  read-only, no network during a scored run, no database access, no orders.
-  It reads one pinned input file and writes one result file plus a summary on
-  stdout.
+- **Location and form.** `tools/r02_backtest.py` plus a separate read-only
+  validator, `tools/r02_validate_ohlcvt.py`. Stdlib-only Python, no network,
+  no database access, no orders. It reads the pinned files and writes one
+  result file plus a summary on stdout.
 - **Reuse of production code.** It imports `cap_decision()` from
-  `src/kraken_run.py`, so the veto is the production function itself. The
-  SMA and forward-fill helpers come from `src/ohlc.py`, applied to
-  completed-day series only (section 4).
-- **Determinism.** The same input file and pre-registration block always give
-  byte-identical output, and the output records both hashes and the git
-  commit.
+  `src/kraken_run.py`, so the veto is the production function itself.
+  Production SMA math is reused only where it is identical; candle selection
+  and gap filling are the backtest's own, as defined in section 4.
+- **Determinism.** The same files and pre-registration block always give
+  byte-identical output. The output records both hashes and the git commit.
 - **Tests,** run under `test.sh` like the other pure tests:
-  - no lookahead (section 4);
-  - completed-day SMA: the incomplete day never enters H30 or H90;
+  - no lookahead;
+  - no backward fill, and no scored event before 90 completed days with values;
+  - 4-hour candles keyed by start, an unclosed candle never used, and the
+    `no_price` rule;
+  - completed-day SMA;
   - DST at the decision instant;
   - the veto reproduces known production rows (from fixtures, not the
     database);
-  - funding order: base before bonus, bonus dropped first;
+  - one bonus per pair per Chicago day;
+  - base funded before bonus;
+  - the control replay equals B;
+  - A′'s spend equality and its `INVALID` path;
   - equal capital and horizon across variants;
-  - A′ spends exactly C's total;
-  - per-class labels never change a size.
+  - per-class labels never change a size;
+  - the validator's hard failures: duplicates, off-grid timestamps, order.
 
 ## 9. Open questions for DCA-R03 and DCA-R04 (not designed, not approved)
 
@@ -234,47 +344,60 @@ schema and no setting follows from this list.
 
 **R03: variable sizing as a production rule**
 
-- Q1. The live signal input: should production H30 and H90 move to completed
-  UTC days only, as in the backtest, or keep the incomplete current day? The
-  two give different decisions near day boundaries.
-- Q2. The decision price: the live mid at the decision instant against the
+- **Q1.** The live signal input: should production H30 and H90 move to
+  completed UTC days only, as in the backtest, or keep the incomplete current
+  day? The two give different decisions near day boundaries.
+- **Q2.** The decision price: the live mid at the decision instant against the
   backtest's 4-hour proxy, and how large the difference is in practice.
-- Q3. Interaction with the DP-5 fallback (I7 sizing from the remaining budget)
-  and with re-peg: is the bonus part of the event's total target, or a
+- **Q3.** Interaction with the DP-5 fallback (I7 sizing from the remaining
+  budget) and with re-peg: is the bonus part of the event's total target, or a
   separate leg with its own identity?
-- Q4. Whether `bonus_quote_amount` is the right carrier for the bonus size, or
-  whether a ratio of base is safer.
+- **Q4.** Whether `bonus_quote_amount` is the right carrier for the bonus
+  size, or whether a ratio of base is safer.
 
 **R04: budget, limits, reserve and off semantics**
 
-- Q5. Atomic daily limit: at most one bonus per order per Chicago day. How is
-  it enforced against concurrent runs, retries, fallback and re-peg, and is
-  it counted on requested or on filled amounts (partial fills)?
-- Q6. Atomic monthly limit: a Chicago calendar month budget for bonus spend.
-  How is it enforced atomically across runs, and what happens at a month
-  boundary while an event is in flight?
-- Q7. Reserve: a bonus only if at least N days of base buys remain afterwards.
-  Which balance is authoritative (spendable vs held in resting orders, and how
-  fresh the snapshot is), and is the reserve checked before or after fees?
-- Q8. Off semantics: what `off` means exactly. Is it zero bonus with no other
+- **Q5. Requirement: at most one bonus per pair per Chicago day.** The bonus
+  must never be granted twice for the same pair and day, through any of these
+  paths:
+  - **a repeated event:** a second cron cycle, a retry or takeover with a
+    rotated `cl_ord_id`, a `--force` run, or two orders on the same pair;
+  - **the DP-5 fallback:** the fallback continues the same event's remaining
+    target and never adds a second bonus;
+  - **re-peg:** a new generation of the same maker execution carries the bonus
+    already granted, never a new one.
+
+  Open: how the grant is recorded atomically (for example a unique key on pair
+  and Chicago date), and whether it counts as granted when requested or only
+  when filled (partial fills).
+- **Q6. Atomic monthly limit.** A Chicago calendar-month budget for bonus
+  spend: how it is enforced atomically across runs, and what happens at a month
+  boundary while an event is in flight.
+- **Q7. Reserve.** A bonus only if at least N days of base buys remain
+  afterwards. Which balance is authoritative (spendable vs held in resting
+  orders, and how fresh the snapshot is), and is the reserve checked before or
+  after fees?
+- **Q8. Off semantics.** What `off` means exactly: zero bonus with no other
   effect? Does an event already in flight finish its bonus? Is there a
-  `shadow` mode that computes and logs the bonus without sizing it? And is
-  `off` a kill switch that takes effect at the next event without a deploy?
-- Q9. Burn accounting (GT finding): an optional bonus should not count as
+  `shadow` mode that computes and logs the bonus without sizing it? Is `off` a
+  kill switch that takes effect at the next event without a deploy?
+- **Q9. Burn accounting (GT finding).** An optional bonus should not count as
   mandatory daily burn in the low-balance warning and the remaining-buys line.
   What should those lines show instead?
-- Q10. The unused `daily_burn` argument of `execute_pair()` (technical debt):
-  remove it, or give it a defined use.
-- Q11. Telemetry for a live rule: the written `requested_quote_amount_bonus`,
-  a reason code per event, and the signal reference used, so that every bonus
-  decision can be rebuilt from the row (as `cap_price` is today).
+- **Q10. The unused `daily_burn` argument of `execute_pair()` (technical
+  debt).** Remove it, or give it a defined use.
+- **Q11. Telemetry for a live rule.** The written `requested_quote_amount_bonus`,
+  a reason code per event and the signal reference used, so that every bonus
+  decision can be rebuilt from the row, as `cap_price` allows today.
+- **Q12. The `ffill_gaps()` seeding finding (section 2).** Should production
+  refuse to seed from a later close, as the backtest does?
 
 ## 10. Owner steps (each needs Roberto's word)
 
 1. Accept or change this specification.
-2. Choose the input source (section 4). Use of `dca_ohlc_history` needs a
-   read-only export.
-3. Fix the pre-registration block, including the `b` grid.
-4. Then: the tool and its tests, in a separate PR. P1 runs, then the
-   pre-registration commit, then one P2 run. A result entry is added to the
-   roadmap register.
+2. Provide the Kraken historical OHLCVT files for `KASUSD` (240 and 1440).
+3. Approve the data-validation report and fix the pre-registration block,
+   including the P2 rule form.
+4. Then the validator, the tool and their tests, in a separate PR: P1 runs,
+   then the pre-registration commit, then one P2 run. A result entry is added
+   to the roadmap register.
