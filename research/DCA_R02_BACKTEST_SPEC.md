@@ -1,6 +1,6 @@
-# DCA-R02: regime signal evaluation — specification and backtest design (v2)
+# DCA-R02: regime signal evaluation — specification and backtest design (v2.1)
 
-**Status:** PROPOSED v2. A research specification, not an implementation
+**Status:** PROPOSED v2.1. A research specification, not an implementation
 authorization. It changes no production code, no `dca_settings` or
 `dca_orders` value and no live order. The backtest script it describes is
 written only after Roberto accepts this document, and runs read-only.
@@ -18,6 +18,18 @@ answered by this version.
 No monetary amounts appear in this document. Every amount is expressed in the
 base unit `U` (one order's `base_quote_amount`). The bonus grid below is a
 research grid for the backtest, not a bonus size for production.
+
+**Changes from v2 (GT review of `d3381a6`: MINOR, all nine points PASS):**
+
+- Roberto's decision: P2 form 1, one `b*` selected on P1, from the `b` grid
+  0.5 U, 1 U, 2 U. Form 2 is dropped.
+- M1: the `b*` selection is now a single fixed procedure (section 6). It uses
+  one conservative score across both funding scenarios, requires the criteria
+  at three of the four `d` values, breaks ties to the smaller `b`, and selects
+  nothing when no `b` qualifies, in which case P2 is not run. P2 data cannot
+  affect the formula or `b*`.
+- M2: an `INVALID` A′ gives `INSUFFICIENT EVIDENCE` for that comparison, not
+  `NO ADVANTAGE` (sections 3 and 7).
 
 **Changes from v1 (GT review of `21b22b2`):**
 
@@ -53,8 +65,8 @@ It must do so without a worse minimum USD reserve than B beyond the bound
 fixed in section 6, and without more missed base buys than B. It must also
 hold for most of the pre-registered `d` grid, not only at its best point.
 
-The null result (`NO ADVANTAGE`) and `INSUFFICIENT EVIDENCE` are acceptable
-outcomes. The roadmap (§4) forbids reporting only the most profitable
+The null result (`NO ADVANTAGE`), `INSUFFICIENT EVIDENCE` and `NO CANDIDATE`
+(section 6) are acceptable outcomes. The roadmap (§4) forbids reporting only the most profitable
 example.
 
 ## 2. Current production logic (verified against `main` `3081e4f`)
@@ -126,10 +138,12 @@ spending more.
   continuous volume, with no lot rounding). This is checked for every scenario,
   above all F2, where weekly funding can leave A′ unable to fund an event that
   C funded earlier.
-- **If the check fails** for a scenario, A′ is marked `INVALID` there. The
-  comparison with A′ is then not made, and H-R02 cannot be supported in that
-  scenario; it fails closed. A′ is never rescaled or re-sized to force
-  equality, and the shortfall and its dates are reported.
+- **If the check fails** for a scenario (for example, F2 liquidity leaves A′
+  unable to fund an event), A′ is marked `INVALID` there. The comparison of C
+  with A′ in that scenario is then `INSUFFICIENT EVIDENCE`, not
+  `NO ADVANTAGE`: an invalid control proves nothing either way. A′ is never
+  rescaled or re-sized to force equality, and the shortfall and its dates are
+  reported. How this enters the overall verdict is defined in section 7.
 
 ## 4. Data and time semantics (no lookahead)
 
@@ -232,7 +246,7 @@ decision instant leaves every decision at or before that instant unchanged.
   is the record. It fixes:
   - the `d` grid (proposed: 0 %, 2.5 %, 5 %, 10 %);
   - the `b` grid: 0.5 U, 1 U, 2 U;
-  - the P2 rule form (below) and, for form 1, the P1 selection criterion;
+  - the `b*` selection procedure (below), unchanged;
   - the cap parameters;
   - `K`, the funding scenarios, the fee rates and the impact allowance;
   - the order schedule;
@@ -249,23 +263,40 @@ decision instant leaves every decision at or before that instant unchanged.
   each after warm-up, the result is `INSUFFICIENT EVIDENCE` and no claim is
   made.
 
-**The P2 rule covers the whole `b` grid. Exactly one of these two forms is
-chosen in the pre-registration:**
+**The P2 rule: form 1, one `b*` selected on P1 (Roberto, 2026-11-03).**
 
-- **Form 1: one candidate selected on P1.**
-  - On P1, a single `b*` is chosen from the grid by the pre-registered
-    criterion. Proposed criterion: the most KAS accumulated, among the `b`
-    values that meet the reserve bound and have no more unfunded base buys
-    than B on P1, in both funding scenarios.
-  - `b*` is committed before P2. On P2 only `b*` is judged, by the decision
-    rule in section 7.
-  - The other `b` values are reported on P2 as description only, and none of
-    them can support H-R02.
-- **Form 2: one strict rule for all.** H-R02 is supported only if **every**
-  `b` in the grid meets the decision rule in section 7 on P2.
+The selection uses P1 data only. It is a fixed procedure, committed in the
+pre-registration block before P2 is run, and nothing in it may change after
+that.
 
-Under either form, choosing a `b` or a `d` after seeing P2 is not allowed, and
-every grid point's P2 result is reported.
+1. **Eligibility of one grid point.** For a given `b`, `d` and funding
+   scenario `F`, the point is eligible on P1 when both of these hold:
+   - C's worst reserve is not lower than B's by more than the reserve bound;
+   - C has no more `unfunded` plus `unfunded_after_bonus` base buys than B.
+2. **Qualification of `b`.** `b` qualifies when at least three of the four `d`
+   values are eligible in **both** F1 and F2. The same `d` must be eligible in
+   both scenarios to count.
+3. **Conservative score.** For a qualifying `b`, the score is the minimum,
+   over both funding scenarios and over the `d` values counted in step 2, of
+   `KAS accumulated by C / KAS accumulated by B`. Each ratio uses the same
+   scenario for C and B. The minimum, not an average, is used, so one weak
+   scenario or `d` value decides.
+4. **Selection.** `b*` is the qualifying `b` with the highest score.
+   - **Ties** (scores equal within a relative tolerance of 1e-9) go to the
+     smaller `b`.
+5. **No candidate.** If no `b` qualifies, no `b*` is selected and P2 is not
+   run. The result is `NO CANDIDATE`: H-R02 is not supported. P2's data stay
+   unseen, so a later, separately pre-registered study may still use them.
+6. **Commit.** `b*`, its score and every P1 grid result are committed before
+   P2 is run. On P2, only `b*` is judged, by the decision rule in section 7.
+   The other two `b` values are shown in the P2 report for description only
+   and cannot support H-R02.
+7. **Isolation from P2.** The selection reads only P1 data. A test changes
+   every P2 candle and checks that the score formula, the scores and `b*` stay
+   identical.
+
+Choosing a `b` or a `d` after seeing P2 is not allowed. Every grid point's P2
+result is reported.
 
 ## 7. Metrics and decision rule
 
@@ -294,17 +325,29 @@ P1 and P2 separately.
   `unfunded_after_bonus`.
 - A base buy unfunded in both is `unfunded`.
 
-**Decision rule (frozen in section 6).** For a judged `b` (form 1: `b*`;
-form 2: each `b`), the rule holds only when every one of these holds on P2,
-under both funding scenarios, for at least three of the four `d` grid points:
+**Decision rule (frozen in section 6).** It is applied on P2 to `b*` only.
+For each funding scenario and each `d` grid point there are four checks:
 
-- C accumulates more KAS than B **and** more than A′, with A′ `VALID` in that
-  scenario;
-- C's worst reserve is not lower than B's by more than the reserve bound;
-- C has no more `unfunded` plus `unfunded_after_bonus` base buys than B.
+1. C accumulates more KAS than B;
+2. C accumulates more KAS than A′. This check is `INSUFFICIENT EVIDENCE` when
+   A′ is `INVALID` in that scenario;
+3. C's worst reserve is not lower than B's by more than the reserve bound;
+4. C has no more `unfunded` plus `unfunded_after_bonus` base buys than B.
 
-H-R02 is supported only if the chosen form's condition is met. Anything less
-is `NO ADVANTAGE`. Missing or inadequate data gives `INSUFFICIENT EVIDENCE`.
+A grid point **passes** when all four checks pass, in both funding scenarios.
+
+**Verdict:**
+
+- **Supported:** at least three of the four `d` grid points pass.
+- **`INSUFFICIENT EVIDENCE`:** three passes cannot be reached, but would have
+  been reached if every `INSUFFICIENT EVIDENCE` check had passed. An invalid
+  A′ therefore never turns into `NO ADVANTAGE`. The same verdict applies when
+  data are missing or inadequate (sections 4 and 6).
+- **`NO ADVANTAGE`:** three passes cannot be reached even if every
+  `INSUFFICIENT EVIDENCE` check had passed. In other words, the result fails
+  on checks that were validly made.
+- **`NO CANDIDATE`:** no `b*` was selected (section 6), so P2 is not run.
+
 No result authorizes a live change: DCA-R03 and DCA-R04 still need their own
 approval.
 
@@ -332,7 +375,11 @@ approval.
   - one bonus per pair per Chicago day;
   - base funded before bonus;
   - the control replay equals B;
-  - A′'s spend equality and its `INVALID` path;
+  - A′'s spend equality, and its `INVALID` path leading to
+    `INSUFFICIENT EVIDENCE`, not `NO ADVANTAGE`;
+  - the `b*` selection: eligibility, the three-of-four rule across both
+    scenarios, the minimum score, ties to the smaller `b`, `NO CANDIDATE`, and
+    no change to `b*` when P2 candles change;
   - equal capital and horizon across variants;
   - per-class labels never change a size;
   - the validator's hard failures: duplicates, off-grid timestamps, order.
@@ -396,8 +443,8 @@ schema and no setting follows from this list.
 
 1. Accept or change this specification.
 2. Provide the Kraken historical OHLCVT files for `KASUSD` (240 and 1440).
-3. Approve the data-validation report and fix the pre-registration block,
-   including the P2 rule form.
+3. Approve the data-validation report and fix the pre-registration block. The
+   P2 rule form is decided: form 1.
 4. Then the validator, the tool and their tests, in a separate PR: P1 runs,
    then the pre-registration commit, then one P2 run. A result entry is added
    to the roadmap register.
