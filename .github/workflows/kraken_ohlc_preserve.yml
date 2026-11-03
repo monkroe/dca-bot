@@ -61,8 +61,6 @@ jobs:
   preserve:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      STATE_DIR: ${{ runner.temp }}/ohlc-preserve
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -80,7 +78,7 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           GITHUB_TOKEN: ${{ github.token }}
-        run: python src/ohlc_preserve.py prepare --state-dir "$STATE_DIR"
+        run: python src/ohlc_preserve.py prepare --state-dir "$RUNNER_TEMP/ohlc-preserve"
 
       - name: Upload pre-write manifest
         id: manifest_upload
@@ -119,7 +117,7 @@ jobs:
           ARTIFACT_DIGEST: ${{ steps.manifest_upload.outputs.artifact-digest }}
         run: |
           python src/ohlc_preserve.py apply \
-            --state-dir "$STATE_DIR" \
+            --state-dir "$RUNNER_TEMP/ohlc-preserve" \
             --state-path "$STATE_PATH" \
             --artifact-id "$ARTIFACT_ID" \
             --artifact-name "$ARTIFACT_NAME" \
