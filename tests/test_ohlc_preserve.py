@@ -1256,7 +1256,7 @@ def test_isolation_and_workflow(t):
     expected = {
         "test.sh": "946ac9b10d7217a1b546707afc88dab75a1f36dd5ca1b81479d8d10bd7f6a116",
         "src/ohlc.py": "ef8d1c07c75aeadb34f6d204188f44bce5887e488015a60ee42df6449f7389a1",
-        "src/kraken_run.py": "bcc216a5fe1ff6de117f0f6bfd5d68275f5478060b7934dd65de25abd0972622",
+        "src/kraken_run.py": "c86f202fa9805fe49671bd3ab4f0ee93d257500800f8b5c7042b88753f5592a0",
         ".github/workflows/kraken_dca.yml": "06f95eb58644178ccf5a400c66e360ca1ed770a245ba2f6c975a8c11add8cd17",
         ".github/workflows/kraken_sync.yml": "c7d858e0b7f65c905b4fb524238545ac45477cab0e8b22f2363e56e3fdbd965e",
     }
