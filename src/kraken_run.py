@@ -1557,6 +1557,9 @@ def finalize_order(cl_ord_id: str, order_id: str, mid: float | None = None, ohlc
     persisted_fee = fee
     persisted_volume = vol_exec
     persisted_avg = avg_px
+    if cl_ord_id.endswith("-resume") and not isinstance(prior_raw.get("kas_resume"), dict):
+        print("  finalize deferred: resume history is not readable")
+        return
     transition = prior_raw.get("repeg_transition")
     if isinstance(transition, dict):
         if not _repeg_apply_generation_fill(transition, order_data, order_id):
@@ -1574,6 +1577,8 @@ def finalize_order(cl_ord_id: str, order_id: str, mid: float | None = None, ohlc
     merged_raw = {**prior_raw, **(order_data if isinstance(order_data, dict) else {})}
     if isinstance(transition, dict):
         merged_raw["repeg_transition"] = transition
+    if "kas_resume" in prior_raw:
+        merged_raw["kas_resume"] = prior_raw["kas_resume"]
     if "kraken_cl" in prior_raw:
         # The persisted provider id is never displaced by a provider response.
         merged_raw["kraken_cl"] = prior_raw["kraken_cl"]
@@ -1717,6 +1722,14 @@ def _limit_window_end(row: dict, settings: dict):
     Derived from the row's dca_order (strategy unit). If the order row is
     gone, fall back to execution_started_at + window so TTL/I6 still bound
     the row instead of leaving it immortal."""
+    if (row.get("cl_ord_id") or "").endswith("-resume"):
+        raw = _safe_json_load(row.get("raw"))
+        if not isinstance(raw, dict) or not isinstance(raw.get("kas_resume"), dict):
+            raise ValueError("Resumed maker row has no readable audit")
+        end = datetime.fromisoformat(raw["kas_resume"]["window_end"])
+        if end.tzinfo is None:
+            raise ValueError("Resumed maker row has no offset in its recorded window")
+        return end.astimezone(CHICAGO_TZ)
     order = _load_order_row(row.get("dca_order_id"))
     if order and order.get("target_time"):
         w = int(order.get("time_window_minutes") or settings.get("time_window_minutes", 10))
@@ -1756,7 +1769,11 @@ def _merged_raw_json(cl_ord_id: str, extra: dict, provider_id: str | None = None
             current = loaded
     except Exception as e:
         print(f"  {ICONS['WARN']} raw merge lookup failed: {e}")
+    if cl_ord_id.endswith("-resume") and not isinstance(current.get("kas_resume"), dict):
+        raise RuntimeError("Resume history is not readable; refusing to replace raw")
     merged = {**current, **extra}
+    if "kas_resume" in current:
+        merged["kas_resume"] = current["kas_resume"]
     pid = provider_id or _provider_id_from_raw(current)
     if pid:
         merged["kraken_cl"] = pid
@@ -3491,7 +3508,13 @@ def run_maker_inspection(settings: dict, user_id: str, now_chicago):
 
     for row in open_rows:
         cl = row["cl_ord_id"]
-        window_end = _limit_window_end(row, settings)
+        try:
+            window_end = _limit_window_end(row, settings)
+        except (ValueError, KeyError, TypeError) as e:
+            if not cl.endswith("-resume"):
+                raise
+            _mark_manual_required(row, f"Resumed maker window unreadable ({e})")
+            continue
         deadline = window_end - timedelta(minutes=CRON_CYCLE_MINUTES)
         ttl_at = window_end + timedelta(minutes=LIMIT_TTL_MINUTES)
         raw = _safe_json_load(row.get("raw")) or {}
@@ -3569,8 +3592,118 @@ def run_maker_inspection(settings: dict, user_id: str, now_chicago):
 #  CORE: EXECUTE ONE PAIR
 # ═══════════════════════════════════════════════════════════════
 
+class KasResume(NamedTuple):
+    trade_date: str
+    target_time: str
+    execution_id: int
+
+
+def _parse_kas_resume(args: list[str]) -> KasResume:
+    if len(args) != 3:
+        raise SystemExit("Usage: --resume-kas YYYY-MM-DD HH:MM EXECUTION_ROW_ID")
+    day, target, row_id = args
+    try:
+        if (datetime.strptime(day, "%Y-%m-%d").strftime("%Y-%m-%d") != day
+                or datetime.strptime(target, "%H:%M").strftime("%H:%M") != target
+                or not row_id.isascii() or not row_id.isdecimal() or int(row_id) < 1):
+            raise ValueError
+    except ValueError:
+        raise SystemExit("Invalid --resume-kas date, time or execution row ID") from None
+    return KasResume(day, target, int(row_id))
+
+
+def _kas_resume_window(request: KasResume, order: dict, settings: dict, now):
+    if now.strftime("%Y-%m-%d") != request.trade_date:
+        return False
+    target = order.get("target_time") or settings.get("target_time")
+    if not target:
+        return False
+    if datetime.strptime(target, "%H:%M").strftime("%H:%M") != request.target_time:
+        return False
+    width = int(order.get("time_window_minutes") or settings.get("time_window_minutes") or 10)
+    start, end = _window_bounds_for(request.trade_date, request.target_time, width)
+    return end if start <= now <= end - timedelta(minutes=CRON_CYCLE_MINUTES) else None
+
+
+def _claim_kas_resume(request: KasResume, order: dict, settings: dict,
+                      user_id: str, started_at: str):
+    """Retake exactly one proven preflight skip; never insert a second day leg."""
+    if (order.get("pair") != "KASUSD" or order.get("id") is None
+            or settings.get("dry_run") or settings.get("order_strategy") != "maker_first"):
+        return None
+    window_end = _kas_resume_window(request, order, settings, datetime.now(CHICAGO_TZ))
+    if not window_end:
+        return None
+    scope = {"user_id": f"eq.{user_id}", "pair": "eq.KASUSD",
+             "trade_date_chicago": f"eq.{request.trade_date}"}
+    rows = sb_get("dca_executions", scope)
+    # In particular, refuse a fallback or force-market row for this pair/day.
+    # GitHub concurrency is still required between entry points; this does not
+    # coordinate orders manually placed outside DCA.
+    if not isinstance(rows, list) or len(rows) != 1:
+        return None
+    old = rows[0]
+    skip = "skipped_insufficient_funds"
+    null_fields = ("order_id", "filled_base_volume", "filled_quote_cost", "fee_quote", "limit_price")
+    if (old.get("id") != request.execution_id or old.get("dca_order_id") != order["id"]
+            or old.get("attempt_type") != "maker_limit" or old.get("status") != skip
+            or not old.get("parent_event_id") or not old.get("execution_finished_at")
+            or any(old.get(key) is not None for key in null_fields)
+            or old.get("requested_quote_amount_base") is None
+            or float(old["requested_quote_amount_base"]) != float(order["base_quote_amount"])):
+        return None
+    old_id = old.get("cl_ord_id") or ""
+    prefix = f"dca-KASUSD-{request.trade_date}-"
+    suffix = old_id.removeprefix(prefix)
+    if not old_id.startswith(prefix) or not re.fullmatch(r"[0-9]{3,4}", suffix):
+        return None
+    try:
+        original_target = datetime.strptime(suffix.zfill(4), "%H%M")
+    except ValueError:
+        return None
+    if request.target_time <= original_target.strftime("%H:%M"):
+        return None
+    raw = _safe_json_load(old.get("raw"))
+    try:
+        if (not isinstance(raw, dict) or "kas_resume" in raw
+                or not float(raw["spendable_usd"]) < float(raw["needed_usd"])
+                or float(raw["needed_usd"]) != float(order["base_quote_amount"])
+                or not raw.get("at")
+                or raw.get("kraken_cl") != provider_client_id("maker_limit", old_id, 0)):
+            return None
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    cl_id = prefix + request.target_time.replace(":", "") + "-resume"
+    pid = provider_client_id("maker_limit", cl_id, 0)
+    if not pid:
+        return None
+    evidence = {"kas_resume": {
+        "requested_target_time": request.target_time, "claimed_at": started_at,
+        "window_end": window_end.isoformat(),
+        "original_execution": old,
+    }}
+    rotated = sb_update("dca_executions", {
+        **scope, "id": f"eq.{request.execution_id}", "dca_order_id": f"eq.{order['id']}",
+        "attempt_type": "eq.maker_limit", "status": f"eq.{skip}",
+        "cl_ord_id": f"eq.{old_id}", "parent_event_id": f"eq.{old['parent_event_id']}",
+        "execution_finished_at": f"eq.{old['execution_finished_at']}",
+        **{key: "is.null" for key in null_fields},
+    }, {
+        "cl_ord_id": cl_id, "status": "claimed", "reason": None,
+        "execution_started_at": started_at, "execution_finished_at": None,
+        "raw": json.dumps({"kraken_cl": pid, **evidence}),
+    })
+    if (not _rows_carry_provider(rotated, pid) or rotated[0].get("cl_ord_id") != cl_id
+            or rotated[0].get("status") != "claimed"
+            or (_safe_json_load(rotated[0].get("raw")) or {}).get("kas_resume") != evidence["kas_resume"]):
+        return None
+    return cl_id, pid, old["parent_event_id"], evidence
+
+
 def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
-                 force: bool = False, daily_burn: float = 0.0) -> dict:
+                 force: bool = False, daily_burn: float = 0.0,
+                 kas_resume: KasResume | None = None) -> dict:
     """
     Full two-phase execution for one trading pair.
 
@@ -3626,7 +3759,14 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
     # one, so counters and fills (repeg_count, generation_fills) can never cross
     # execution identities and move the budget.
     takeover_evidence: dict = {}
-    if maker and not dry_run and not force:
+    if kas_resume is not None:
+        claimed = None if force or today_chicago != kas_resume.trade_date else _claim_kas_resume(
+            kas_resume, order, settings, user_id, exec_started_at)
+        if not claimed:
+            return {"pair": pair, "status": "resume_not_claimed", "skipped": True}
+        cl_ord_id, provider_id, event_id, takeover_evidence = claimed
+        retry_takeover = True
+    elif maker and not dry_run and not force:
         try:
             prev = sb_get("dca_executions", {
                 "dca_order_id": f"eq.{order.get('id')}",
@@ -3648,7 +3788,8 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
             ok, why = _retry_decision(prow.get("status"), prow.get("reason"),
                                       rcount, datetime.now(CHICAGO_TZ), rdeadline)
             print(f"  Retry check: {'YES' if ok else 'no'} ({why})")
-            if ok:
+            # An explicit manual resume is single-use, even if Kraken later refuses it.
+            if ok and not (prow.get("cl_ord_id") or "").endswith("-resume"):
                 cl_ord_id = f"{base_cl}-r{rcount + 1}"
                 # A takeover is a NEW execution identity (the cl_ord_id
                 # rotates), so it gets a NEW provider id. It is persisted in
@@ -3716,6 +3857,8 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
         if provider_id is None:
             return json.dumps(extra)
         raw_state.update(extra)
+        if kas_resume is not None:
+            raw_state["kas_resume"] = takeover_evidence["kas_resume"]
         raw_state["kraken_cl"] = provider_id
         return json.dumps(raw_state)
 
@@ -3738,7 +3881,25 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
         raise
 
     def update_execution(updates: dict):
-        sb_update("dca_executions", {"cl_ord_id": f"eq.{cl_ord_id}"}, updates)
+        return sb_update("dca_executions", {"cl_ord_id": f"eq.{cl_ord_id}"}, updates)
+
+    def persist_maker_submission(updates: dict) -> bool:
+        if kas_resume is None:
+            update_execution(updates)
+            return True
+        try:
+            rows = sb_update("dca_executions", {
+                "cl_ord_id": f"eq.{cl_ord_id}", "status": "eq.claimed",
+                "order_id": "is.null",
+            }, updates)
+        except Exception as e:
+            print(f"  Resume persistence ambiguous; reconciliation owns this claim: {e}")
+            return False
+        return (_rows_carry_provider(rows, provider_id)
+                and rows[0].get("status") == updates["status"]
+                and rows[0].get("order_id") == updates.get("order_id")
+                and (_safe_json_load(rows[0].get("raw")) or {}).get("kas_resume")
+                    == takeover_evidence["kas_resume"])
 
     # ── Preflight: Balance ────────────────────────────────────
     # Bound BEFORE the try: the except below deliberately continues, and these
@@ -3758,6 +3919,8 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
         held_note = f" (held in open orders ${usd_held:.2f})" if usd_held else ""
         print(f"  Spendable: ${usd_balance:.2f}{held_note} | Need: ${total_target:.2f} [{bal_source}]")
 
+        if kas_resume is not None and (bal_source != "BalanceEx" or not math.isfinite(usd_balance)):
+            raise KrakenError("Resume needs a verified spendable USD balance from BalanceEx")
         if usd_balance < total_target:
             if dry_run:
                 # A dry run spends nothing — real balance must never gate
@@ -3803,6 +3966,10 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
         # July's shift payouts by value landed after 16:00, so at 13:00 the money
         # that would fund the top-up does not exist yet.
     except KrakenError as e:
+        if kas_resume is not None:
+            update_execution({"status": "manual_required", "reason": str(e),
+                              "execution_finished_at": _now_utc_iso()})
+            return {"pair": pair, "status": "manual_required"}
         print(f"  {ICONS['WARN']} Balance check failed: {e} — continuing anyway")
 
     # ── Preflight: Pair info ──────────────────────────────────
@@ -3986,6 +4153,9 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
         limit_price = ticker["bid"]
         price_str = f"{limit_price:.{pair_info['pair_decimals']}f}"
 
+        if kas_resume is not None:
+            window_end = datetime.fromisoformat(takeover_evidence["kas_resume"]["window_end"])
+
         def _pending_row():
             return {
                 "pair": pair,
@@ -4027,6 +4197,13 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
             })
             return {"pair": pair, "status": "limit_open"}
 
+        if kas_resume is not None and (
+                not _kas_resume_window(kas_resume, order, settings, datetime.now(CHICAGO_TZ))
+                or datetime.now(CHICAGO_TZ) > window_end - timedelta(minutes=CRON_CYCLE_MINUTES)):
+            update_execution({"status": "manual_required", "reason": "Resume window closed",
+                              "execution_finished_at": _now_utc_iso()})
+            return {"pair": pair, "status": "manual_required"}
+
         limit_params = {
             "pair": pair,
             "type": "buy",
@@ -4038,9 +4215,12 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
         }
         try:
             result = kraken_private("AddOrder", limit_params)
-            order_id = result.get("txid", [None])[0]
-            print(f"  {ICONS['OK']} Post-only limit resting: {order_id} @ {price_str}")
-            update_execution({
+            txids = result.get("txid") if isinstance(result, dict) else None
+            if kas_resume is not None and (not isinstance(txids, list) or len(txids) != 1
+                    or not isinstance(txids[0], str) or not txids[0].strip()):
+                return {"pair": pair, "status": "claimed", "submission_state": "UNKNOWN"}
+            order_id = (txids or [None])[0]
+            persisted = persist_maker_submission({
                 "status": "limit_open",
                 "order_id": order_id,
                 "limit_price": limit_price,
@@ -4056,6 +4236,9 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
                     "balance_source": bal_source,
                 }}),
             })
+            if not persisted:
+                return {"pair": pair, "status": "claimed", "submission_state": "UNKNOWN"}
+            print(f"  {ICONS['OK']} Post-only limit resting: {order_id} @ {price_str}")
             # No finalize here — the order rests; the next runs' inspection
             # phase owns it from now on (DP-2: cron cadence is the timer).
             return {"pair": pair, "status": "limit_open", "order_id": order_id}
@@ -4067,18 +4250,18 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
                 txid = _resolve_duplicate_submission(
                     cl_ord_id, provider_id, exec_started_at, e, pair, today_chicago)
                 if txid:
-                    update_execution({
-                        "status": "limit_open",
-                        "order_id": txid,
-                        "limit_price": limit_price,
-                        "raw": _merged_raw_json(cl_ord_id, {"duplicate_recovered": True}, provider_id),
-                    })
-                    return {"pair": pair, "status": "limit_open", "order_id": txid}
+                    raw = (raw_json({"duplicate_recovered": True}) if kas_resume is not None
+                           else _merged_raw_json(cl_ord_id, {"duplicate_recovered": True}, provider_id))
+                    if persist_maker_submission({
+                        "status": "limit_open", "order_id": txid, "limit_price": limit_price,
+                        "raw": raw,
+                    }):
+                        return {"pair": pair, "status": "limit_open", "order_id": txid}
                 return {"pair": pair, "status": "claimed", "submission_state": "UNKNOWN"}
             if "post only" in str(e).lower():
                 # Would cross the spread -> rejected, NO position exists.
                 print(f"  {ICONS['SKIP']} Post-only rejected -> direct fallback")
-                update_execution({
+                persisted = persist_maker_submission({
                     "status": "rejected_postonly",
                     "limit_price": limit_price,
                     "execution_finished_at": datetime.now(timezone.utc).isoformat(),
@@ -4086,6 +4269,8 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
                         limit_params, e, spendable_usd=usd_balance,
                         held_usd=usd_held, balance_source=bal_source)),
                 })
+                if not persisted:
+                    return {"pair": pair, "status": "claimed", "submission_state": "UNKNOWN"}
                 _fallback_decision(_pending_row(), settings, user_id, window_end,
                                    dry_run=False, scenario=None)
                 return {"pair": pair, "status": "rejected_postonly"}
@@ -4102,6 +4287,11 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
             })
             tg_send(msg_exec_fail(today_chicago, pair, "Could not place the order.", e))
             return {"pair": pair, "status": "failed_kraken"}
+        except Exception:
+            if kas_resume is None:
+                raise
+            # A transport/decode failure after submitting does not prove no order.
+            return {"pair": pair, "status": "claimed", "submission_state": "UNKNOWN"}
 
     # ── Execute ───────────────────────────────────────────────
     if dry_run:
@@ -4691,6 +4881,9 @@ def main():
     print(f"{ICONS['BOT']} DCA Bot v{VERSION}")
 
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
+    if mode not in ("", "--reconcile", "--weekly", "--force", "--resume-kas"):
+        raise SystemExit(f"Unknown mode: {mode}")
+    kas_resume = _parse_kas_resume(sys.argv[2:]) if mode == "--resume-kas" else None
 
     # ── Load settings + user_id (needed for all modes) ────────
     settings_rows = sb_get("dca_settings", {"id": "eq.1"})
@@ -4715,6 +4908,25 @@ def main():
 
     if mode == "--weekly":
         send_weekly_summary(user_id)
+        return
+
+    if kas_resume is not None:
+        orders = sb_get("dca_orders", {
+            "user_id": f"eq.{user_id}", "pair": "eq.KASUSD",
+            "enabled": "eq.true", "base_quote_amount": "gt.0",
+        })
+        if not isinstance(orders, list) or len(orders) != 1:
+            raise SystemExit("Resume requires exactly one enabled KASUSD DCA order")
+        result = execute_pair(orders[0], settings, datetime.now(CHICAGO_TZ).strftime("%Y-%m-%d"),
+                              user_id, kas_resume=kas_resume)
+        print(f"KAS resume status: {result['status']}")
+        if result["status"] == "rejected_postonly":
+            print("Post-only was refused. The normal guarded fallback may have submitted; "
+                  "check the execution/fallback rows and the Kraken order status. Do not rerun.")
+        elif result["status"] == "claimed":
+            print("Submission may be unresolved. Check reconciliation and Kraken; do not rerun.")
+        elif result["status"] == "resume_not_claimed":
+            raise SystemExit("No eligible execution was claimed; no order was submitted by this run")
         return
 
     # ── Normal run ────────────────────────────────────────────
