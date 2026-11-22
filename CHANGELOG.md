@@ -8,7 +8,7 @@ History before 2026-07-18 (Phase 1 -- Kraken + Strike execution, notifications, 
 
 - PR #5 allows a same-day retry after a zero-spend insufficient-funds skip. In run [45028940455](https://github.com/monkroe/dca-bot/actions/runs/45028940455), the existing daily row blocked the buy after a top-up and target-time change. The runner reclaims that row inside the current target window. The window bounds attempts without an additional retry limit.
 - Fixed the undefined `held` variable that omitted the `Balance:` line from fill notifications in run [45038465095](https://github.com/monkroe/dca-bot/actions/runs/45038465095).
-- Balance preflight takes a mirror snapshot on the first check and on funded retries, including when Kraken rejects the order. Repeated funding skips reuse the first snapshot.
+- Balance preflight takes a mirror snapshot on the first check, on funded retries even if Kraken rejects the order, and when the balance check is unavailable. Repeated funding skips reuse the first snapshot.
 - Telegram sends `DCA SKIP` on the first funding skip and again if the required USD amount changes. An invalid stored skip count is treated as zero.
 
 ## 2026-10-06 (vakaras – Chicago; UTC jau 10-07)

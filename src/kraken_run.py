@@ -3865,6 +3865,8 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
         # that would fund the top-up does not exist yet.
     except KrakenError as e:
         print(f"  {ICONS['WARN']} Balance check failed: {e} — continuing anyway")
+        if not dry_run:
+            snapshot_mirror(user_id)
 
     # ── Preflight: Pair info ──────────────────────────────────
     try:

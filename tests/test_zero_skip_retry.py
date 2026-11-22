@@ -50,7 +50,7 @@ class FundingWorld(World):
             return rows
 
     def kraken_private(self, endpoint, params=None):
-        if endpoint == "BalanceEx":
+        if endpoint == "BalanceEx" and endpoint not in self.endpoint_errors:
             self.kraken_calls.append((endpoint, params))
             return {"ZUSD": {"balance": str(self.usd), "hold_trade": "0"}}
         return super().kraken_private(endpoint, params)
@@ -93,6 +93,23 @@ def t_funded(r):
                                     for x in w.rows], [identity])
     r.check("BalanceEx refreshed", len(w.calls("BalanceEx")), 2)
     r.check("one post-only buy", [p["oflags"] for p in w.calls("AddOrder")], ["post,fciq"])
+
+
+def t_balance_unavailable(r):
+    w = FundingWorld()
+    for endpoint in ("BalanceEx", "Balance"):
+        w.endpoint_errors[endpoint] = kr.KrakenError(["EGeneral:Permission denied"])
+    snapshots = []
+
+    def snapshot(user_id):
+        snapshots.append((user_id, len(w.calls("AddOrder"))))
+
+    with w.installed(), w.clock(), patch.object(kr, "snapshot_mirror", snapshot):
+        r.check("unavailable balance check still opens maker order", w.cycle(INITIAL_ORDER),
+                "limit_open")
+    r.check("both balance endpoints attempted", [name for name, _ in w.kraken_calls[:2]],
+            ["BalanceEx", "Balance"])
+    r.check("one snapshot before order submission", snapshots, [("test-user", 0)])
 
 
 def t_still_short(r):
@@ -281,6 +298,7 @@ def t_scheduled_cycle(r):
 if __name__ == "__main__":
     raise SystemExit(Runner("Same-day funding retry").run([
         ("funds arrive in the rescheduled window", t_funded),
+        ("failed balance checks still snapshot before ordering", t_balance_unavailable),
         ("funds are still short", t_still_short),
         ("only the first funding skip notifies and snapshots", t_notify_only_on_first_skip),
         ("a Kraken refusal does not reset the funding notice", t_notify_once_across_allowed_refusal),
