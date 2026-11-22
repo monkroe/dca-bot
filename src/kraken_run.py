@@ -2398,8 +2398,8 @@ def snapshot_mirror(user_id: str) -> None:
     This run already happens at the moment in question, so the snapshot costs
     two API calls and no new scheduled job.
 
-    The preflight calls this after claiming the daily leg. Once a funding
-    skip has been recorded, later attempts on that leg reuse its snapshot.
+    Preflight snapshots the first balance check and each funded attempt.
+    Repeated funding skips reuse the earlier snapshot.
 
     NEVER RAISES. A snapshot is telemetry; the buy does not depend on it and
     must not be able to fail because of it.
@@ -3802,16 +3802,18 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
     # The funding skip count belongs to the daily leg, even if an explicit
     # Kraken refusal has since rotated its client id.
     skip_count = prior_raw.get("skip_count", 0)
-    if skip_count:
+    if type(skip_count) is not int or skip_count < 0:
+        skip_count = 0
+    previous_needed = prior_raw.get("needed_usd")
+    if "skip_count" in prior_raw:
         raw_state["skip_count"] = skip_count
-
-    # Capture the decision-time balances for either outcome of the first
-    # preflight. A funding retry still checks BalanceEx with a fresh read.
-    if not dry_run and not skip_count:
-        snapshot_mirror(user_id)
+        if previous_needed is not None:
+            raw_state["needed_usd"] = previous_needed
 
     try:
         usd_balance, usd_held, bal_source = check_balance_usd()
+        if not dry_run and (not skip_count or usd_balance >= total_target):
+            snapshot_mirror(user_id)
         held_note = f" (held in open orders ${usd_held:.2f})" if usd_held else ""
         print(f"  Spendable: ${usd_balance:.2f}{held_note} | Need: ${total_target:.2f} [{bal_source}]")
 
@@ -3839,7 +3841,7 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
                         "open_orders": _open_orders_digest(),
                     }),
                 })
-                if not skip_count:
+                if not skip_count or (previous_needed is not None and previous_needed != total_target):
                     ts_chi = datetime.now(timezone.utc).astimezone(CHICAGO_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
                     tg_send(msg_warn(
                         "DCA SKIP",

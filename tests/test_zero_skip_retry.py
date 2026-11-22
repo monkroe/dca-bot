@@ -78,12 +78,16 @@ class FundingWorld(World):
 
 def t_funded(r):
     w = FundingWorld()
-    row = w.seeded_skip()
-    identity = (row["id"], row["cl_ord_id"], row["parent_event_id"])
-    w.usd += 10
-    with w.installed(), w.clock():
+    snapshots = []
+    with w.installed(), w.clock(), patch.object(kr, "snapshot_mirror", snapshots.append):
+        r.check("first check skips", w.cycle(INITIAL_ORDER), SKIPPED)
+        row = w.rows[0]
+        identity = (row["id"], row["cl_ord_id"], row["parent_event_id"])
+        w.now += timedelta(minutes=50)
+        w.usd += 10
         status = w.cycle()
         next_status = w.cycle()
+    r.check("first skip and funded retry both snapshot", snapshots, ["test-user"] * 2)
     r.check("maker order opens once", (status, next_status), ("limit_open", "already_claimed"))
     r.check("existing row reused", [(x["id"], x["cl_ord_id"], x["parent_event_id"])
                                     for x in w.rows], [identity])
@@ -141,7 +145,38 @@ def t_notify_once_across_allowed_refusal(r):
     r.check("normal refusal retry still runs", (first, refused, last),
             (SKIPPED, "failed_kraken", SKIPPED))
     r.check("one funding skip message across attempts", sum("DCA SKIP" in msg for msg in w.tg), 1)
-    r.check("one mirror snapshot across attempts", snapshots, ["test-user"])
+    r.check("skip and funded Kraken refusal both snapshot", snapshots, ["test-user"] * 2)
+
+
+def t_notify_when_target_changes(r):
+    w = FundingWorld()
+    w.seeded_skip()
+    snapshots = []
+    new_target = {**NEW_ORDER, "base_quote_amount": 12.0}
+    with w.installed(), w.clock(), patch.object(kr, "snapshot_mirror", snapshots.append):
+        r.check("changed target still skips", w.cycle(new_target), SKIPPED)
+        w.now += timedelta(minutes=1)
+        r.check("same target still skips", w.cycle(new_target), SKIPPED)
+    notices = [msg for msg in w.tg if "DCA SKIP" in msg]
+    r.check("first notice and one changed-target notice", len(notices), 2)
+    r.check("latest notice contains new target", "$12.00" in notices[-1], True)
+    r.check("repeat skips never snapshot", snapshots, [])
+
+
+def t_invalid_skip_count(r):
+    for invalid in ("2", None, [1], True, -1, 1.5):
+        w = FundingWorld()
+        row = w.seeded_skip()
+        raw = w.raw(row["cl_ord_id"])
+        row["raw"] = kr.json.dumps({**raw, "skip_count": invalid})
+        with w.installed(), w.clock():
+            try:
+                result = w.cycle()
+            except TypeError as exc:
+                result = str(exc)
+        r.check(f"skip succeeds with invalid count {invalid!r}", result, SKIPPED)
+        r.check("invalid count restarts at one", w.raw(row["cl_ord_id"])["skip_count"], 1)
+        r.check("invalid count does not hide the notice", sum("DCA SKIP" in msg for msg in w.tg), 2)
 
 
 def t_unsafe_to_retry(r):
@@ -249,6 +284,8 @@ if __name__ == "__main__":
         ("funds are still short", t_still_short),
         ("only the first funding skip notifies and snapshots", t_notify_only_on_first_skip),
         ("a Kraken refusal does not reset the funding notice", t_notify_once_across_allowed_refusal),
+        ("changed funding target notifies again", t_notify_when_target_changes),
+        ("invalid skip counts recover", t_invalid_skip_count),
         ("existing or ambiguous Kraken orders are never retried", t_unsafe_to_retry),
         ("parallel cycles compete for one claim", t_parallel),
         ("stale reader loses after winner skips again", t_stale_reader),
