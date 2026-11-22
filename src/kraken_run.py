@@ -1700,6 +1700,14 @@ def _window_bounds_for(trade_date: str, target_time: str, window_minutes: int):
     return target - half, target + half
 
 
+def _order_window(order: dict, settings: dict, trade_date: str):
+    target = order.get("target_time")
+    if target is None:
+        target = settings.get("target_time", "08:00")
+    minutes = int(order.get("time_window_minutes") or settings.get("time_window_minutes", 10))
+    return _window_bounds_for(trade_date, target, minutes)
+
+
 def _load_order_row(dca_order_id):
     if dca_order_id is None:
         return None
@@ -3593,7 +3601,10 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
     fee_rate = (max(float(settings.get("maker_fee_rate") or 0.004), 0.0)
                 if maker else float(settings["taker_fee_rate"]))
 
-    ot = (order.get("target_time") or "08:00").replace(":", "")
+    order_time = order.get("target_time")
+    if order_time is not None and not isinstance(order_time, str):
+        return {"pair": pair, "status": "invalid_window", "skipped": True}
+    ot = (order_time or "08:00").replace(":", "")
     if dry_run:
         # Maker dry-run needs a DETERMINISTIC id: one event per order per
         # day, so the cross-run machine is exercised. Market dry-run keeps
@@ -3607,12 +3618,10 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
     print(f"  {pair} | ${total_target:.2f} | {strategy} | fee {fee_rate*100:.2f}% | {'DRY RUN' if dry_run else 'LIVE'}")
     print(f"  cl_ord_id: {cl_ord_id}")
 
-    # ── Phase 0: take over a leg that Kraken explicitly refused ───────────
+    # ── Phase 0: take over a skipped or explicitly refused leg ─────────────
     #
-    # Same row, rotated client id (dca_exec_leg_per_event_uniq forbids a second
-    # maker_limit row for the day, and that guard stays). Only reached when the
-    # rejection is on the allowlist and the window is still open; see
-    # _retry_decision.
+    # The daily unique index requires reusing the maker row. Rotate the client
+    # id only after an allowlisted Kraken rejection (see _retry_decision).
     retry_takeover = False
     # One instant for this execution identity: the takeover rotation and the
     # claim row below both record it, and the provider lookup later bounds
@@ -3621,10 +3630,8 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
     # The provider id sent to Kraken for THIS (attempt_type, cl_ord_id, 0).
     # None in dry runs: nothing is submitted, so no provider identity exists.
     provider_id = None
-    # What a takeover records about the attempt it replaces: a NAMESPACED
-    # summary only. The previous identity's raw is not copied into the new
-    # one, so counters and fills (repeg_count, generation_fills) can never cross
-    # execution identities and move the budget.
+    # A funding retry retains evidence on the same identity. A Kraken refusal
+    # rotates the identity and carries only a summary of the prior attempt.
     takeover_evidence: dict = {}
     if maker and not dry_run and not force:
         try:
@@ -3632,13 +3639,62 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
                 "dca_order_id": f"eq.{order.get('id')}",
                 "trade_date_chicago": f"eq.{today_chicago}",
                 "attempt_type": "eq.maker_limit",
-                "select": "id,status,cl_ord_id,reason,parent_event_id,raw",
+                "select": "id,status,cl_ord_id,reason,parent_event_id,raw,order_id,execution_started_at",
             })
         except Exception as e:
             prev = []
             print(f"  {ICONS['WARN']} retry lookup failed: {e}")
-        if prev:
-            prow = prev[0]
+        prow = prev[0] if prev else {}
+        if prow.get("status") == "skipped_insufficient_funds":
+            already_claimed = {"pair": pair, "status": "already_claimed", "skipped": True}
+            prior_raw = _safe_json_load(prow.get("raw"))
+            prior_raw = prior_raw if isinstance(prior_raw, dict) else {}
+            if (prow.get("order_id") is not None or prior_raw.get("txid")
+                    or prior_raw.get("order_id") or prior_raw.get("submission_state") == "UNKNOWN"):
+                return already_claimed
+            try:
+                start, end = _order_window(order, settings, today_chicago)
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                return {"pair": pair, "status": "invalid_window", "skipped": True}
+            if not start <= datetime.now(CHICAGO_TZ) <= end:
+                return {"pair": pair, "status": "outside_window", "skipped": True}
+
+            # No submission occurred. Keep the event and client identity.
+            cl_ord_id = prow["cl_ord_id"]
+            provider_id = provider_client_id("maker_limit", cl_ord_id, 0)
+            if provider_id is None:
+                raise RuntimeError(f"no provider id derivable for {cl_ord_id}")
+            takeover_evidence = prior_raw
+            if prow.get("reason"):
+                takeover_evidence["previous_skip_reasons"] = [
+                    *prior_raw.get("previous_skip_reasons", []), prow["reason"],
+                ]
+            takeover_evidence.setdefault("skip_count", 1)
+            # Match the observed attempt so a stale reader loses even if the
+            # winner has already finished and put the row back into skip.
+            previous_start = prow.get("execution_started_at")
+            claimed = sb_update("dca_executions", {
+                "id": f"eq.{prow['id']}",
+                "status": "eq.skipped_insufficient_funds",
+                "order_id": "is.null",
+                "execution_started_at": f"eq.{previous_start}" if previous_start else "is.null",
+            }, {
+                "status": "claimed",
+                "reason": None,
+                "requested_quote_amount_base": total_target,
+                "execution_started_at": exec_started_at,
+                "execution_finished_at": None,
+                "raw": json.dumps({**takeover_evidence, "kraken_cl": provider_id}),
+            })
+            if not claimed:
+                return already_claimed
+            if not _rows_carry_provider(claimed, provider_id):
+                raise RuntimeError(
+                    f"provider id for {cl_ord_id} not confirmed persisted -- no AddOrder")
+            event_id = prow.get("parent_event_id") or str(uuid.uuid4())
+            retry_takeover = True
+            print(f"  {ICONS['OK']} Rechecking funding for {cl_ord_id}")
+        elif prow:
             base_cl, rcount = _retry_parts(prow.get("cl_ord_id") or cl_ord_id)
             _, wend = _window_bounds_for(
                 today_chicago,
@@ -3777,6 +3833,7 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
                         "held_usd": usd_held,
                         "balance_source": bal_source,
                         "needed_usd": total_target,
+                        "skip_count": raw_state.get("skip_count", 0) + 1,
                         "at": _now_utc_iso(),
                         "open_orders": _open_orders_digest(),
                     }),
@@ -4788,12 +4845,11 @@ def main():
     for order in orders:
         pair = order["pair"]
         o_time = order.get("target_time") or settings.get("target_time", "08:00")
-        o_window = int(order.get("time_window_minutes") or settings.get("time_window_minutes", 10))
-
-        o_h, o_m = map(int, o_time.split(":"))
-        o_target = now_chicago.replace(hour=o_h, minute=o_m, second=0, microsecond=0)
-        o_start = o_target - timedelta(minutes=o_window // 2)
-        o_end = o_target + timedelta(minutes=o_window // 2)
+        try:
+            o_start, o_end = _order_window(order, settings, today_chicago)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            print(f"   {ICONS['SKIP']} Invalid target window — skipping {pair}")
+            continue
 
         in_window = o_start <= now_chicago <= o_end
         print(f"\n   {pair} @ {o_time} CT [{o_start.strftime('%H:%M')}-{o_end.strftime('%H:%M')}] {'IN' if in_window else 'OUT'}")
