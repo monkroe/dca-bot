@@ -53,7 +53,7 @@ from zoneinfo import ZoneInfo
 from ohlc import build_daily_metrics
 from weekly_summary import weekly_summary_evidence
 
-VERSION = "1.8.2"
+VERSION = "1.8.3"
 
 # ═══════════════════════════════════════════════════════════════
 #  ICONS — single source of truth for all UI symbols
@@ -1320,7 +1320,7 @@ def _remaining_after_buy_line() -> str:
     more important than the extra line.
     """
     try:
-        avail, _held, _src = check_balance_usd()
+        avail, held, _src = check_balance_usd()
         rows = sb_get("dca_orders", {"enabled": "eq.true",
                                      "select": "base_quote_amount,bonus_quote_amount"})
         burn = sum(float(r.get("base_quote_amount") or 0)
@@ -2398,11 +2398,8 @@ def snapshot_mirror(user_id: str) -> None:
     This run already happens at the moment in question, so the snapshot costs
     two API calls and no new scheduled job.
 
-    ONCE PER DAY, not once per invocation. Cron fires this process every five
-    minutes through the window, but the preflight that calls this sits behind
-    the day's claim, so later invocations return before reaching it. Putting it
-    in `main()` would have written ~120 snapshots a day for the same
-    information.
+    The preflight calls this after claiming the daily leg. Once a funding
+    skip has been recorded, later attempts on that leg reuse its snapshot.
 
     NEVER RAISES. A snapshot is telemetry; the buy does not depend on it and
     must not be able to fail because of it.
@@ -3633,6 +3630,7 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
     # A funding retry retains evidence on the same identity. A Kraken refusal
     # rotates the identity and carries only a summary of the prior attempt.
     takeover_evidence: dict = {}
+    prior_raw: dict = {}
     if maker and not dry_run and not force:
         try:
             prev = sb_get("dca_executions", {
@@ -3801,12 +3799,15 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
     # are read again further down when recording a failure.
     usd_balance, usd_held, bal_source = -1.0, 0.0, "unavailable"
 
-    # One mirror snapshot per day, taken HERE because this is the moment the
-    # buy decision is made. It runs before the funding branch below so the
-    # record exists on BOTH outcomes -- the 07-30 case that motivated the table
-    # was a refusal, not a buy, and a snapshot only on success would have missed
-    # exactly the day it was needed. Skipped in dry runs, which decide nothing.
-    if not dry_run:
+    # The funding skip count belongs to the daily leg, even if an explicit
+    # Kraken refusal has since rotated its client id.
+    skip_count = prior_raw.get("skip_count", 0)
+    if skip_count:
+        raw_state["skip_count"] = skip_count
+
+    # Capture the decision-time balances for either outcome of the first
+    # preflight. A funding retry still checks BalanceEx with a fresh read.
+    if not dry_run and not skip_count:
         snapshot_mirror(user_id)
 
     try:
@@ -3833,17 +3834,18 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
                         "held_usd": usd_held,
                         "balance_source": bal_source,
                         "needed_usd": total_target,
-                        "skip_count": raw_state.get("skip_count", 0) + 1,
+                        "skip_count": skip_count + 1,
                         "at": _now_utc_iso(),
                         "open_orders": _open_orders_digest(),
                     }),
                 })
-                ts_chi = datetime.now(timezone.utc).astimezone(CHICAGO_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
-                tg_send(msg_warn(
-                    "DCA SKIP",
-                    f"{ts_chi} | {pair}\nInsufficient funds: ${usd_balance:.2f} < ${total_target:.2f}"
-                    + (f"\nHeld in open orders: ${usd_held:.2f}" if usd_held else "")
-                ))
+                if not skip_count:
+                    ts_chi = datetime.now(timezone.utc).astimezone(CHICAGO_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
+                    tg_send(msg_warn(
+                        "DCA SKIP",
+                        f"{ts_chi} | {pair}\nInsufficient funds: ${usd_balance:.2f} < ${total_target:.2f}"
+                        + (f"\nHeld in open orders: ${usd_held:.2f}" if usd_held else "")
+                    ))
                 return {"pair": pair, "status": "skipped_insufficient_funds"}
         # NO LOW-BALANCE WARNING HERE ANY MORE, and its absence is the fix.
         #

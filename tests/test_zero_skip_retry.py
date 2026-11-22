@@ -109,6 +109,41 @@ def t_still_short(r):
     r.check("no order submitted", w.calls("AddOrder"), [])
 
 
+def t_notify_only_on_first_skip(r):
+    w = FundingWorld()
+    snapshots = []
+    with w.installed(), w.clock(), patch.object(kr, "snapshot_mirror", snapshots.append):
+        statuses = [w.cycle(INITIAL_ORDER)]
+        w.now += timedelta(minutes=50)
+        statuses.append(w.cycle())
+        w.now += timedelta(minutes=5)
+        statuses.append(w.cycle())
+
+    r.check("all three balance checks skip", statuses, [SKIPPED] * 3)
+    r.check("all three skips counted", w.raw(w.rows[0]["cl_ord_id"])["skip_count"], 3)
+    r.check("one DCA SKIP notification", sum("DCA SKIP" in msg for msg in w.tg), 1)
+    r.check("one mirror snapshot", snapshots, ["test-user"])
+
+
+def t_notify_once_across_allowed_refusal(r):
+    w = FundingWorld()
+    snapshots = []
+    w.endpoint_errors["AddOrder"] = kr.KrakenError(["EOrder:Insufficient funds"])
+    with w.installed(), w.clock(), patch.object(kr, "snapshot_mirror", snapshots.append):
+        first = w.cycle(INITIAL_ORDER)
+        w.now += timedelta(minutes=50)
+        w.usd += 10
+        refused = w.cycle()
+        w.now += timedelta(minutes=1)
+        w.usd -= 10
+        last = w.cycle()
+
+    r.check("normal refusal retry still runs", (first, refused, last),
+            (SKIPPED, "failed_kraken", SKIPPED))
+    r.check("one funding skip message across attempts", sum("DCA SKIP" in msg for msg in w.tg), 1)
+    r.check("one mirror snapshot across attempts", snapshots, ["test-user"])
+
+
 def t_unsafe_to_retry(r):
     for status, order_id, raw in (
         ("filled", "OFILLED", {}),
@@ -212,6 +247,8 @@ if __name__ == "__main__":
     raise SystemExit(Runner("Same-day funding retry").run([
         ("funds arrive in the rescheduled window", t_funded),
         ("funds are still short", t_still_short),
+        ("only the first funding skip notifies and snapshots", t_notify_only_on_first_skip),
+        ("a Kraken refusal does not reset the funding notice", t_notify_once_across_allowed_refusal),
         ("existing or ambiguous Kraken orders are never retried", t_unsafe_to_retry),
         ("parallel cycles compete for one claim", t_parallel),
         ("stale reader loses after winner skips again", t_stale_reader),

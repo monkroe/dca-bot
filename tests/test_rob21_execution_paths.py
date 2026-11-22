@@ -7,6 +7,7 @@ ROB-18 takeover identity, and stale reconciliation by persisted provider id.
 Nothing here touches a network or a credential.
 """
 import json
+from unittest.mock import patch
 
 from _harness import kr, Runner
 from _rob21_world import (
@@ -220,6 +221,29 @@ def t_finalize_merge_preserves_provider_id(r):
     r.check("finalize wrote the fill", w.row(CL)["status"], "filled")
     r.check("finalize merge keeps the persisted provider id", w.raw(CL)["kraken_cl"], PID_MARKET)
     r.check("finalize merge keeps other persisted keys", w.raw(CL)["repeg_count"], 0)
+
+
+def t_fill_reports_remaining_balance(r):
+    for held, expected in (
+        (0.0, "Balance: $8.00"),
+        (2.0, "Balance: $8.00 available | $2.00 reserved"),
+    ):
+        w = World()
+        w.balance = (8.0, held, "BalanceEx")
+        seed_claimed(w, CL, "market", PID_MARKET)
+        w.closed_orders["OT"] = {
+            "status": "closed", "vol_exec": "10", "cost": "0.34", "fee": "0.003",
+            "price": "0.034", "closetm": 1759766400.0,
+        }
+        with w.installed(), patch.multiple(
+            kr, TG_NOTIFY_ON_FILL=True,
+            get_ohlc_ctx=lambda *_a, **_k: {},
+            resolve_reference_mid=lambda *_a, **_k: (None, None, None),
+        ):
+            REAL_FINALIZE(CL, "OT")
+        balance_lines = [line for text in w.tg for line in text.splitlines()
+                         if line.startswith("Balance:")]
+        r.check(f"fill message with held={held}", balance_lines, [expected])
 
 
 def t_takeover_raw_never_carries_the_previous_identitys_state(r):
@@ -508,6 +532,7 @@ TESTS = [
     ("failure paths preserve kraken_cl", t_failure_paths_preserve_provider_id),
     ("provider response cannot displace kraken_cl", t_provider_response_cannot_displace_provider_id),
     ("raw merge forces the persisted id last", t_finalize_merge_preserves_provider_id),
+    ("fill reports remaining balance with and without holds", t_fill_reports_remaining_balance),
     ("takeover raw never carries previous state", t_takeover_raw_never_carries_the_previous_identitys_state),
     ("writes merge onto what the run persisted", t_writes_merge_what_the_run_already_persisted),
     ("duplicate + FOUND recovers", t_duplicate_found_recovers),

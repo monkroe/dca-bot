@@ -4,6 +4,12 @@ Conventions: dates are **Chicago** time (the bot's trading timezone); a "vakaras
 
 History before 2026-07-18 (Phase 1 -- Kraken + Strike execution, notifications, reconciliation, impact/all-in bps telemetry) is in `git log`; this changelog starts at Phase 2.
 
+## v1.8.3 (2026-11-22)
+
+- PR #5 allows a same-day retry after a zero-spend insufficient-funds skip. In run [45028940455](https://github.com/monkroe/dca-bot/actions/runs/45028940455), the existing daily row blocked the buy after a top-up and target-time change. The runner reclaims that row inside the current target window. The window bounds attempts without an additional retry limit.
+- Fixed the undefined `held` variable that omitted the `Balance:` line from fill notifications in run [45038465095](https://github.com/monkroe/dca-bot/actions/runs/45038465095).
+- An insufficient-funds skip sends one Telegram `DCA SKIP` message and takes one mirror snapshot per order per day. Later funding retries still check the current balance.
+
 ## 2026-10-06 (vakaras – Chicago; UTC jau 10-07)
 
 ### fix(dca): Kraken provider client-order identity and crash-safe recovery – ROB-21
