@@ -2452,6 +2452,37 @@ def _retry_parts(cl_ord_id: str):
     return (cl_ord_id, 0)
 
 
+def _zero_skip_retryable(row, now_chicago, start, deadline):
+    """Only a proven pre-AddOrder zero-spend skip may reclaim its daily leg."""
+    if row.get("status") != "skipped_insufficient_funds":
+        return False
+    if now_chicago < start or now_chicago > deadline:
+        return False
+    if row.get("order_id") is not None:
+        return False
+    if row.get("filled_quote_cost") not in (None, 0, 0.0):
+        return False
+    if row.get("fee_quote") not in (None, 0, 0.0):
+        return False
+    raw = _safe_json_load(row.get("raw"))
+    if not isinstance(raw, dict) or raw.get("txid") or raw.get("order_id"):
+        return False
+    if raw.get("submission_state") is not None:
+        return False
+    if not raw.get("at") or not isinstance(raw.get("spendable_usd"), (int, float)):
+        return False
+    if not isinstance(raw.get("needed_usd"), (int, float)):
+        return False
+    pid = _provider_id_from_raw(raw)
+    if not pid or pid != provider_client_id("maker_limit", row.get("cl_ord_id"), 0):
+        return False
+    skips = raw.get("skip_count", 1)  # Historical skips predate the counter.
+    if type(skips) is not int or skips < 1:
+        return False
+    _, explicit_retries = _retry_parts(row.get("cl_ord_id"))
+    return skips + explicit_retries < RETRY_MAX_DEFAULT + 1
+
+
 def _retry_decision(status, stored_error, retry_count, now_chicago, deadline,
                     retry_max=RETRY_MAX_DEFAULT):
     """PURE. Returns (True, reason) when the failed leg may be re-attempted.
@@ -3632,53 +3663,111 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
                 "dca_order_id": f"eq.{order.get('id')}",
                 "trade_date_chicago": f"eq.{today_chicago}",
                 "attempt_type": "eq.maker_limit",
-                "select": "id,status,cl_ord_id,reason,parent_event_id,raw",
+                "select": "id,status,cl_ord_id,reason,parent_event_id,raw,order_id,filled_quote_cost,fee_quote",
             })
         except Exception as e:
             prev = []
             print(f"  {ICONS['WARN']} retry lookup failed: {e}")
         if prev:
             prow = prev[0]
-            base_cl, rcount = _retry_parts(prow.get("cl_ord_id") or cl_ord_id)
-            _, wend = _window_bounds_for(
-                today_chicago,
-                order.get("target_time") or settings.get("target_time", "08:00"),
-                int(order.get("time_window_minutes") or settings.get("time_window_minutes") or 10))
-            rdeadline = wend - timedelta(minutes=CRON_CYCLE_MINUTES)
-            ok, why = _retry_decision(prow.get("status"), prow.get("reason"),
-                                      rcount, datetime.now(CHICAGO_TZ), rdeadline)
-            print(f"  Retry check: {'YES' if ok else 'no'} ({why})")
-            if ok:
-                cl_ord_id = f"{base_cl}-r{rcount + 1}"
-                # A takeover is a NEW execution identity (the cl_ord_id
-                # rotates), so it gets a NEW provider id. It is persisted in
-                # the SAME update that rotates the id: there is no instant at
-                # which the row carries the new cl_ord_id next to the previous
-                # attempt's provider id, so reconciliation can never look up
-                # the old one.
-                provider_id = provider_client_id("maker_limit", cl_ord_id, 0)
-                if provider_id is None:
-                    raise RuntimeError(f"no provider id derivable for {cl_ord_id}")
-                prior_raw = _safe_json_load(prow.get("raw"))
-                prior_raw = prior_raw if isinstance(prior_raw, dict) else {}
-                takeover_evidence = {"previous_attempt": {
-                    "cl_ord_id": prow.get("cl_ord_id"),
-                    "error": prior_raw.get("error"),
-                    "at": prior_raw.get("at"),
-                }}
-                rotated = sb_update("dca_executions", {"id": f"eq.{prow['id']}"}, {
-                    "cl_ord_id": cl_ord_id,
-                    "status": "claimed",
-                    "reason": None,
-                    "execution_started_at": exec_started_at,
-                    "raw": json.dumps({"kraken_cl": provider_id, **takeover_evidence}),
-                })
-                if not _rows_carry_provider(rotated, provider_id):
-                    raise RuntimeError(
-                        f"provider id for {cl_ord_id} not confirmed persisted -- no AddOrder")
-                event_id = prow.get("parent_event_id") or str(uuid.uuid4())
-                retry_takeover = True
-                print(f"  {ICONS['OK']} Retrying refused leg as {cl_ord_id}")
+            if prow.get("status") == "skipped_insufficient_funds":
+                start, end = _window_bounds_for(
+                    today_chicago,
+                    order.get("target_time") or settings.get("target_time", "08:00"),
+                    int(order.get("time_window_minutes") or settings.get("time_window_minutes") or 10))
+                eligible = _zero_skip_retryable(
+                    prow, datetime.now(CHICAGO_TZ), start,
+                    end - timedelta(minutes=CRON_CYCLE_MINUTES))
+                print(f"  Zero-skip retry: {'YES' if eligible else 'no'}")
+                if eligible:
+                    # Never rotate identity: preflight returned before AddOrder.
+                    cl_ord_id = prow["cl_ord_id"]
+                    prior_raw = _safe_json_load(prow["raw"])
+                    provider_id = _provider_id_from_raw(prior_raw)
+                    prior_raw = dict(prior_raw)
+                    if not isinstance(prior_raw.get("skip_history"), list):
+                        prior_raw["skip_history"] = [{
+                            "at": prior_raw["at"],
+                            "spendable_usd": prior_raw["spendable_usd"],
+                            "needed_usd": prior_raw["needed_usd"],
+                            "held_usd": prior_raw.get("held_usd"),
+                            "balance_source": prior_raw.get("balance_source"),
+                        }]
+                    prior_raw["skip_count"] = prior_raw.get("skip_count", 1)
+                    # PostgREST PATCH is one atomic UPDATE with status predicate.
+                    # Only the winner may proceed to Kraken; zero rows = lost race.
+                    taken = sb_update("dca_executions", {
+                        "id": f"eq.{prow['id']}",
+                        "user_id": f"eq.{user_id}",
+                        "dca_order_id": f"eq.{order['id']}",
+                        "trade_date_chicago": f"eq.{today_chicago}",
+                        "status": "eq.skipped_insufficient_funds",
+                        "order_id": "is.null",
+                    }, {
+                        "status": "claimed",
+                        "reason": None,
+                        "execution_started_at": exec_started_at,
+                        "execution_finished_at": None,
+                        "raw": json.dumps(prior_raw),
+                    })
+                    if not taken:
+                        return {"pair": pair, "status": "already_claimed", "skipped": True}
+                    if (len(taken) != 1 or taken[0].get("status") != "claimed"
+                            or not _rows_carry_provider(taken, provider_id)):
+                        raise RuntimeError("zero-skip claim unconfirmed -- no AddOrder")
+                    takeover_evidence = prior_raw
+                    event_id = prow.get("parent_event_id") or str(uuid.uuid4())
+                    retry_takeover = True
+                    print(f"  {ICONS['OK']} Reclaimed zero-spend leg: {cl_ord_id}")
+            else:
+                base_cl, rcount = _retry_parts(prow.get("cl_ord_id") or cl_ord_id)
+                _, wend = _window_bounds_for(
+                    today_chicago,
+                    order.get("target_time") or settings.get("target_time", "08:00"),
+                    int(order.get("time_window_minutes") or settings.get("time_window_minutes") or 10))
+                rdeadline = wend - timedelta(minutes=CRON_CYCLE_MINUTES)
+                previous_raw = _safe_json_load(prow.get("raw")) or {}
+                prior_skips = previous_raw.get("skip_count", 0)
+                if type(prior_skips) is not int or prior_skips < 0:
+                    prior_skips = RETRY_MAX_DEFAULT + 1  # Invalid counter: fail closed.
+                ok, why = _retry_decision(prow.get("status"), prow.get("reason"),
+                                          rcount + prior_skips, datetime.now(CHICAGO_TZ), rdeadline)
+                print(f"  Retry check: {'YES' if ok else 'no'} ({why})")
+                if ok:
+                    cl_ord_id = f"{base_cl}-r{rcount + 1}"
+                    # A takeover is a NEW execution identity (the cl_ord_id
+                    # rotates), so it gets a NEW provider id. It is persisted in
+                    # the SAME update that rotates the id: there is no instant at
+                    # which the row carries the new cl_ord_id next to the previous
+                    # attempt's provider id, so reconciliation can never look up
+                    # the old one.
+                    provider_id = provider_client_id("maker_limit", cl_ord_id, 0)
+                    if provider_id is None:
+                        raise RuntimeError(f"no provider id derivable for {cl_ord_id}")
+                    prior_raw = _safe_json_load(prow.get("raw"))
+                    prior_raw = prior_raw if isinstance(prior_raw, dict) else {}
+                    takeover_evidence = {"previous_attempt": {
+                        "cl_ord_id": prow.get("cl_ord_id"),
+                        "error": prior_raw.get("error"),
+                        "at": prior_raw.get("at"),
+                    }}
+                    if prior_skips:
+                        takeover_evidence["skip_count"] = prior_skips
+                        if isinstance(prior_raw.get("skip_history"), list):
+                            takeover_evidence["skip_history"] = prior_raw["skip_history"]
+                    rotated = sb_update("dca_executions", {"id": f"eq.{prow['id']}"}, {
+                        "cl_ord_id": cl_ord_id,
+                        "status": "claimed",
+                        "reason": None,
+                        "execution_started_at": exec_started_at,
+                        "raw": json.dumps({"kraken_cl": provider_id, **takeover_evidence}),
+                    })
+                    if not _rows_carry_provider(rotated, provider_id):
+                        raise RuntimeError(
+                            f"provider id for {cl_ord_id} not confirmed persisted -- no AddOrder")
+                    event_id = prow.get("parent_event_id") or str(uuid.uuid4())
+                    retry_takeover = True
+                    print(f"  {ICONS['OK']} Retrying refused leg as {cl_ord_id}")
 
     # ── Phase 1: CLAIM ────────────────────────────────────────
     if not retry_takeover:
@@ -3768,6 +3857,12 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
                 reason = (f"spendable USD ${usd_balance:.2f} < needed ${total_target:.2f}"
                           f"{held_note} [{bal_source}]")
                 print(f"  {ICONS['FAIL']} {reason}")
+                previous_skips = raw_state.get("skip_count", 0)
+                if type(previous_skips) is not int or previous_skips < 0:
+                    previous_skips = RETRY_MAX_DEFAULT + 1
+                skip_at = _now_utc_iso()
+                history = raw_state.get("skip_history")
+                history = history if isinstance(history, list) else []
                 update_execution({
                     "status": "skipped_insufficient_funds",
                     "reason": reason,
@@ -3777,7 +3872,13 @@ def execute_pair(order: dict, settings: dict, today_chicago: str, user_id: str,
                         "held_usd": usd_held,
                         "balance_source": bal_source,
                         "needed_usd": total_target,
-                        "at": _now_utc_iso(),
+                        "at": skip_at,
+                        "skip_count": previous_skips + 1,
+                        "skip_history": history + [{
+                            "at": skip_at, "spendable_usd": usd_balance,
+                            "held_usd": usd_held, "needed_usd": total_target,
+                            "balance_source": bal_source,
+                        }],
                         "open_orders": _open_orders_digest(),
                     }),
                 })

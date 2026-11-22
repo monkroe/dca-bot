@@ -1,0 +1,22 @@
+name: DCA PR tests
+on:
+  pull_request:
+    paths:
+      - 'src/kraken_run.py'
+      - 'tests/**'
+      - 'scripts/**'
+      - 'test.sh'
+      - '.github/workflows/dca_pr_tests.yml'
+permissions:
+  contents: read
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Unit and schema tests (no secrets)
+        run: ./test.sh
